@@ -717,7 +717,10 @@ export function buildRouter(): Router {
 
   biz.get("/audit-log", requireRole("owner", "admin", "accountant"), h((req, res) => {
     const q = auditQuerySchema.parse(req.query);
-    const { rows, total } = storage.queryAuditLog(ctx(req).orgId, q);
+    // CSV must match the ENTIRE filtered view, not one page: override
+    // pagination for exports (hard cap keeps a runaway export bounded).
+    const filters = q.format === "csv" ? { ...q, page: 1, pageSize: 100_000 } : q;
+    const { rows, total } = storage.queryAuditLog(ctx(req).orgId, filters);
     if (q.format === "csv") {
       return sendCsv(res, "audit-log.csv", rows as Array<Record<string, unknown>>, [
         { header: "Time", value: (r) => r.created_at },
@@ -742,8 +745,21 @@ export function buildRouter(): Router {
       res.status(400).json({ error: "validation failed", issues: err.issues.map((i) => `${i.path.join(".")}: ${i.message}`) });
       return;
     }
-    if (err && typeof err === "object" && "type" in err && (err as { type: string }).type === "entity.too.large") {
-      res.status(413).json({ error: "body exceeds size limit" });
+    if (err && typeof err === "object" && "type" in err) {
+      const type = (err as { type: string }).type;
+      if (type === "entity.too.large") {
+        res.status(413).json({ error: "body exceeds size limit" });
+        return;
+      }
+      if (type === "entity.parse.failed" || type === "charset.unsupported" || type === "encoding.unsupported") {
+        res.status(400).json({ error: "malformed request body" });
+        return;
+      }
+    }
+    // check-then-insert races (e.g. two concurrent registrations with the
+    // same email) land on the UNIQUE constraint: that's a conflict, not a 500.
+    if (err && typeof err === "object" && "code" in err && String((err as { code: string }).code).startsWith("SQLITE_CONSTRAINT")) {
+      res.status(409).json({ error: "conflict: resource already exists" });
       return;
     }
     console.error("unhandled error:", err);

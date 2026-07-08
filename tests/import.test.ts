@@ -107,6 +107,40 @@ test("opening balances: balanced file posts exactly ONE journal entry", () => {
   assert.equal(tb.reduce((s, r) => s + r.debit, 0), tb.reduce((s, r) => s + r.credit, 0));
 });
 
+test("strict import: bad calendar date (2026-13-40) yields a row-level error, not a raw ZodError", () => {
+  const { orgId, userId } = createTestOrg();
+  createCustomer(orgId, "Date Co");
+  const csv = [
+    "number,customer_name,date,due_date,line_description,quantity,rate,income_account_code,tax_rate",
+    "IMP-D1,Date Co,2026-13-40,2026-02-05,Widget,1,10.00,4000,0",
+  ].join("\n");
+  const result = importInvoices(orgId, userId, csv, false, false);
+  assert.equal(result.inserted, 0);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].row, 2); // structured {row, message} report
+  assert.match(result.errors[0].message, /IMP-D1/);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM invoices WHERE org_id = ?").get(orgId) as { n: number }).n, 0);
+});
+
+test("trial balance as-of lists accounts with only post-cutoff activity at zero", () => {
+  const { orgId, userId } = createTestOrg();
+  const customerId = createCustomer(orgId, "Late Co");
+  storage.createInvoice(orgId, userId, {
+    customerId,
+    date: "2026-06-01",
+    dueDate: "2026-07-01",
+    lines: [{ description: "later", quantity: 1, rate: 1000, accountId: accountId(orgId, "4000"), taxRate: 0 }],
+  });
+  const tb = storage.trialBalance(orgId, "2026-03-31");
+  const sales = tb.find((r) => r.code === "4000");
+  assert.ok(sales, "account must still appear in the as-of report");
+  assert.equal(sales!.debit, 0);
+  assert.equal(sales!.credit, 0);
+  // Without a cutoff the activity shows.
+  const tbAll = storage.trialBalance(orgId);
+  assert.equal(tbAll.find((r) => r.code === "4000")!.credit, 1000);
+});
+
 test("RFC 4180: descriptions with commas and quotes survive import", () => {
   const { orgId, userId } = createTestOrg();
   createCustomer(orgId, "Punct & Co");

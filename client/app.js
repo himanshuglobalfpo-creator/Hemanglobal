@@ -34,6 +34,9 @@
     ["#/budgets", "Budgets"], ["#/import", "Import"], ["#/audit", "Audit"], ["#/settings", "Settings"],
   ];
   function shell(content) {
+    // Handlers attached to #app survive innerHTML swaps; clear them on every
+    // render so a page's delegated handler can never fire on another page.
+    app.onclick = null;
     const canAudit = me && ["owner", "admin", "accountant"].includes(me.role);
     app.innerHTML = `
       <nav><span class="brand">LedgerLite</span>
@@ -249,14 +252,14 @@
         <tbody>${budgets.map((b) => `<tr><td>${esc(b.name)}</td><td>${b.fiscal_year}</td>
           <td><button class="ghost" data-line="${b.id}">Set line</button>
               <a href="/api/reports/budget-vs-actual?budgetId=${b.id}&format=csv">vs actual CSV</a>
-              <button class="danger" data-del="${b.id}">Delete</button></td></tr>`).join("")}</tbody></table></div>`);
+              <button class="danger" data-bdel="${b.id}">Delete</button></td></tr>`).join("")}</tbody></table></div>`);
     qs("#badd").onclick = async () => {
       try { await api("/api/budgets", { method: "POST", body: { name: val("#bname"), fiscalYear: Number(val("#byear")) } }); route(); }
       catch (e) { showErr(e); }
     };
     app.onclick = async (ev) => {
       const lineId = ev.target.getAttribute && ev.target.getAttribute("data-line");
-      const delId = ev.target.getAttribute && ev.target.getAttribute("data-del");
+      const delId = ev.target.getAttribute && ev.target.getAttribute("data-bdel");
       if (delId) { if (confirm("Delete budget?")) { await api(`/api/budgets/${delId}`, { method: "DELETE" }); route(); } }
       if (lineId) {
         const code = prompt("Account code (income/expense), e.g. 4000:\n" + plAccounts.map((a) => a.code + " " + a.name).join(", "));

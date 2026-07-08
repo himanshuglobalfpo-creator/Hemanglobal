@@ -708,17 +708,21 @@ export function createCreditNote(orgId: number, userId: number, raw: unknown): {
 /* ------------------------------------------------------------------ */
 
 export function trialBalance(orgId: number, asOf?: string): Array<{ code: string; name: string; type: string; debit: number; credit: number }> {
+  // The as-of cutoff lives in the SUM, not the WHERE: filtering in WHERE
+  // would drop accounts whose only postings are after the cutoff, instead of
+  // listing them at zero like every other account.
   const rows = db
     .prepare(
       `SELECT a.code, a.name, a.type,
-              COALESCE(SUM(jl.debit), 0) AS dr, COALESCE(SUM(jl.credit), 0) AS cr
+              COALESCE(SUM(CASE WHEN ? IS NULL OR je.date <= ? THEN jl.debit ELSE 0 END), 0) AS dr,
+              COALESCE(SUM(CASE WHEN ? IS NULL OR je.date <= ? THEN jl.credit ELSE 0 END), 0) AS cr
        FROM accounts a
        LEFT JOIN journal_lines jl ON jl.account_id = a.id AND jl.org_id = a.org_id
        LEFT JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = a.org_id
-       WHERE a.org_id = ? AND (je.id IS NULL OR ? IS NULL OR je.date <= ?)
+       WHERE a.org_id = ?
        GROUP BY a.id ORDER BY a.code`,
     )
-    .all(orgId, asOf ?? null, asOf ?? null) as Array<{ code: string; name: string; type: string; dr: number; cr: number }>;
+    .all(asOf ?? null, asOf ?? null, asOf ?? null, asOf ?? null, orgId) as Array<{ code: string; name: string; type: string; dr: number; cr: number }>;
   return rows.map((r) => {
     const net = r.dr - r.cr;
     return { code: r.code, name: r.name, type: r.type, debit: net > 0 ? net : 0, credit: net < 0 ? -net : 0 };

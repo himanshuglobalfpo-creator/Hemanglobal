@@ -27,6 +27,10 @@ const SESSION_TTL_DAYS = 14;
 export const SESSION_COOKIE = "ledgerlite_sid";
 
 export function createSession(userId: number, orgId: number): string {
+  // Opportunistic housekeeping: purge expired sessions and MFA challenges so
+  // neither table grows without bound (cheap: both hit indexed/small tables).
+  db.prepare("DELETE FROM sessions WHERE expires_at <= datetime('now')").run();
+  db.prepare("DELETE FROM mfa_challenges WHERE expires_at <= datetime('now')").run();
   const token = crypto.randomBytes(32).toString("hex");
   db.prepare("INSERT INTO sessions (id, user_id, org_id, expires_at) VALUES (?,?,?, datetime('now', ?))")
     .run(token, userId, orgId, `+${SESSION_TTL_DAYS} days`);
@@ -53,7 +57,16 @@ function readCookie(req: Request, name: string): string | undefined {
   if (!header) return undefined;
   for (const part of header.split(";")) {
     const [k, ...rest] = part.trim().split("=");
-    if (k === name) return decodeURIComponent(rest.join("="));
+    if (k === name) {
+      const raw = rest.join("=");
+      // A malformed percent-sequence must not 500 every request: fall back
+      // to the raw value (our tokens are hex and never need decoding anyway).
+      try {
+        return decodeURIComponent(raw);
+      } catch {
+        return raw;
+      }
+    }
   }
   return undefined;
 }

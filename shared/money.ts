@@ -5,11 +5,15 @@
  * the GL stays 100% base currency.
  */
 
-const ZERO_DECIMAL = new Set(["JPY"]); // yen has no minor unit
+// Storage rule: EVERY currency is stored in 1/100 units (dollarsToCents and
+// the client both multiply user input by 100), including zero-decimal ones
+// like JPY. Zero-decimal codes only affect DISPLAY precision — so server
+// documents and the client always agree on the stored value.
+const ZERO_DECIMAL = new Set(["JPY"]);
 
 export function formatMoney(cents: number, currency: string = "USD"): string {
   const decimals = ZERO_DECIMAL.has(currency) ? 0 : 2;
-  const amount = ZERO_DECIMAL.has(currency) ? cents : cents / 100;
+  const amount = cents / 100;
   try {
     return new Intl.NumberFormat("en-US", {
       style: "currency",

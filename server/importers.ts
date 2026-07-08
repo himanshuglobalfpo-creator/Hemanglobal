@@ -11,6 +11,7 @@
  *   and writes one audit summary entry (real runs only).
  */
 import { parse } from "csv-parse/sync";
+import { z } from "zod";
 import { db } from "./db.js";
 import { ACCOUNT_TYPES, ACCOUNT_SUBTYPES, type ImportResult, type ImportRowError } from "../shared/schema.js";
 import { dollarsToCents } from "../shared/money.js";
@@ -203,17 +204,19 @@ export function importInvoices(orgId: number, userId: number, csvText: string, d
           number: g.number,
           lines: lineInputs,
         });
-      if (partial) {
-        // Nested db.transaction => SAVEPOINT: one bad invoice rolls back alone.
-        try {
-          db.transaction(create)();
-          inserted++;
-        } catch (err) {
-          errors.push({ row: g.firstRow, message: `invoice ${g.number}: ${(err as Error).message}` });
-        }
-      } else {
-        create();
+      // Nested db.transaction => SAVEPOINT: one bad invoice rolls back alone.
+      // Both modes catch per group so ANY failure (including Zod rejections
+      // that pass the cheap regex pre-check, e.g. date "2026-13-40") lands in
+      // the structured {row, message} report instead of leaking a raw error;
+      // strict mode then rejects the whole file below.
+      try {
+        db.transaction(create)();
         inserted++;
+      } catch (err) {
+        const message = err instanceof z.ZodError
+          ? err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")
+          : (err as Error).message;
+        errors.push({ row: g.firstRow, message: `invoice ${g.number}: ${message}` });
       }
     }
 
