@@ -25,6 +25,25 @@ npm test             # tsc --noEmit + node --test (24 tests)
 Register an account in the UI — this creates your org, seeds the chart of
 accounts (including FX Gain 4950 / FX Loss 6950), and signs you in as owner.
 
+## Deploying
+
+```bash
+# Bare metal / VM (Node 20+):
+cp .env.example .env            # set a strong VAULT_KEY
+npm ci --omit=dev               # tsx is a runtime dependency; dev types excluded
+NODE_ENV=production npm start   # put nginx/caddy in front for HTTPS
+
+# Docker:
+docker build -t ledgerlite .
+docker run -d -p 3000:3000 -e VAULT_KEY="$(openssl rand -hex 32)" \
+  -v ledgerlite-data:/data ledgerlite
+```
+
+Production checklist: strong `VAULT_KEY`, HTTPS termination in front
+(`NODE_ENV=production` turns on secure cookies), and scheduled backups of
+`DATA_DIR` (SQLite DB + local uploads). Migrations run automatically on boot
+and are idempotent, so upgrades are: pull, install, restart.
+
 ## Environment variables
 
 | Variable       | Default                      | Purpose |
