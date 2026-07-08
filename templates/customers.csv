@@ -1,0 +1,3 @@
+name,email,phone,address,shipping_city,shipping_state,shipping_zip
+Acme Inc,billing@acme.com,555-0100,"12 Main St, Suite 4",Springfield,IL,62701
+Globex Corp,ap@globex.com,555-0101,,Shelbyville,IL,62565

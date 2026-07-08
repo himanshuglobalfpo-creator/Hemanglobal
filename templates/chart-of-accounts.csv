@@ -1,0 +1,5 @@
+code,name,type,subtype
+1200,Inventory,asset,current_asset
+4100,Service Revenue,income,sales
+6100,Rent Expense,expense,operating_expense
+6200,Software Subscriptions,expense,operating_expense
