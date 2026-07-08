@@ -933,3 +933,274 @@ export function queryAuditLog(orgId: number, f: AuditFilters): { rows: unknown[]
     .all(...params, f.pageSize, (f.page - 1) * f.pageSize);
   return { rows, total };
 }
+
+/* ------------------------------------------------------------------ */
+/* Manual journal entries — Phase 3                                    */
+/* ------------------------------------------------------------------ */
+
+export interface ManualJeInput {
+  date: string;
+  memo: string;
+  lines: Array<{ accountId: number; debit: number; credit: number }>;
+}
+
+export function createManualJournalEntry(orgId: number, userId: number, input: ManualJeInput): number {
+  assertPeriodOpen(orgId, input.date);
+  if (input.lines.length < 2) throw new HttpError(400, "a journal entry needs at least 2 lines");
+  for (const l of input.lines) {
+    if (!accountById(orgId, l.accountId)) throw new HttpError(400, `account ${l.accountId} not in org`);
+    if (l.debit < 0 || l.credit < 0) throw new HttpError(400, "debit/credit must be >= 0");
+    if (l.debit > 0 && l.credit > 0) throw new HttpError(400, "a line is either a debit or a credit, not both");
+  }
+  const dr = input.lines.reduce((s, l) => s + l.debit, 0);
+  const cr = input.lines.reduce((s, l) => s + l.credit, 0);
+  if (dr !== cr) {
+    throw new HttpError(400, `entry does not balance: debits ${(dr / 100).toFixed(2)} != credits ${(cr / 100).toFixed(2)}`);
+  }
+  const run = db.transaction((): number => {
+    const id = postJournalEntry(orgId, input.date, input.memo, "manual", null, input.lines);
+    audit(orgId, userId, "create", "journal_entry", id, `Manual JE ${(dr / 100).toFixed(2)}: ${input.memo}`);
+    return id;
+  });
+  return run();
+}
+
+/** Posts a mirror-image entry; the original stays immutable (audit trail). */
+export function reverseJournalEntry(orgId: number, userId: number, entryId: number, date: string): number {
+  assertPeriodOpen(orgId, date);
+  const entry = db.prepare("SELECT * FROM journal_entries WHERE org_id = ? AND id = ?").get(orgId, entryId) as
+    | { id: number; memo: string; source: string }
+    | undefined;
+  if (!entry) throw new HttpError(404, "journal entry not found");
+  const already = db
+    .prepare("SELECT 1 FROM journal_entries WHERE org_id = ? AND source = 'reversal' AND source_id = ?")
+    .get(orgId, entryId);
+  if (already) throw new HttpError(409, "entry has already been reversed");
+  const lines = db
+    .prepare("SELECT account_id, debit, credit FROM journal_lines WHERE org_id = ? AND entry_id = ?")
+    .all(orgId, entryId) as Array<{ account_id: number; debit: number; credit: number }>;
+  const run = db.transaction((): number => {
+    const id = postJournalEntry(
+      orgId, date, `Reversal of JE #${entryId}: ${entry.memo}`, "reversal", entryId,
+      lines.map((l) => ({ accountId: l.account_id, debit: l.credit, credit: l.debit })),
+    );
+    audit(orgId, userId, "reverse", "journal_entry", entryId, `Reversed by JE #${id}`);
+    return id;
+  });
+  return run();
+}
+
+export function listJournalEntries(orgId: number, page: number, pageSize: number): { rows: unknown[]; total: number } {
+  const total = (db.prepare("SELECT COUNT(*) AS n FROM journal_entries WHERE org_id = ?").get(orgId) as { n: number }).n;
+  const rows = db
+    .prepare(
+      `SELECT je.*, (SELECT SUM(debit) FROM journal_lines jl WHERE jl.entry_id = je.id AND jl.org_id = je.org_id) AS amount
+       FROM journal_entries je WHERE je.org_id = ? ORDER BY je.date DESC, je.id DESC LIMIT ? OFFSET ?`,
+    )
+    .all(orgId, pageSize, (page - 1) * pageSize);
+  return { rows, total };
+}
+
+/* ------------------------------------------------------------------ */
+/* Bill void — Phase 3 (mirror of voidInvoice)                         */
+/* ------------------------------------------------------------------ */
+
+export function voidBill(orgId: number, userId: number, billId: number): BillRow {
+  const bill = getBill(orgId, billId);
+  if (bill.status === "void") throw new HttpError(409, "already void");
+  if (bill.amount_paid > 0 || bill.foreign_amount_paid > 0) {
+    throw new HttpError(409, "cannot void a bill with payments applied");
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  assertPeriodOpen(orgId, today);
+  const run = db.transaction(() => {
+    if (bill.journal_entry_id) {
+      const lines = db
+        .prepare("SELECT account_id, debit, credit FROM journal_lines WHERE org_id = ? AND entry_id = ?")
+        .all(orgId, bill.journal_entry_id) as Array<{ account_id: number; debit: number; credit: number }>;
+      postJournalEntry(
+        orgId, today, `Void bill ${bill.number}`, "bill_void", bill.id,
+        lines.map((l) => ({ accountId: l.account_id, debit: l.credit, credit: l.debit })),
+      );
+    }
+    db.prepare("UPDATE bills SET status = 'void' WHERE id = ? AND org_id = ?").run(bill.id, orgId);
+    audit(orgId, userId, "void", "bill", bill.id, `Voided bill ${bill.number}`);
+  });
+  run();
+  return getBill(orgId, billId);
+}
+
+/* ------------------------------------------------------------------ */
+/* Report pack II — Phase 3                                            */
+/* ------------------------------------------------------------------ */
+
+export interface BalanceSheetSection {
+  rows: Array<{ code: string; name: string; amount: number }>;
+  total: number;
+}
+export interface BalanceSheet {
+  asOf: string;
+  assets: BalanceSheetSection;
+  liabilities: BalanceSheetSection;
+  equity: BalanceSheetSection; // includes a computed "Current earnings" row
+  balanced: boolean;
+}
+
+/**
+ * Balance sheet as of a date. Income/expense activity to date is rolled into
+ * equity as "Current earnings", so Assets == Liabilities + Equity always ties
+ * to the trial balance.
+ */
+export function balanceSheet(orgId: number, asOf: string): BalanceSheet {
+  const tb = trialBalance(orgId, asOf);
+  const section = (type: string, sign: 1 | -1): BalanceSheetSection => {
+    const rows = tb
+      .filter((r) => r.type === type)
+      .map((r) => ({ code: r.code, name: r.name, amount: sign * (r.debit - r.credit) }))
+      .filter((r) => r.amount !== 0);
+    return { rows, total: rows.reduce((s, r) => s + r.amount, 0) };
+  };
+  const assets = section("asset", 1);
+  const liabilities = section("liability", -1);
+  const equity = section("equity", -1);
+  const income = tb.filter((r) => r.type === "income").reduce((s, r) => s + (r.credit - r.debit), 0);
+  const expense = tb.filter((r) => r.type === "expense").reduce((s, r) => s + (r.debit - r.credit), 0);
+  const earnings = income - expense;
+  if (earnings !== 0) {
+    equity.rows.push({ code: "—", name: "Current earnings", amount: earnings });
+    equity.total += earnings;
+  }
+  return { asOf, assets, liabilities, equity, balanced: assets.total === liabilities.total + equity.total };
+}
+
+export interface GlLine {
+  date: string;
+  entryId: number;
+  memo: string;
+  source: string;
+  debit: number;
+  credit: number;
+  balance: number;
+}
+export interface GeneralLedger {
+  account: { id: number; code: string; name: string; type: string };
+  openingBalance: number;
+  lines: GlLine[];
+  closingBalance: number;
+}
+
+/** General ledger for one account with running balance (debit-positive). */
+export function generalLedger(orgId: number, accountId: number, from?: string, to?: string): GeneralLedger {
+  const acct = accountById(orgId, accountId);
+  if (!acct) throw new HttpError(404, "account not found");
+  const lo = from ?? "0000-01-01";
+  const hi = to ?? "9999-12-31";
+  const opening = db
+    .prepare(
+      `SELECT COALESCE(SUM(jl.debit - jl.credit), 0) AS bal
+       FROM journal_lines jl JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = jl.org_id
+       WHERE jl.org_id = ? AND jl.account_id = ? AND je.date < ?`,
+    )
+    .get(orgId, accountId, lo) as { bal: number };
+  const raw = db
+    .prepare(
+      `SELECT je.date, je.id AS entryId, je.memo, je.source, jl.debit, jl.credit
+       FROM journal_lines jl JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = jl.org_id
+       WHERE jl.org_id = ? AND jl.account_id = ? AND je.date BETWEEN ? AND ?
+       ORDER BY je.date, je.id, jl.id`,
+    )
+    .all(orgId, accountId, lo, hi) as Array<Omit<GlLine, "balance">>;
+  let running = opening.bal;
+  const lines = raw.map((l) => {
+    running += l.debit - l.credit;
+    return { ...l, balance: running };
+  });
+  return {
+    account: { id: acct.id, code: acct.code, name: acct.name, type: acct.type },
+    openingBalance: opening.bal,
+    lines,
+    closingBalance: running,
+  };
+}
+
+export interface AgingRow {
+  partyId: number;
+  party: string;
+  current: number;
+  d1_30: number;
+  d31_60: number;
+  d61_90: number;
+  d90_plus: number;
+  total: number;
+}
+
+/** Aging buckets by days past due_date, base-currency outstanding. */
+function aging(orgId: number, table: "invoices" | "bills", partyTable: "customers" | "vendors", partyCol: string, asOf: string): AgingRow[] {
+  const docs = db
+    .prepare(
+      `SELECT d.${partyCol} AS partyId, p.name AS party, d.due_date, d.total - d.amount_paid AS outstanding
+       FROM ${table} d JOIN ${partyTable} p ON p.id = d.${partyCol} AND p.org_id = d.org_id
+       WHERE d.org_id = ? AND d.status IN ('open','partial') AND d.date <= ?`,
+    )
+    .all(orgId, asOf) as Array<{ partyId: number; party: string; due_date: string; outstanding: number }>;
+  const byParty = new Map<number, AgingRow>();
+  const asOfMs = Date.parse(asOf + "T00:00:00Z");
+  for (const d of docs) {
+    if (d.outstanding <= 0) continue;
+    let row = byParty.get(d.partyId);
+    if (!row) {
+      row = { partyId: d.partyId, party: d.party, current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90_plus: 0, total: 0 };
+      byParty.set(d.partyId, row);
+    }
+    const daysPast = Math.floor((asOfMs - Date.parse(d.due_date + "T00:00:00Z")) / 864e5);
+    if (daysPast <= 0) row.current += d.outstanding;
+    else if (daysPast <= 30) row.d1_30 += d.outstanding;
+    else if (daysPast <= 60) row.d31_60 += d.outstanding;
+    else if (daysPast <= 90) row.d61_90 += d.outstanding;
+    else row.d90_plus += d.outstanding;
+    row.total += d.outstanding;
+  }
+  return [...byParty.values()].sort((a, b) => b.total - a.total);
+}
+
+export const arAging = (orgId: number, asOf: string): AgingRow[] => aging(orgId, "invoices", "customers", "customer_id", asOf);
+export const apAging = (orgId: number, asOf: string): AgingRow[] => aging(orgId, "bills", "vendors", "vendor_id", asOf);
+
+export interface CashFlowReport {
+  from: string;
+  to: string;
+  openingCash: number;
+  receipts: number;
+  payments: number;
+  netChange: number;
+  closingCash: number;
+  byAccount: Array<{ code: string; name: string; opening: number; inflow: number; outflow: number; closing: number }>;
+}
+
+/** Cash-basis cash flow over bank-subtype accounts (direct method). */
+export function cashFlow(orgId: number, from: string, to: string): CashFlowReport {
+  const banks = db
+    .prepare("SELECT id, code, name FROM accounts WHERE org_id = ? AND subtype = 'bank' ORDER BY code")
+    .all(orgId) as Array<{ id: number; code: string; name: string }>;
+  const byAccount = banks.map((b) => {
+    const opening = (db
+      .prepare(
+        `SELECT COALESCE(SUM(jl.debit - jl.credit), 0) AS bal FROM journal_lines jl
+         JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = jl.org_id
+         WHERE jl.org_id = ? AND jl.account_id = ? AND je.date < ?`,
+      )
+      .get(orgId, b.id, from) as { bal: number }).bal;
+    const flow = db
+      .prepare(
+        `SELECT COALESCE(SUM(jl.debit), 0) AS inflow, COALESCE(SUM(jl.credit), 0) AS outflow FROM journal_lines jl
+         JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = jl.org_id
+         WHERE jl.org_id = ? AND jl.account_id = ? AND je.date BETWEEN ? AND ?`,
+      )
+      .get(orgId, b.id, from, to) as { inflow: number; outflow: number };
+    return { code: b.code, name: b.name, opening, inflow: flow.inflow, outflow: flow.outflow, closing: opening + flow.inflow - flow.outflow };
+  });
+  const openingCash = byAccount.reduce((s, a) => s + a.opening, 0);
+  const receipts = byAccount.reduce((s, a) => s + a.inflow, 0);
+  const payments = byAccount.reduce((s, a) => s + a.outflow, 0);
+  return { from, to, openingCash, receipts, payments, netChange: receipts - payments, closingCash: openingCash + receipts - payments, byAccount };
+}

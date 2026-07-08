@@ -17,6 +17,8 @@ import {
   putBudgetLinesSchema, insertWebhookSchema, insertCreditNoteSchema, auditQuerySchema,
   reportRangeSchema, budgetVsActualQuerySchema, openingBalanceMetaSchema, isoDate,
   ATTACHMENT_ENTITY_TYPES, ATTACHMENT_MIME_WHITELIST, ATTACHMENT_MAX_BYTES, WEBHOOK_EVENTS,
+  manualJournalSchema, reverseJournalSchema, changePasswordSchema, orgUpdateSchema,
+  addOrgUserSchema, updateOrgUserSchema, updateAccountSchema, glQuerySchema, asOfQuerySchema,
 } from "../shared/schema.js";
 import {
   requireAuth, requireRole, enforceOwnerMfa, createSession, destroySession,
@@ -178,6 +180,28 @@ export function buildRouter(): Router {
     res.json({ ok: true });
   }));
 
+  // Password change (self-service, session required). A full email-based
+  // reset flow requires an SMTP provider and is tracked as a known gap.
+  router.post("/api/auth/change-password", requireAuth, h(async (req, res) => {
+    const c = ctx(req);
+    const input = changePasswordSchema.parse(req.body);
+    const user = db.prepare("SELECT password_hash FROM users WHERE id = ?").get(c.userId) as { password_hash: string };
+    if (!(await bcrypt.compare(input.currentPassword, user.password_hash))) {
+      throw new HttpError(401, "current password is incorrect");
+    }
+    const newHash = await bcrypt.hash(input.newPassword, 10);
+    const header = req.headers.cookie ?? "";
+    const currentToken = header.split(";").map((s) => s.trim()).find((s) => s.startsWith(SESSION_COOKIE + "="))?.split("=")[1] ?? "";
+    const run = db.transaction(() => {
+      db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(newHash, c.userId);
+      // Kill every OTHER session for this user (stolen-session hygiene).
+      db.prepare("DELETE FROM sessions WHERE user_id = ? AND id != ?").run(c.userId, currentToken);
+    });
+    run();
+    storage.audit(c.orgId, c.userId, "update", "user", c.userId, "Password changed");
+    res.json({ ok: true });
+  }));
+
   router.post("/api/auth/logout", requireAuth, h((req, res) => {
     const header = req.headers.cookie ?? "";
     const token = header.split(";").map((c) => c.trim()).find((c) => c.startsWith(SESSION_COOKIE + "="))?.split("=")[1];
@@ -269,6 +293,10 @@ export function buildRouter(): Router {
     biz.post(`/${table}`, requireRole("owner", "admin", "accountant"), h((req, res) => {
       const c = ctx(req);
       const input = schema.parse(req.body);
+      // Duplicate prevention: case-insensitive name within the org (same rule
+      // as the CSV importer).
+      const dup = db.prepare(`SELECT 1 FROM ${table} WHERE org_id = ? AND lower(name) = lower(?) AND is_active = 1`).get(c.orgId, input.name);
+      if (dup) throw new HttpError(409, `a ${table.slice(0, -1)} named "${input.name}" already exists`);
       const r = db.prepare(
         `INSERT INTO ${table} (org_id, name, email, phone, address, shipping_city, shipping_state, shipping_zip, currency)
          VALUES (?,?,?,?,?,?,?,?,?)`,
@@ -289,6 +317,15 @@ export function buildRouter(): Router {
       if (r.changes === 0) throw new HttpError(404, "not found");
       storage.audit(c.orgId, c.userId, "update", table.slice(0, -1), id, `Updated ${input.name}`);
       res.json({ ok: true });
+    }));
+    // Soft delete: history (invoices/bills) must survive, so we deactivate.
+    biz.delete(`/${table}/:id`, requireRole("owner", "admin"), h((req, res) => {
+      const c = ctx(req);
+      const id = Number(req.params.id);
+      const r = db.prepare(`UPDATE ${table} SET is_active = 0 WHERE id = ? AND org_id = ?`).run(id, c.orgId);
+      if (r.changes === 0) throw new HttpError(404, "not found");
+      storage.audit(c.orgId, c.userId, "delete", table.slice(0, -1), id, `Deactivated ${table.slice(0, -1)} #${id}`);
+      res.json({ ok: true, softDeleted: true });
     }));
   }
 
@@ -379,6 +416,12 @@ export function buildRouter(): Router {
     const c = ctx(req);
     const bill = storage.payBill(c.orgId, c.userId, Number(req.params.id), req.body);
     if (bill.status === "paid") emitEvent(c.orgId, "bill.paid", { billId: bill.id, number: bill.number, total: bill.total });
+    res.json(bill);
+  }));
+
+  biz.post("/bills/:id/void", requireRole("owner", "admin"), h((req, res) => {
+    const c = ctx(req);
+    const bill = storage.voidBill(c.orgId, c.userId, Number(req.params.id));
     res.json(bill);
   }));
 
@@ -769,6 +812,238 @@ export function buildRouter(): Router {
       ]);
     }
     res.json({ rows, total, page: q.page, pageSize: q.pageSize });
+  }));
+
+
+  /* ---------------- Phase 3: account maintenance ------------------- */
+
+  biz.put("/accounts/:id", requireRole("owner", "admin", "accountant"), h((req, res) => {
+    const c = ctx(req);
+    const id = Number(req.params.id);
+    const input = updateAccountSchema.parse(req.body);
+    const r = db.prepare("UPDATE accounts SET name = ?, is_active = ? WHERE id = ? AND org_id = ?")
+      .run(input.name, input.isActive ? 1 : 0, id, c.orgId);
+    if (r.changes === 0) throw new HttpError(404, "account not found");
+    storage.audit(c.orgId, c.userId, "update", "account", id, `Account renamed to ${input.name}${input.isActive ? "" : " (deactivated)"}`);
+    res.json({ ok: true });
+  }));
+
+  // Hard delete only when the account has never been used; otherwise the
+  // ledger's history must survive — deactivate via PUT instead.
+  biz.delete("/accounts/:id", requireRole("owner", "admin"), h((req, res) => {
+    const c = ctx(req);
+    const id = Number(req.params.id);
+    const acct = storage.accountById(c.orgId, id);
+    if (!acct) throw new HttpError(404, "account not found");
+    const used =
+      db.prepare("SELECT 1 FROM journal_lines WHERE org_id = ? AND account_id = ? LIMIT 1").get(c.orgId, id) ||
+      db.prepare("SELECT 1 FROM invoice_lines WHERE org_id = ? AND account_id = ? LIMIT 1").get(c.orgId, id) ||
+      db.prepare("SELECT 1 FROM bill_lines WHERE org_id = ? AND account_id = ? LIMIT 1").get(c.orgId, id) ||
+      db.prepare("SELECT 1 FROM budget_lines WHERE org_id = ? AND account_id = ? LIMIT 1").get(c.orgId, id);
+    if (used) throw new HttpError(409, "account has activity — deactivate it instead (PUT with isActive=false)");
+    db.prepare("DELETE FROM accounts WHERE id = ? AND org_id = ?").run(id, c.orgId);
+    storage.audit(c.orgId, c.userId, "delete", "account", id, `Deleted unused account ${acct.code} ${acct.name}`);
+    res.json({ ok: true });
+  }));
+
+  /* ---------------- Phase 3: manual journal entries ---------------- */
+
+  biz.get("/journal-entries", h((req, res) => {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize) || 25));
+    res.json(storage.listJournalEntries(ctx(req).orgId, page, pageSize));
+  }));
+
+  biz.get("/journal-entries/:id", h((req, res) => {
+    const c = ctx(req);
+    const entry = db.prepare("SELECT * FROM journal_entries WHERE org_id = ? AND id = ?").get(c.orgId, Number(req.params.id));
+    if (!entry) throw new HttpError(404, "journal entry not found");
+    const lines = db.prepare(
+      `SELECT jl.*, a.code AS account_code, a.name AS account_name FROM journal_lines jl
+       JOIN accounts a ON a.id = jl.account_id AND a.org_id = jl.org_id
+       WHERE jl.org_id = ? AND jl.entry_id = ?`,
+    ).all(c.orgId, Number(req.params.id));
+    res.json({ ...entry, lines });
+  }));
+
+  biz.post("/journal-entries", requireRole("owner", "admin", "accountant"), h((req, res) => {
+    const c = ctx(req);
+    const input = manualJournalSchema.parse(req.body);
+    const id = storage.createManualJournalEntry(c.orgId, c.userId, input);
+    res.status(201).json({ id });
+  }));
+
+  biz.post("/journal-entries/:id/reverse", requireRole("owner", "admin", "accountant"), h((req, res) => {
+    const c = ctx(req);
+    const input = reverseJournalSchema.parse(req.body);
+    const id = storage.reverseJournalEntry(c.orgId, c.userId, Number(req.params.id), input.date);
+    res.status(201).json({ id });
+  }));
+
+  /* ---------------- Phase 3: report pack II ------------------------ */
+
+  biz.get("/reports/balance-sheet", h((req, res) => {
+    const q = asOfQuerySchema.parse(req.query);
+    const bs = storage.balanceSheet(ctx(req).orgId, q.asOf ?? new Date().toISOString().slice(0, 10));
+    if (q.format === "csv") {
+      const rows = [
+        ...bs.assets.rows.map((r) => ({ section: "Assets", ...r })),
+        { section: "Assets", code: "", name: "TOTAL ASSETS", amount: bs.assets.total },
+        ...bs.liabilities.rows.map((r) => ({ section: "Liabilities", ...r })),
+        { section: "Liabilities", code: "", name: "TOTAL LIABILITIES", amount: bs.liabilities.total },
+        ...bs.equity.rows.map((r) => ({ section: "Equity", ...r })),
+        { section: "Equity", code: "", name: "TOTAL EQUITY", amount: bs.equity.total },
+      ];
+      return sendCsv(res, "balance-sheet.csv", rows, [
+        { header: "Section", value: (r) => r.section },
+        { header: "Code", value: (r) => r.code },
+        { header: "Account", value: (r) => r.name },
+        { header: "Amount", value: (r) => money(r.amount) },
+      ]);
+    }
+    res.json(bs);
+  }));
+
+  biz.get("/reports/general-ledger", h((req, res) => {
+    const q = glQuerySchema.parse(req.query);
+    const gl = storage.generalLedger(ctx(req).orgId, q.accountId, q.from, q.to);
+    if (q.format === "csv") {
+      return sendCsv(res, `general-ledger-${gl.account.code}.csv`, gl.lines, [
+        { header: "Date", value: (r) => r.date },
+        { header: "JE", value: (r) => r.entryId },
+        { header: "Memo", value: (r) => r.memo },
+        { header: "Source", value: (r) => r.source },
+        { header: "Debit", value: (r) => money(r.debit) },
+        { header: "Credit", value: (r) => money(r.credit) },
+        { header: "Balance", value: (r) => money(r.balance) },
+      ]);
+    }
+    res.json(gl);
+  }));
+
+  const agingColumns = [
+    { header: "Name", value: (r: storage.AgingRow) => r.party },
+    { header: "Current", value: (r: storage.AgingRow) => money(r.current) },
+    { header: "1-30", value: (r: storage.AgingRow) => money(r.d1_30) },
+    { header: "31-60", value: (r: storage.AgingRow) => money(r.d31_60) },
+    { header: "61-90", value: (r: storage.AgingRow) => money(r.d61_90) },
+    { header: "90+", value: (r: storage.AgingRow) => money(r.d90_plus) },
+    { header: "Total", value: (r: storage.AgingRow) => money(r.total) },
+  ];
+
+  biz.get("/reports/ar-aging", h((req, res) => {
+    const q = asOfQuerySchema.parse(req.query);
+    const rows = storage.arAging(ctx(req).orgId, q.asOf ?? new Date().toISOString().slice(0, 10));
+    if (q.format === "csv") return sendCsv(res, "ar-aging.csv", rows, agingColumns);
+    res.json(rows);
+  }));
+
+  biz.get("/reports/ap-aging", h((req, res) => {
+    const q = asOfQuerySchema.parse(req.query);
+    const rows = storage.apAging(ctx(req).orgId, q.asOf ?? new Date().toISOString().slice(0, 10));
+    if (q.format === "csv") return sendCsv(res, "ap-aging.csv", rows, agingColumns);
+    res.json(rows);
+  }));
+
+  biz.get("/reports/cash-flow", h((req, res) => {
+    const q = reportRangeSchema.parse(req.query);
+    const year = new Date().getFullYear();
+    const cf = storage.cashFlow(ctx(req).orgId, q.from ?? `${year}-01-01`, q.to ?? `${year}-12-31`);
+    if (q.format === "csv") {
+      return sendCsv(res, "cash-flow.csv", cf.byAccount, [
+        { header: "Code", value: (r) => r.code },
+        { header: "Account", value: (r) => r.name },
+        { header: "Opening", value: (r) => money(r.opening) },
+        { header: "Receipts", value: (r) => money(r.inflow) },
+        { header: "Payments", value: (r) => money(r.outflow) },
+        { header: "Closing", value: (r) => money(r.closing) },
+      ]);
+    }
+    res.json(cf);
+  }));
+
+  /* ---------------- Phase 3: org settings & team ------------------- */
+
+  biz.put("/settings/org", requireRole("owner", "admin"), h((req, res) => {
+    const c = ctx(req);
+    const input = orgUpdateSchema.parse(req.body);
+    db.prepare("UPDATE orgs SET name = ? WHERE id = ?").run(input.name, c.orgId);
+    storage.audit(c.orgId, c.userId, "update", "org", c.orgId, `Org renamed to ${input.name}`);
+    res.json({ ok: true });
+  }));
+
+  biz.get("/org/users", requireRole("owner", "admin"), h((req, res) => {
+    res.json(
+      db.prepare(
+        `SELECT u.id, u.email, u.name, ou.role, u.totp_enabled, u.created_at
+         FROM org_users ou JOIN users u ON u.id = ou.user_id WHERE ou.org_id = ? ORDER BY ou.id`,
+      ).all(ctx(req).orgId),
+    );
+  }));
+
+  biz.post("/org/users", requireRole("owner"), h(async (req, res) => {
+    const c = ctx(req);
+    const input = addOrgUserSchema.parse(req.body);
+    if (db.prepare("SELECT 1 FROM users WHERE email = ?").get(input.email.toLowerCase())) {
+      throw new HttpError(409, "a user with that email already exists");
+    }
+    const passwordHash = await bcrypt.hash(input.password, 10);
+    const run = db.transaction((): number => {
+      const u = db.prepare("INSERT INTO users (email, password_hash, name) VALUES (?,?,?)")
+        .run(input.email.toLowerCase(), passwordHash, input.name);
+      const userId = Number(u.lastInsertRowid);
+      db.prepare("INSERT INTO org_users (org_id, user_id, role) VALUES (?,?,?)").run(c.orgId, userId, input.role);
+      storage.audit(c.orgId, c.userId, "create", "user", userId, `Added ${input.email} as ${input.role}`);
+      return userId;
+    });
+    res.status(201).json({ id: run() });
+  }));
+
+  biz.put("/org/users/:userId", requireRole("owner"), h((req, res) => {
+    const c = ctx(req);
+    const targetId = Number(req.params.userId);
+    if (targetId === c.userId) throw new HttpError(409, "you cannot change your own role");
+    const input = updateOrgUserSchema.parse(req.body);
+    const r = db.prepare("UPDATE org_users SET role = ? WHERE org_id = ? AND user_id = ?").run(input.role, c.orgId, targetId);
+    if (r.changes === 0) throw new HttpError(404, "user is not a member of this org");
+    storage.audit(c.orgId, c.userId, "update", "user", targetId, `Role changed to ${input.role}`);
+    res.json({ ok: true });
+  }));
+
+  biz.delete("/org/users/:userId", requireRole("owner"), h((req, res) => {
+    const c = ctx(req);
+    const targetId = Number(req.params.userId);
+    if (targetId === c.userId) throw new HttpError(409, "you cannot remove yourself");
+    const run = db.transaction(() => {
+      const r = db.prepare("DELETE FROM org_users WHERE org_id = ? AND user_id = ?").run(c.orgId, targetId);
+      if (r.changes === 0) throw new HttpError(404, "user is not a member of this org");
+      db.prepare("DELETE FROM sessions WHERE org_id = ? AND user_id = ?").run(c.orgId, targetId);
+    });
+    run();
+    storage.audit(c.orgId, c.userId, "delete", "user", targetId, `Removed user #${targetId} from org`);
+    res.json({ ok: true });
+  }));
+
+  /* ---------------- Phase 3: bank statement import ------------------ */
+
+  biz.get("/bank/transactions", h((req, res) => {
+    const c = ctx(req);
+    const accountId = Number(req.query.accountId ?? 0);
+    if (!accountId) throw new HttpError(400, "accountId is required");
+    res.json(
+      db.prepare(
+        "SELECT * FROM bank_transactions WHERE org_id = ? AND account_id = ? ORDER BY date DESC, id DESC LIMIT 500",
+      ).all(c.orgId, accountId),
+    );
+  }));
+
+  biz.post("/bank/import", requireRole("owner", "admin", "accountant"), csvBody, h((req, res) => {
+    const c = ctx(req);
+    const accountId = Number(req.query.accountId ?? 0);
+    const acct = storage.accountById(c.orgId, accountId);
+    if (!acct || acct.subtype !== "bank") throw new HttpError(400, "accountId must be a bank account in this org");
+    const result = importers.importBankTransactions(c.orgId, c.userId, accountId, readCsv(req), isDryRun(req));
+    res.status(result.errors.length > 0 ? 400 : 200).json(result);
   }));
 
   /* ------------------------- error handler ------------------------ */

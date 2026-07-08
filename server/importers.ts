@@ -289,3 +289,38 @@ export function importOpeningBalances(orgId: number, userId: number, csvText: st
 
   return { inserted: lines.length, skipped: 0, errors, dryRun };
 }
+
+/* --------------------- Phase 3: bank statement import -------------- */
+
+/**
+ * Statement lines (date, description, amount as signed dollars) land in
+ * bank_transactions as unreconciled rows. Matching them to journal activity
+ * is a follow-up step — this importer only stages the statement.
+ */
+export function importBankTransactions(orgId: number, userId: number, accountId: number, csvText: string, dryRun: boolean): ImportResult {
+  const rows = parseCsv(csvText);
+  const errors: ImportRowError[] = [];
+  let inserted = 0;
+
+  runFileTransaction(() => {
+    const ins = db.prepare(
+      "INSERT INTO bank_transactions (org_id, account_id, date, description, amount) VALUES (?,?,?,?,?)",
+    );
+    rows.forEach((r, i) => {
+      const date = (r.date ?? "").trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date + "T00:00:00Z"))) {
+        return void errors.push({ row: rowNum(i), message: `invalid date "${date}"` });
+      }
+      const amount = dollarsSafe(r.amount ?? "");
+      if (!Number.isFinite(amount) || amount === 0) {
+        return void errors.push({ row: rowNum(i), message: `invalid amount "${r.amount}" (signed dollars, non-zero)` });
+      }
+      ins.run(orgId, accountId, date, (r.description ?? "").trim(), amount);
+      inserted++;
+    });
+    if (errors.length > 0) throw new HttpError(400, "bank import rejected: fix row errors");
+    if (!dryRun) audit(orgId, userId, "import", "bank_transaction", null, `Bank statement import: ${inserted} lines into account ${accountId}`);
+  }, dryRun);
+
+  return { inserted, skipped: 0, errors, dryRun };
+}

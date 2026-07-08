@@ -268,3 +268,46 @@ export const reportRangeSchema = z.object({
 export const budgetVsActualQuerySchema = reportRangeSchema.extend({
   budgetId: z.coerce.number().int().positive(),
 });
+
+/* ------------------------------------------------------------------ */
+/* Phase 3 additions                                                   */
+/* ------------------------------------------------------------------ */
+
+export const manualJournalSchema = z.object({
+  date: isoDate,
+  memo: z.string().min(1).max(500),
+  lines: z
+    .array(z.object({ accountId: z.number().int().positive(), debit: posCents.default(0), credit: posCents.default(0) }))
+    .min(2),
+});
+
+export const reverseJournalSchema = z.object({ date: isoDate });
+
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(8).max(200),
+});
+
+export const orgUpdateSchema = z.object({ name: z.string().min(1).max(120) });
+
+export const addOrgUserSchema = z.object({
+  email: z.string().email().max(254),
+  password: z.string().min(8).max(200),
+  name: z.string().min(1).max(120),
+  role: z.enum(ROLES),
+});
+export const updateOrgUserSchema = z.object({ role: z.enum(ROLES) });
+
+export const updateAccountSchema = z.object({
+  name: z.string().min(1).max(120),
+  isActive: z.boolean().default(true),
+});
+
+export const glQuerySchema = reportRangeSchema.extend({
+  accountId: z.coerce.number().int().positive(),
+});
+
+export const asOfQuerySchema = z.object({
+  asOf: isoDate.optional(),
+  format: z.enum(["json", "csv"]).default("json"),
+});

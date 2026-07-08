@@ -230,9 +230,13 @@
     const now = new Date(); const y = now.getFullYear();
     const links = [
       ["Trial balance", `/api/reports/trial-balance`],
+      ["Balance sheet", `/api/reports/balance-sheet`],
+      ["P&L by month", `/api/reports/profit-loss-monthly?from=${y}-01-01&to=${y}-12-31`],
+      ["Cash flow", `/api/reports/cash-flow?from=${y}-01-01&to=${y}-12-31`],
       ["Sales by customer", `/api/reports/sales-by-customer?from=${y}-01-01&to=${y}-12-31`],
       ["Expenses by vendor", `/api/reports/expenses-by-vendor?from=${y}-01-01&to=${y}-12-31`],
-      ["P&L by month", `/api/reports/profit-loss-monthly?from=${y}-01-01&to=${y}-12-31`],
+      ["A/R aging", `/api/reports/ar-aging`],
+      ["A/P aging", `/api/reports/ap-aging`],
       ...budgets.map((b) => [`Budget vs actual — ${b.name}`, `/api/reports/budget-vs-actual?budgetId=${b.id}`]),
     ];
     shell(`<h1>Reports</h1><div class="card"><table><thead><tr><th>Report</th><th>View</th><th>Export</th></tr></thead>

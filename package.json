@@ -13,7 +13,7 @@
     "seed": "tsx scripts/seed-demo.ts",
     "check": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "tsc --noEmit && eslint . && node --import tsx --test tests/fx.test.ts tests/totp.test.ts tests/import.test.ts tests/webhook.test.ts"
+    "test": "tsc --noEmit && eslint . && node --import tsx --test tests/fx.test.ts tests/totp.test.ts tests/import.test.ts tests/webhook.test.ts tests/phase3.test.ts"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
