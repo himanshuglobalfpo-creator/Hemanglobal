@@ -12,7 +12,8 @@
     "start": "tsx server/index.ts",
     "seed": "tsx scripts/seed-demo.ts",
     "check": "tsc --noEmit",
-    "test": "tsc --noEmit && node --import tsx --test tests/fx.test.ts tests/totp.test.ts tests/import.test.ts tests/webhook.test.ts"
+    "lint": "eslint .",
+    "test": "tsc --noEmit && eslint . && node --import tsx --test tests/fx.test.ts tests/totp.test.ts tests/import.test.ts tests/webhook.test.ts"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -23,10 +24,13 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/bcryptjs": "^2.4.6",
     "@types/better-sqlite3": "^7.6.11",
     "@types/express": "^4.17.21",
     "@types/node": "^22.5.0",
-    "typescript": "^5.5.4"
+    "eslint": "^10.6.0",
+    "typescript": "^5.5.4",
+    "typescript-eslint": "^8.63.0"
   }
 }

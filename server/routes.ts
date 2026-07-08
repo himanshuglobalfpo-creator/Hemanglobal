@@ -18,7 +18,6 @@ import {
   reportRangeSchema, budgetVsActualQuerySchema, openingBalanceMetaSchema, isoDate,
   ATTACHMENT_ENTITY_TYPES, ATTACHMENT_MIME_WHITELIST, ATTACHMENT_MAX_BYTES, WEBHOOK_EVENTS,
 } from "../shared/schema.js";
-import { formatMoney } from "../shared/money.js";
 import {
   requireAuth, requireRole, enforceOwnerMfa, createSession, destroySession,
   setSessionCookie, SESSION_COOKIE, type AuthContext,
@@ -47,14 +46,48 @@ export function buildRouter(): Router {
   /* Auth                                                             */
   /* ================================================================ */
 
-  router.post("/api/auth/register", h((req, res) => {
+  // Brute-force guard on password login: 10 FAILED attempts per 5 minutes
+  // per (ip, email) bucket. In-memory is fine for a single-node deployment;
+  // successful logins never count against the bucket.
+  const LOGIN_WINDOW_MS = 5 * 60_000;
+  const LOGIN_MAX_FAILURES = 10;
+  const loginFailures = new Map<string, number[]>();
+  const loginKey = (req: Request): string =>
+    `${req.ip ?? "?"}|${String((req.body as Record<string, unknown> | undefined)?.email ?? "").toLowerCase()}`;
+
+  const recordLoginFailure = (req: Request): void => {
+    const key = loginKey(req);
+    const now = Date.now();
+    const hits = (loginFailures.get(key) ?? []).filter((t) => now - t < LOGIN_WINDOW_MS);
+    hits.push(now);
+    loginFailures.set(key, hits);
+    if (loginFailures.size > 10_000) {
+      // bound the map: drop buckets whose newest failure has aged out
+      for (const [k, v] of loginFailures) if (now - (v[v.length - 1] ?? 0) >= LOGIN_WINDOW_MS) loginFailures.delete(k);
+    }
+  };
+
+  const loginRateLimit = (req: Request, res: Response, next: NextFunction): void => {
+    const now = Date.now();
+    const hits = (loginFailures.get(loginKey(req)) ?? []).filter((t) => now - t < LOGIN_WINDOW_MS);
+    if (hits.length >= LOGIN_MAX_FAILURES) {
+      res.status(429).json({ error: "too many failed login attempts; try again later", code: "RATE_LIMITED" });
+      return;
+    }
+    next();
+  };
+
+  router.post("/api/auth/register", h(async (req, res) => {
     const input = registerSchema.parse(req.body);
     const existing = db.prepare("SELECT 1 FROM users WHERE email = ?").get(input.email.toLowerCase());
     if (existing) throw new HttpError(409, "email already registered");
+    // bcrypt work happens async BEFORE the (synchronous) transaction so the
+    // event loop is never blocked and no await sits inside the tx.
+    const passwordHash = await bcrypt.hash(input.password, 10);
     const run = db.transaction(() => {
       const user = db
         .prepare("INSERT INTO users (email, password_hash, name) VALUES (?,?,?)")
-        .run(input.email.toLowerCase(), bcrypt.hashSync(input.password, 10), input.name);
+        .run(input.email.toLowerCase(), passwordHash, input.name);
       const org = db.prepare("INSERT INTO orgs (name, base_currency) VALUES (?,?)").run(input.orgName, input.baseCurrency);
       const userId = Number(user.lastInsertRowid);
       const orgId = Number(org.lastInsertRowid);
@@ -68,12 +101,13 @@ export function buildRouter(): Router {
     res.status(201).json({ userId, orgId });
   }));
 
-  router.post("/api/auth/login", h((req, res) => {
+  router.post("/api/auth/login", loginRateLimit, h(async (req, res) => {
     const input = loginSchema.parse(req.body);
     const user = db
       .prepare("SELECT id, password_hash, totp_enabled FROM users WHERE email = ?")
       .get(input.email.toLowerCase()) as { id: number; password_hash: string; totp_enabled: number } | undefined;
-    if (!user || !bcrypt.compareSync(input.password, user.password_hash)) {
+    if (!user || !(await bcrypt.compare(input.password, user.password_hash))) {
+      recordLoginFailure(req);
       throw new HttpError(401, "invalid credentials");
     }
     // TASK 2: correct password on an MFA-enabled account yields a short-lived
@@ -93,7 +127,7 @@ export function buildRouter(): Router {
     res.json({ ok: true });
   }));
 
-  router.post("/api/auth/mfa/verify", h((req, res) => {
+  router.post("/api/auth/mfa/verify", h(async (req, res) => {
     const input = mfaVerifySchema.parse(req.body);
     const challenge = db
       .prepare("SELECT * FROM mfa_challenges WHERE token = ? AND used = 0 AND expires_at > datetime('now')")
@@ -123,7 +157,10 @@ export function buildRouter(): Router {
       ok = verifyTotp(vaultDecrypt(user.totp_secret), input.code);
     } else if (input.recoveryCode && user.recovery_codes) {
       const hashes: string[] = JSON.parse(user.recovery_codes);
-      const idx = hashes.findIndex((hash) => bcrypt.compareSync(input.recoveryCode as string, hash));
+      let idx = -1;
+      for (let i = 0; i < hashes.length; i++) {
+        if (await bcrypt.compare(input.recoveryCode, hashes[i])) { idx = i; break; }
+      }
       if (idx >= 0) {
         hashes.splice(idx, 1); // single-use: burn the matched hash
         db.prepare("UPDATE users SET recovery_codes = ? WHERE id = ?").run(JSON.stringify(hashes), user.id);
@@ -169,14 +206,14 @@ export function buildRouter(): Router {
     res.json({ secret, otpauthUri: otpauthUri(secret, c.email) });
   }));
 
-  router.post("/api/auth/mfa/enable", requireAuth, h((req, res) => {
+  router.post("/api/auth/mfa/enable", requireAuth, h(async (req, res) => {
     const c = ctx(req);
     const input = mfaEnableSchema.parse(req.body);
     const secret = pendingTotpSecrets.get(c.userId);
     if (!secret) throw new HttpError(400, "call /api/auth/mfa/setup first");
     if (!verifyTotp(secret, input.code)) throw new HttpError(400, "code does not match — check your authenticator clock");
     const recoveryCodes = generateRecoveryCodes(8);
-    const hashes = recoveryCodes.map((code) => bcrypt.hashSync(code, 10));
+    const hashes = await Promise.all(recoveryCodes.map((code) => bcrypt.hash(code, 10)));
     db.prepare("UPDATE users SET totp_secret = ?, totp_enabled = 1, recovery_codes = ? WHERE id = ?")
       .run(vaultEncrypt(secret), JSON.stringify(hashes), c.userId);
     pendingTotpSecrets.delete(c.userId);
@@ -185,14 +222,14 @@ export function buildRouter(): Router {
     res.json({ ok: true, recoveryCodes });
   }));
 
-  router.post("/api/auth/mfa/disable", requireAuth, h((req, res) => {
+  router.post("/api/auth/mfa/disable", requireAuth, h(async (req, res) => {
     const c = ctx(req);
     const input = mfaDisableSchema.parse(req.body);
     const user = db.prepare("SELECT password_hash, totp_secret FROM users WHERE id = ?").get(c.userId) as {
       password_hash: string;
       totp_secret: string | null;
     };
-    if (!bcrypt.compareSync(input.password, user.password_hash)) throw new HttpError(401, "wrong password");
+    if (!(await bcrypt.compare(input.password, user.password_hash))) throw new HttpError(401, "wrong password");
     if (!user.totp_secret || !verifyTotp(vaultDecrypt(user.totp_secret), input.code)) throw new HttpError(401, "invalid code");
     db.prepare("UPDATE users SET totp_secret = NULL, totp_enabled = 0, recovery_codes = NULL WHERE id = ?").run(c.userId);
     storage.audit(c.orgId, c.userId, "update", "user", c.userId, "MFA disabled");
@@ -768,6 +805,3 @@ export function buildRouter(): Router {
 
   return router;
 }
-
-/** formatMoney is re-exported so PDF/statement templates share one impl. */
-export { formatMoney };

@@ -7,7 +7,6 @@
  *  - documents in a foreign currency store BOTH foreign cents and base cents
  *    converted at the document-date rate (per-line rounding, then summed).
  */
-import crypto from "node:crypto";
 import { z } from "zod";
 import { db } from "./db.js";
 import {
@@ -19,7 +18,6 @@ import {
 import { convertCents } from "../shared/money.js";
 
 type InvoiceInput = z.infer<typeof insertInvoiceSchema>;
-type BillInput = z.infer<typeof insertBillSchema>;
 type PaymentInput = z.infer<typeof paymentSchema>;
 type CreditNoteInput = z.infer<typeof insertCreditNoteSchema>;
 
