@@ -19,7 +19,7 @@ SQLite (better-sqlite3) / Zod. Vanilla-JS single-page client served statically.
 npm install
 npm start            # http://localhost:3000
 npm run check        # tsc --noEmit
-npm test             # tsc --noEmit + node --test (24 tests)
+npm test             # tsc --noEmit + eslint + node --test (53 tests)
 ```
 
 Register an account in the UI — this creates your org, seeds the chart of
@@ -72,6 +72,7 @@ and are idempotent, so upgrades are: pull, install, restart.
 | `0005_budgets.sql` | `budgets`, `budget_lines` (month 1–12, integer cents) |
 | `0006_webhooks.sql` | `webhooks`, `webhook_deliveries` |
 | `0007_hot_path_indexes.sql` | Composite indexes for paginated lists, party reports, P&L/budget aggregation, webhook due-scan, audit filters |
+| `0008_bank_reconciliation.sql` | Bank rec: transaction status + import hash, `bank_matches` join table, `reconciliations` history |
 
 ## Multi-currency model (single-rate, phase 1)
 
@@ -118,11 +119,37 @@ Drivers: `local` (default) or `s3` (SigV4 with plain `fetch`, no SDK).
 
 All under `/api/reports/*`, all accept `?from=&to=` and **`?format=csv`**
 (RFC 4180 via `server/csv.ts`, CRLF, quotes doubled — opens cleanly in Excel):
-`trial-balance`, `sales-by-customer`, `expenses-by-vendor`,
-`profit-loss-monthly` (one column per calendar month), and
-`budget-vs-actual?budgetId=` (variance is favorable-positive: income above
-budget / expense below budget; actuals use the same aggregation as the P&L so
-the two always tie).
+`trial-balance`, `balance-sheet` (A = L + E with current earnings rolled
+into equity), `profit-loss-monthly` (one column per calendar month),
+`cash-flow` (cash-basis over bank accounts), `general-ledger?accountId=`
+(running balance), `ar-aging` / `ap-aging` (current/1-30/31-60/61-90/90+),
+`sales-by-customer`, `expenses-by-vendor`, and `budget-vs-actual?budgetId=`
+(variance is favorable-positive; actuals use the same aggregation as the
+P&L so the two always tie).
+
+## Journals, team & company
+
+Manual journal entries (`POST /api/journal-entries`, balanced-or-rejected)
+with one-shot reversal (`POST /api/journal-entries/:id/reverse`); bill void;
+team management under `/api/org/users` (owner adds/re-roles/removes members);
+self-service password change; org rename; account edit/deactivate and
+delete-if-unused; case-insensitive duplicate prevention and soft delete for
+customers/vendors. Posted invoices/bills are immutable by design — void and
+reissue (audit-trail discipline).
+
+## Bank reconciliation
+
+Statement lines import via `POST /api/bank/import?accountId=` (CSV:
+`date,description,amount` signed dollars; sha256 dedup makes re-imports a
+no-op). `GET /api/bank/suggestions` proposes exact-amount matches within ±7
+days; `POST /api/bank/transactions/:id/match {entryIds}` clears one line
+against one or MANY journal entries (a single deposit covering several
+invoice payments); `categorize` posts a balanced JE from signed splits
+(merchant fees, transfers) and clears the line in one step; `exclude` parks
+duplicates. `POST /api/bank/reconcile` returns the classic identity —
+statement ending balance + deposits in transit − outstanding checks =
+ledger balance — with itemized outstanding lists, and `complete:true`
+persists the reconciliation only when the difference is zero.
 
 ## Data import
 

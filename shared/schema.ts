@@ -72,7 +72,15 @@ export const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024; // documented 10 MB limit
 export const isoDate = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be YYYY-MM-DD")
-  .refine((d) => !Number.isNaN(Date.parse(d + "T00:00:00Z")), "invalid calendar date");
+  .refine((d) => {
+    // NB: Date.parse silently rolls day overflow ("2026-02-30" → Mar 2),
+    // so validate the calendar ourselves: month 1-12 and day within that
+    // month's real length (leap years included via Date.UTC(y, m, 0)).
+    const [y, m, day] = d.split("-").map(Number);
+    if (m < 1 || m > 12) return false;
+    const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    return day >= 1 && day <= daysInMonth;
+  }, "invalid calendar date");
 
 export const cents = z.number().int("money must be integer cents");
 export const posCents = cents.nonnegative();

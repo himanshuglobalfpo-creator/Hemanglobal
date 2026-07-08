@@ -303,8 +303,9 @@ export function createInvoice(orgId: number, userId: number, raw: unknown): Invo
   assertPeriodOpen(orgId, input.date);
   const customer = db
     .prepare("SELECT * FROM customers WHERE org_id = ? AND id = ?")
-    .get(orgId, input.customerId) as { id: number; name: string; currency: string | null } | undefined;
+    .get(orgId, input.customerId) as { id: number; name: string; currency: string | null; is_active: number } | undefined;
   if (!customer) throw new HttpError(404, "customer not found");
+  if (!customer.is_active) throw new HttpError(409, "customer is deactivated — reactivate before invoicing", "PARTY_INACTIVE");
 
   // Customer's currency is the default document currency when none is given.
   const wanted = input.currency ?? customer.currency ?? undefined;
@@ -323,9 +324,15 @@ export function createInvoice(orgId: number, userId: number, raw: unknown): Invo
   const baseTax = computed.reduce((s, l) => s + l.baseTax, 0);
   const baseTotal = baseSubtotal + baseTax;
 
+  if (baseTotal <= 0) {
+    throw new HttpError(400, "invoice total must be greater than zero", "ZERO_DOCUMENT");
+  }
   const ar = accountByCode(orgId, "1100");
   const taxAcct = accountByCode(orgId, "2100");
   const number = input.number ?? nextDocNumber(orgId, "invoices", "INV");
+  if (input.number && db.prepare("SELECT 1 FROM invoices WHERE org_id = ? AND number = ?").get(orgId, input.number)) {
+    throw new HttpError(409, `invoice number ${input.number} already exists`, "DUPLICATE_NUMBER");
+  }
 
   const run = db.transaction((): number => {
     const res = db
@@ -507,8 +514,9 @@ export function createBill(orgId: number, userId: number, raw: unknown): BillRow
   assertPeriodOpen(orgId, input.date);
   const vendor = db
     .prepare("SELECT * FROM vendors WHERE org_id = ? AND id = ?")
-    .get(orgId, input.vendorId) as { id: number; name: string; currency: string | null } | undefined;
+    .get(orgId, input.vendorId) as { id: number; name: string; currency: string | null; is_active: number } | undefined;
   if (!vendor) throw new HttpError(404, "vendor not found");
+  if (!vendor.is_active) throw new HttpError(409, "vendor is deactivated — reactivate before billing", "PARTY_INACTIVE");
 
   const wanted = input.currency ?? vendor.currency ?? undefined;
   const fx = resolveDocCurrency(orgId, { currency: wanted, fxRate: input.fxRate, date: input.date });
@@ -525,9 +533,15 @@ export function createBill(orgId: number, userId: number, raw: unknown): BillRow
   const baseTax = computed.reduce((s, l) => s + l.baseTax, 0);
   const baseTotal = baseSubtotal + baseTax;
 
+  if (baseTotal <= 0) {
+    throw new HttpError(400, "bill total must be greater than zero", "ZERO_DOCUMENT");
+  }
   const ap = accountByCode(orgId, "2000");
   const taxAcct = accountByCode(orgId, "2100");
   const number = input.number ?? nextDocNumber(orgId, "bills", "BILL");
+  if (input.number && db.prepare("SELECT 1 FROM bills WHERE org_id = ? AND number = ?").get(orgId, input.number)) {
+    throw new HttpError(409, `bill number ${input.number} already exists`, "DUPLICATE_NUMBER");
+  }
 
   const run = db.transaction((): number => {
     const res = db
@@ -957,6 +971,7 @@ export function createManualJournalEntry(orgId: number, userId: number, input: M
   if (dr !== cr) {
     throw new HttpError(400, `entry does not balance: debits ${(dr / 100).toFixed(2)} != credits ${(cr / 100).toFixed(2)}`);
   }
+  if (dr === 0) throw new HttpError(400, "journal entry amount must be greater than zero", "ZERO_JOURNAL");
   const run = db.transaction((): number => {
     const id = postJournalEntry(orgId, input.date, input.memo, "manual", null, input.lines);
     audit(orgId, userId, "create", "journal_entry", id, `Manual JE ${(dr / 100).toFixed(2)}: ${input.memo}`);
