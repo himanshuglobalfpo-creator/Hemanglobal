@@ -311,3 +311,26 @@ export const asOfQuerySchema = z.object({
   asOf: isoDate.optional(),
   format: z.enum(["json", "csv"]).default("json"),
 });
+
+/* ------------------------------------------------------------------ */
+/* Phase 5: bank reconciliation                                        */
+/* ------------------------------------------------------------------ */
+
+export const bankMatchSchema = z.object({
+  entryIds: z.array(z.number().int().positive()).min(1).max(50),
+});
+
+export const bankCategorizeSchema = z.object({
+  memo: z.string().max(500).optional(),
+  splits: z
+    .array(z.object({ accountId: z.number().int().positive(), amount: cents.refine((v) => v !== 0, "non-zero") }))
+    .min(1)
+    .max(50),
+});
+
+export const bankReconcileSchema = z.object({
+  accountId: z.number().int().positive(),
+  statementDate: isoDate,
+  endingBalance: cents,
+  complete: z.boolean().default(false),
+});

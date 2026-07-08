@@ -30,7 +30,7 @@
   /* ---------------- shell ---------------- */
   const NAV = [
     ["#/dashboard", "Dashboard"], ["#/customers", "Customers"], ["#/vendors", "Vendors"],
-    ["#/invoices", "Invoices"], ["#/bills", "Bills"], ["#/reports", "Reports"],
+    ["#/invoices", "Invoices"], ["#/bills", "Bills"], ["#/banking", "Banking"], ["#/reports", "Reports"],
     ["#/budgets", "Budgets"], ["#/import", "Import"], ["#/audit", "Audit"], ["#/settings", "Settings"],
   ];
   function shell(content) {
@@ -223,6 +223,72 @@
       };
     };
     render();
+  }
+
+
+  /* Phase 5: bank reconciliation */
+  async function bankingPage() {
+    const accounts = await api("/api/accounts");
+    const banks = accounts.filter((a) => a.subtype === "bank");
+    const params = new URLSearchParams(location.hash.split("?")[1] || "");
+    const acctId = Number(params.get("account")) || (banks[0] && banks[0].id);
+    const [txs, suggestions] = acctId
+      ? await Promise.all([api(`/api/bank/transactions?accountId=${acctId}`), api(`/api/bank/suggestions?accountId=${acctId}`)])
+      : [[], []];
+    const suggByTx = {};
+    suggestions.forEach((s) => { suggByTx[s.bankTransactionId] = s.candidates; });
+    shell(`<h1>Banking</h1>
+      <div class="card"><div class="row">
+        <label>Account <select id="bacct">${banks.map((b) => `<option value="${b.id}" ${b.id === acctId ? "selected" : ""}>${esc(b.code)} ${esc(b.name)}</option>`).join("")}</select></label>
+      </div>
+      <h2>Import statement (CSV: date,description,amount — signed dollars)</h2>
+      <textarea id="bcsv" rows="4" style="width:100%" placeholder="date,description,amount\n2026-01-05,Deposit,1500.00\n2026-01-06,Card payment,-42.50"></textarea>
+      <div class="row" style="margin-top:8px"><button id="bimp">Import</button><span class="muted" id="bimpout"></span></div></div>
+      <div class="card"><h2>Statement lines</h2>
+      <table><thead><tr><th>Date</th><th>Description</th><th class="num">Amount</th><th>Status</th><th></th></tr></thead>
+      <tbody>${txs.map((t) => {
+        const cands = suggByTx[t.id] || [];
+        return `<tr><td>${esc(t.date)}</td><td>${esc(t.description)}</td><td class="num">${money(t.amount)}</td>
+          <td><span class="badge ${t.status === "matched" ? "paid" : t.status === "excluded" ? "void" : ""}">${esc(t.status)}</span></td>
+          <td>${t.status === "unmatched" && cands.length ? `<button class="ghost" data-bmatch="${t.id}" data-entry="${cands[0].entryId}">Match JE #${cands[0].entryId}</button>` : ""}
+              ${t.status === "unmatched" ? `<button class="ghost" data-bcat="${t.id}" data-amt="${t.amount}">Categorize</button><button class="ghost" data-bexc="${t.id}">Exclude</button>` : ""}
+              ${t.status !== "unmatched" ? `<button class="ghost" data-bunm="${t.id}">Undo</button>` : ""}</td></tr>`;
+      }).join("") || `<tr><td colspan="5" class="muted">no statement lines</td></tr>`}</tbody></table></div>
+      <div class="card"><h2>Reconcile</h2><div class="row">
+        <input id="rdate" type="date" value="${new Date().toISOString().slice(0, 10)}">
+        <input id="rbal" type="number" step="0.01" placeholder="Statement ending balance">
+        <button id="rrun">Check</button><button class="ghost" id="rdone">Complete</button></div>
+        <pre id="rout" class="muted"></pre></div>`);
+    qs("#bacct").onchange = () => { location.hash = `#/banking?account=${val("#bacct")}`; };
+    qs("#bimp").onclick = async () => {
+      const res = await fetch(`/api/bank/import?accountId=${acctId}`, { method: "POST", headers: { "Content-Type": "text/csv" }, body: qs("#bcsv").value });
+      qs("#bimpout").textContent = JSON.stringify(await res.json());
+      if (res.ok) route();
+    };
+    const reconcile = async (complete) => {
+      try {
+        const r = await api("/api/bank/reconcile", { method: "POST", body: { accountId: acctId, statementDate: val("#rdate"), endingBalance: Math.round(Number(val("#rbal")) * 100), complete } });
+        qs("#rout").textContent = `cleared ${money(r.clearedBalance)} | ledger ${money(r.ledgerBalance)} | deposits in transit ${money(r.depositsInTransit)} | outstanding checks ${money(r.outstandingChecks)} | difference ${money(r.difference)} ${r.reconciled ? "— RECONCILED ✓" : ""}\n` +
+          r.outstandingItems.map((o) => `  outstanding: ${o.date} JE#${o.entryId} ${money(o.amount)} ${o.memo}`).join("\n");
+      } catch (e) { qs("#rout").textContent = e.message; }
+    };
+    qs("#rrun").onclick = () => reconcile(false);
+    qs("#rdone").onclick = () => reconcile(true);
+    app.onclick = async (ev) => {
+      const t = (a) => ev.target.getAttribute && ev.target.getAttribute(a);
+      try {
+        if (t("data-bmatch")) { await api(`/api/bank/transactions/${t("data-bmatch")}/match`, { method: "POST", body: { entryIds: [Number(t("data-entry"))] } }); route(); }
+        if (t("data-bexc")) { await api(`/api/bank/transactions/${t("data-bexc")}/exclude`, { method: "POST" }); route(); }
+        if (t("data-bunm")) { await api(`/api/bank/transactions/${t("data-bunm")}/unmatch`, { method: "POST" }); route(); }
+        if (t("data-bcat")) {
+          const code = prompt("Category account code (e.g. 4000 sales, 6000 expense):"); if (!code) return;
+          const acct = accounts.find((a) => a.code === code.trim()); if (!acct) return alert("unknown code");
+          const amt = Number(t("data-amt"));
+          await api(`/api/bank/transactions/${t("data-bcat")}/categorize`, { method: "POST", body: { splits: [{ accountId: acct.id, amount: amt }] } });
+          route();
+        }
+      } catch (e) { alert(e.message); }
+    };
   }
 
   async function reportsPage() {
@@ -436,6 +502,7 @@
       if (hash.startsWith("#/vendors")) return await partiesPage("vendors");
       if (hash.startsWith("#/invoices")) return await docsPage("invoices");
       if (hash.startsWith("#/bills")) return await docsPage("bills");
+      if (hash.startsWith("#/banking")) return await bankingPage();
       if (hash.startsWith("#/reports")) return await reportsPage();
       if (hash.startsWith("#/budgets")) return await budgetsPage();
       if (hash.startsWith("#/import")) return await importPage();

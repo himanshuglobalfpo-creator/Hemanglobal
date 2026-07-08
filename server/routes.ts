@@ -18,6 +18,7 @@ import {
   reportRangeSchema, budgetVsActualQuerySchema, openingBalanceMetaSchema, isoDate,
   ATTACHMENT_ENTITY_TYPES, ATTACHMENT_MIME_WHITELIST, ATTACHMENT_MAX_BYTES, WEBHOOK_EVENTS,
   manualJournalSchema, reverseJournalSchema, changePasswordSchema, orgUpdateSchema,
+  bankMatchSchema, bankCategorizeSchema, bankReconcileSchema,
   addOrgUserSchema, updateOrgUserSchema, updateAccountSchema, glQuerySchema, asOfQuerySchema,
 } from "../shared/schema.js";
 import {
@@ -30,6 +31,7 @@ import { emitEvent, assertUrlIsPublic, runDeliveryPass } from "./webhooks.js";
 import { fileDriver, newStorageKey } from "./files.js";
 import { sendCsv, type CsvColumn } from "./csv.js";
 import * as importers from "./importers.js";
+import * as bank from "./bank.js";
 import { invoiceDocumentHtml, customerStatementHtml } from "./documents.js";
 
 const ctx = (req: Request): AuthContext => req.ctx as AuthContext;
@@ -1044,6 +1046,56 @@ export function buildRouter(): Router {
     if (!acct || acct.subtype !== "bank") throw new HttpError(400, "accountId must be a bank account in this org");
     const result = importers.importBankTransactions(c.orgId, c.userId, accountId, readCsv(req), isDryRun(req));
     res.status(result.errors.length > 0 ? 400 : 200).json(result);
+  }));
+
+  /* ------------- Phase 5: bank reconciliation engine ---------------- */
+
+  biz.get("/bank/suggestions", h((req, res) => {
+    const c = ctx(req);
+    const accountId = Number(req.query.accountId ?? 0);
+    if (!accountId) throw new HttpError(400, "accountId is required");
+    res.json(bank.suggestMatches(c.orgId, accountId));
+  }));
+
+  biz.post("/bank/transactions/:id/match", requireRole("owner", "admin", "accountant"), h((req, res) => {
+    const c = ctx(req);
+    const input = bankMatchSchema.parse(req.body);
+    bank.matchBankTransaction(c.orgId, c.userId, Number(req.params.id), input.entryIds);
+    res.json({ ok: true });
+  }));
+
+  biz.post("/bank/transactions/:id/unmatch", requireRole("owner", "admin", "accountant"), h((req, res) => {
+    const c = ctx(req);
+    bank.unmatchBankTransaction(c.orgId, c.userId, Number(req.params.id));
+    res.json({ ok: true });
+  }));
+
+  biz.post("/bank/transactions/:id/exclude", requireRole("owner", "admin", "accountant"), h((req, res) => {
+    const c = ctx(req);
+    bank.excludeBankTransaction(c.orgId, c.userId, Number(req.params.id));
+    res.json({ ok: true });
+  }));
+
+  biz.post("/bank/transactions/:id/categorize", requireRole("owner", "admin", "accountant"), h((req, res) => {
+    const c = ctx(req);
+    const input = bankCategorizeSchema.parse(req.body);
+    const entryId = bank.categorizeBankTransaction(c.orgId, c.userId, Number(req.params.id), input.memo ?? "", input.splits);
+    res.status(201).json({ entryId });
+  }));
+
+  biz.post("/bank/reconcile", requireRole("owner", "admin", "accountant"), h((req, res) => {
+    const c = ctx(req);
+    const input = bankReconcileSchema.parse(req.body);
+    res.json(bank.reconcileAccount(c.orgId, c.userId, input.accountId, input.statementDate, input.endingBalance, input.complete));
+  }));
+
+  biz.get("/bank/reconciliations", h((req, res) => {
+    const c = ctx(req);
+    const accountId = Number(req.query.accountId ?? 0);
+    if (!accountId) throw new HttpError(400, "accountId is required");
+    res.json(db.prepare(
+      "SELECT * FROM reconciliations WHERE org_id = ? AND account_id = ? ORDER BY statement_date DESC LIMIT 50",
+    ).all(c.orgId, accountId));
   }));
 
   /* ------------------------- error handler ------------------------ */

@@ -16,6 +16,7 @@ import { db } from "./db.js";
 import { ACCOUNT_TYPES, ACCOUNT_SUBTYPES, type ImportResult, type ImportRowError } from "../shared/schema.js";
 import { dollarsToCents } from "../shared/money.js";
 import { accountByCode, audit, createInvoice, postJournalEntry, assertPeriodOpen, HttpError } from "./storage.js";
+import { bankImportHash } from "./bank.js";
 
 class DryRunRollback extends Error {}
 
@@ -302,10 +303,19 @@ export function importBankTransactions(orgId: number, userId: number, accountId:
   const errors: ImportRowError[] = [];
   let inserted = 0;
 
+  let skipped = 0;
   runFileTransaction(() => {
     const ins = db.prepare(
-      "INSERT INTO bank_transactions (org_id, account_id, date, description, amount) VALUES (?,?,?,?,?)",
+      "INSERT INTO bank_transactions (org_id, account_id, date, description, amount, import_hash) VALUES (?,?,?,?,?,?)",
     );
+    const countByHash = db.prepare(
+      "SELECT COUNT(*) AS n FROM bank_transactions WHERE org_id = ? AND import_hash = ?",
+    );
+    // Duplicate rule: identical lines WITHIN one file are legitimate (two
+    // equal card charges the same day), but a line already imported by a
+    // PREVIOUS run is a duplicate. So each hash may only be inserted up to
+    // (occurrences in this file) minus (rows already in the DB).
+    const seenInFile = new Map<string, number>();
     rows.forEach((r, i) => {
       const date = (r.date ?? "").trim();
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date + "T00:00:00Z"))) {
@@ -315,12 +325,21 @@ export function importBankTransactions(orgId: number, userId: number, accountId:
       if (!Number.isFinite(amount) || amount === 0) {
         return void errors.push({ row: rowNum(i), message: `invalid amount "${r.amount}" (signed dollars, non-zero)` });
       }
-      ins.run(orgId, accountId, date, (r.description ?? "").trim(), amount);
+      const description = (r.description ?? "").trim();
+      const hash = bankImportHash(accountId, date, amount, description);
+      const occurrence = (seenInFile.get(hash) ?? 0) + 1;
+      seenInFile.set(hash, occurrence);
+      const existing = (countByHash.get(orgId, hash) as { n: number }).n;
+      if (occurrence <= existing) {
+        skipped++; // this exact line was already imported by an earlier run
+        return;
+      }
+      ins.run(orgId, accountId, date, description, amount, hash);
       inserted++;
     });
     if (errors.length > 0) throw new HttpError(400, "bank import rejected: fix row errors");
-    if (!dryRun) audit(orgId, userId, "import", "bank_transaction", null, `Bank statement import: ${inserted} lines into account ${accountId}`);
+    if (!dryRun) audit(orgId, userId, "import", "bank_transaction", null, `Bank statement import: ${inserted} inserted, ${skipped} duplicates skipped (account ${accountId})`);
   }, dryRun);
 
-  return { inserted, skipped: 0, errors, dryRun };
+  return { inserted, skipped, errors, dryRun };
 }
