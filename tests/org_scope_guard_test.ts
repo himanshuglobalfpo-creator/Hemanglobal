@@ -70,6 +70,9 @@ const BUSINESS_TABLES = [
   "depreciationEntries",
   "fxRevaluations",
   "fxRevaluationLines",
+  "employees",
+  "payrollRuns",
+  "payrollItems",
 ];
 
 // (method, table) pairs where an unscoped .from(table) inside that method is

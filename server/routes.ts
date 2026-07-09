@@ -18,6 +18,9 @@ import {
   disposeFixedAssetSchema,
   postDepreciationQuerySchema,
   revalueFxSchema,
+  createEmployeeSchema,
+  updateEmployeeSchema,
+  createPayrollRunSchema,
   insertCustomerSchema,
   insertVendorSchema,
   postJournalEntrySchema,
@@ -633,6 +636,56 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   );
   app.post("/api/fx/revalue/:id/reverse", requireRole("owner", "admin", "accountant"), (req, res) =>
     handle(res, () => storage.reverseFxRevaluation(parseId(req.params.id)))
+  );
+
+  // ---------- Payroll ----------
+  app.get("/api/payroll/employees", (req, res) =>
+    handle(res, () => {
+      const { limit, offset } = paginationQuerySchema.parse(req.query);
+      return storage.listEmployees(limit, offset);
+    })
+  );
+  app.get("/api/payroll/employees/:id", (req, res) =>
+    handle(res, async () => {
+      const emp = await storage.getEmployee(parseId(req.params.id));
+      if (!emp) throw new Error("Employee not found");
+      return emp;
+    })
+  );
+  app.post("/api/payroll/employees", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => storage.createEmployee(createEmployeeSchema.parse(req.body)))
+  );
+  app.patch("/api/payroll/employees/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const id = parseId(req.params.id);
+      const { ifUnmodifiedSince, ...body } = req.body ?? {};
+      const data = updateEmployeeSchema.parse(body);
+      assertUnmodifiedSince(await storage.getEmployee(id), ifUnmodifiedSince);
+      return storage.updateEmployee(id, data);
+    })
+  );
+  app.delete("/api/payroll/employees/:id", requireRole("owner", "admin"), (req, res) =>
+    handle(res, () => storage.deleteEmployee(parseId(req.params.id)))
+  );
+
+  app.get("/api/payroll/runs", (req, res) =>
+    handle(res, () => {
+      const { limit, offset } = paginationQuerySchema.parse(req.query);
+      return storage.listPayrollRuns(limit, offset);
+    })
+  );
+  app.get("/api/payroll/runs/:id", (req, res) =>
+    handle(res, async () => {
+      const run = await storage.getPayrollRun(parseId(req.params.id));
+      if (!run) throw new Error("Pay run not found");
+      return run;
+    })
+  );
+  app.post("/api/payroll/runs", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => storage.createPayrollRun(createPayrollRunSchema.parse(req.body)))
+  );
+  app.post("/api/payroll/runs/:id/post", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => storage.postPayrollRun(parseId(req.params.id)))
   );
 
   app.get("/api/accounts", (_req, res) => handle(res, () => storage.listAccounts()));

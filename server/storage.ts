@@ -31,12 +31,16 @@ import {
   depreciationEntries,
   fxRevaluations,
   fxRevaluationLines,
+  employees,
+  payrollRuns,
+  payrollItems,
   type OrgNexusState,
   type NexusStateInput,
 } from "@shared/schema";
 import { organizations } from "@shared/auth-schema";
 import { applyPurchase, costOfSale, buildCogsJournalLines, type CogsComponent } from "@shared/inventory";
 import { computeDepreciationSchedule, lastDayOfPeriod, periodOf, addMonthsToPeriod, type DepreciationPeriod } from "@shared/depreciation";
+import { computeEmployeePayroll, salaryGrossForPeriod, hourlyGross, type EmployeePayrollResult } from "@shared/payroll";
 import type {
   Account,
   InsertAccount,
@@ -98,6 +102,12 @@ import type {
   FxRevaluation,
   FxRevaluationLine,
   RevalueFxInput,
+  Employee,
+  PayrollRun,
+  PayrollItem,
+  CreateEmployeeInput,
+  UpdateEmployeeInput,
+  CreatePayrollRunInput,
 } from "@shared/schema";
 import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
@@ -215,6 +225,8 @@ const DEFAULT_COA: InsertAccount[] = [
   { code: "2000", name: "Accounts Payable", type: "liability", subtype: "current_liability", isActive: true },
   { code: "2100", name: "Sales Tax Payable", type: "liability", subtype: "current_liability", isActive: true },
   { code: "2200", name: "Credit Card", type: "liability", subtype: "credit_card", isActive: true },
+  { code: "2300", name: "Payroll Taxes Payable", type: "liability", subtype: "current_liability", isActive: true },
+  { code: "2310", name: "Payroll Deductions Payable", type: "liability", subtype: "current_liability", isActive: true },
   // Equity (3000-3999)
   { code: "3000", name: "Owner's Equity", type: "equity", subtype: "equity", isActive: true },
   { code: "3100", name: "Retained Earnings", type: "equity", subtype: "equity", isActive: true },
@@ -230,6 +242,7 @@ const DEFAULT_COA: InsertAccount[] = [
   { code: "6100", name: "Utilities", type: "expense", subtype: "operating_expense", isActive: true },
   { code: "6200", name: "Office Supplies", type: "expense", subtype: "operating_expense", isActive: true },
   { code: "6300", name: "Salaries & Wages", type: "expense", subtype: "operating_expense", isActive: true },
+  { code: "6350", name: "Payroll Tax Expense", type: "expense", subtype: "operating_expense", isActive: true },
   { code: "6400", name: "Marketing & Advertising", type: "expense", subtype: "operating_expense", isActive: true },
   { code: "6500", name: "Software & Subscriptions", type: "expense", subtype: "operating_expense", isActive: true },
   { code: "6600", name: "Professional Fees", type: "expense", subtype: "operating_expense", isActive: true },
@@ -239,6 +252,27 @@ const DEFAULT_COA: InsertAccount[] = [
 
 function nowIso(): string {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
+}
+
+// Maps a computed payroll result onto the payroll_items money columns.
+function payrollItemColumns(r: EmployeePayrollResult) {
+  return {
+    grossCents: r.grossCents,
+    preTaxDeductionCents: r.preTaxCents,
+    postTaxDeductionCents: r.postTaxCents,
+    fedWithholdingCents: r.fedWithholdingCents,
+    stateWithholdingCents: r.stateWithholdingCents,
+    ssEmployeeCents: r.ssEmployeeCents,
+    medicareEmployeeCents: r.medicareEmployeeCents,
+    additionalMedicareCents: r.additionalMedicareCents,
+    ssEmployerCents: r.ssEmployerCents,
+    medicareEmployerCents: r.medicareEmployerCents,
+    futaCents: r.futaCents,
+    sutaCents: r.sutaCents,
+    employeeTaxCents: r.employeeTaxCents,
+    employerTaxCents: r.employerTaxCents,
+    netCents: r.netCents,
+  };
 }
 
 // Seed the default chart of accounts for a specific org. Called at org creation
@@ -1905,6 +1939,219 @@ export class DatabaseStorage {
     });
     const updated = (await this.getFixedAsset(assetId))!;
     return { asset: updated, entry, gainLossCents, netBookValueCents };
+  }
+
+  // ---------- Payroll ----------
+  // Idempotent per-org seeds for the payroll GL accounts (older orgs self-heal),
+  // mirroring ensureFxAccounts().
+  private async ensurePayrollAccounts(): Promise<{ wages: Account; taxExpense: Account; taxesPayable: Account; deductionsPayable: Account }> {
+    const orgId = currentOrgId();
+    const find = async (code: string) => db.select().from(accounts).where(and(eq(accounts.code, code), eq(accounts.orgId, orgId))).then((r: any[]) => r[0]);
+    const ensure = async (code: string, name: string, type: string, subtype: string) => {
+      let a = await find(code);
+      if (!a) a = await db.insert(accounts).values({ orgId, code, name, type, subtype, isActive: true }).returning().then((r) => r[0]);
+      return a as Account;
+    };
+    return {
+      wages: await ensure("6300", "Salaries & Wages", "expense", "operating_expense"),
+      taxExpense: await ensure("6350", "Payroll Tax Expense", "expense", "operating_expense"),
+      taxesPayable: await ensure("2300", "Payroll Taxes Payable", "liability", "current_liability"),
+      deductionsPayable: await ensure("2310", "Payroll Deductions Payable", "liability", "current_liability"),
+    };
+  }
+
+  // Posted year-to-date gross for an employee in a calendar year (drives the
+  // annual wage-base caps). Only POSTED runs count; a run being posted excludes
+  // itself so it never double-counts.
+  private async ytdGrossForEmployee(employeeId: number, year: string, excludeRunId?: number): Promise<number> {
+    const params: any[] = [currentOrgId(), employeeId, year];
+    let extra = "";
+    if (excludeRunId !== undefined) { params.push(excludeRunId); extra = ` AND pr.id <> $4`; }
+    const row = (await pool.query(
+      `SELECT COALESCE(SUM(pi.gross_cents), 0)::int AS ytd
+       FROM payroll_items pi JOIN payroll_runs pr ON pr.id = pi.run_id
+       WHERE pi.org_id = $1 AND pi.employee_id = $2 AND pr.status = 'posted' AND substr(pr.pay_date, 1, 4) = $3${extra}`,
+      params
+    )).rows[0];
+    return Number(row?.ytd ?? 0);
+  }
+
+  async listEmployees(limit = 50, offset = 0): Promise<Paginated<Employee>> {
+    const where = eq(employees.orgId, currentOrgId());
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(employees).where(where);
+    const rows = await db.select().from(employees).where(where).orderBy(employees.name).limit(limit).offset(offset);
+    return { rows, total, limit, offset };
+  }
+  async getEmployee(id: number): Promise<Employee | undefined> {
+    return await db.select().from(employees).where(and(eq(employees.id, id), eq(employees.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+  async createEmployee(input: CreateEmployeeInput): Promise<Employee> {
+    const row = await db.insert(employees).values({
+      orgId: currentOrgId(), name: input.name, email: input.email || null, payType: input.payType,
+      payRateCents: input.payRateCents, payFrequency: input.payFrequency,
+      federalWithholdingRate: input.federalWithholdingRate, stateWithholdingRate: input.stateWithholdingRate,
+      status: input.status, hireDate: input.hireDate ?? null, createdAt: nowIso(), updatedAt: nowIso(),
+    }).returning().then((r: any[]) => r[0]);
+    await this.audit("create", "employee", row.id, `Added employee ${row.name} (${row.payType})`);
+    return row;
+  }
+  async updateEmployee(id: number, input: UpdateEmployeeInput): Promise<Employee | undefined> {
+    const existing = await this.getEmployee(id);
+    if (!existing) return undefined;
+    const patch: any = { updatedAt: nowIso() };
+    for (const k of ["name", "email", "payType", "payRateCents", "payFrequency", "federalWithholdingRate", "stateWithholdingRate", "status", "hireDate"] as const) {
+      if (input[k] !== undefined) patch[k] = k === "email" ? (input[k] || null) : input[k];
+    }
+    const row = await db.update(employees).set(patch).where(and(eq(employees.id, id), eq(employees.orgId, currentOrgId()))).returning().then((r: any[]) => r[0]);
+    await this.audit("update", "employee", id, `Updated employee ${existing.name}`);
+    return row;
+  }
+  async deleteEmployee(id: number): Promise<{ ok: true }> {
+    const existing = await this.getEmployee(id);
+    if (!existing) throw new Error("Employee not found");
+    const used = (await pool.query(`SELECT COUNT(*)::int AS c FROM payroll_items WHERE employee_id = $1 AND org_id = $2`, [id, currentOrgId()])).rows[0].c as number;
+    if (used > 0) throw new Error(`Cannot delete ${existing.name} — they appear on ${used} pay run(s). Mark them inactive instead.`);
+    await db.delete(employees).where(and(eq(employees.id, id), eq(employees.orgId, currentOrgId())));
+    await this.audit("delete", "employee", id, `Deleted employee ${existing.name}`);
+    return { ok: true };
+  }
+
+  async listPayrollRuns(limit = 50, offset = 0): Promise<Paginated<PayrollRun>> {
+    const where = eq(payrollRuns.orgId, currentOrgId());
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(payrollRuns).where(where);
+    const rows = await db.select().from(payrollRuns).where(where).orderBy(desc(payrollRuns.payDate), desc(payrollRuns.id)).limit(limit).offset(offset);
+    return { rows, total, limit, offset };
+  }
+  async getPayrollRun(id: number): Promise<(PayrollRun & { items: (PayrollItem & { employeeName?: string })[] }) | undefined> {
+    const run = await db.select().from(payrollRuns).where(and(eq(payrollRuns.id, id), eq(payrollRuns.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!run) return undefined;
+    const items = await db.select().from(payrollItems).where(and(eq(payrollItems.runId, id), eq(payrollItems.orgId, currentOrgId()))).orderBy(payrollItems.id);
+    const emps = await this.listEmployees(500, 0);
+    const nameById = new Map(emps.rows.map((e) => [e.id, e.name]));
+    return { ...run, items: items.map((it) => ({ ...it, employeeName: nameById.get(it.employeeId) })) };
+  }
+
+  // Gross for one run line (YTD-independent, deterministic).
+  private grossForLine(emp: Employee, line: { hours?: number; additionalPayCents: number }): number {
+    let base: number;
+    if (emp.payType === "hourly") {
+      if (line.hours === undefined) throw new Error(`Hours are required for hourly employee "${emp.name}".`);
+      base = hourlyGross(emp.payRateCents, line.hours);
+    } else {
+      base = salaryGrossForPeriod(emp.payRateCents, emp.payFrequency as any);
+    }
+    return base + line.additionalPayCents;
+  }
+
+  // Create a DRAFT pay run: compute every employee's gross/taxes/net (integer
+  // cents, with the current posted YTD driving wage-base caps) and store it. NO
+  // journal entry — posting (below) books the GL.
+  async createPayrollRun(input: CreatePayrollRunInput): Promise<PayrollRun> {
+    const orgId = currentOrgId();
+    const bank = await db.select().from(accounts).where(and(eq(accounts.id, input.bankAccountId), eq(accounts.orgId, orgId))).then((r: any[]) => r[0]);
+    if (!bank) throw new Error("bankAccountId does not exist in this organization.");
+    if (bank.type !== "asset") throw new Error(`Net pay must be drawn from an asset (bank) account; "${bank.code} ${bank.name}" is ${bank.type}.`);
+    const year = input.payDate.slice(0, 4);
+    const empIds = input.lines.map((l) => l.employeeId);
+    const emps = await db.select().from(employees).where(and(inArray(employees.id, empIds), eq(employees.orgId, orgId)));
+    const empMap = new Map(emps.map((e) => [e.id, e]));
+    for (const id of empIds) {
+      const e = empMap.get(id);
+      if (!e) throw new Error(`Employee ${id} not found in this organization.`);
+      if (e.status !== "active") throw new Error(`Employee "${e.name}" is inactive and cannot be paid.`);
+    }
+
+    const computed: Array<{ employeeId: number; hours: number | null; r: EmployeePayrollResult }> = [];
+    const totals = { gross: 0, empTax: 0, erTax: 0, ded: 0, net: 0 };
+    for (const line of input.lines) {
+      const emp = empMap.get(line.employeeId)!;
+      const gross = this.grossForLine(emp, line);
+      const ytd = await this.ytdGrossForEmployee(emp.id, year);
+      const r = computeEmployeePayroll({
+        grossCents: gross, ytdGrossCents: ytd,
+        preTaxCents: line.preTaxDeductionCents, postTaxCents: line.postTaxDeductionCents,
+        federalWithholdingRate: emp.federalWithholdingRate, stateWithholdingRate: emp.stateWithholdingRate,
+      });
+      computed.push({ employeeId: emp.id, hours: emp.payType === "hourly" ? (line.hours ?? 0) : null, r });
+      totals.gross += r.grossCents; totals.empTax += r.employeeTaxCents; totals.erTax += r.employerTaxCents;
+      totals.ded += r.preTaxCents + r.postTaxCents; totals.net += r.netCents;
+    }
+
+    return await db.transaction(async (tx) => {
+      const run = await tx.insert(payrollRuns).values({
+        orgId, payDate: input.payDate, periodStart: input.periodStart, periodEnd: input.periodEnd,
+        status: "draft", bankAccountId: input.bankAccountId,
+        totalGrossCents: totals.gross, totalEmployeeTaxCents: totals.empTax, totalEmployerTaxCents: totals.erTax,
+        totalDeductionsCents: totals.ded, totalNetCents: totals.net, createdAt: nowIso(), updatedAt: nowIso(),
+      }).returning().then((r: any[]) => r[0]);
+      for (const c of computed) {
+        await tx.insert(payrollItems).values({ orgId, runId: run.id, employeeId: c.employeeId, hours: c.hours, ...payrollItemColumns(c.r) });
+      }
+      await this.audit("create", "payroll_run", run.id, `Created draft pay run ${input.periodStart}–${input.periodEnd} (${computed.length} employee(s), net ${formatMoney(totals.net)})`);
+      return run;
+    });
+  }
+
+  // Post a DRAFT pay run: recompute with the CURRENT posted YTD (so caps are
+  // fresh if other runs posted since the draft), update the items, and book ONE
+  // balanced journal entry. Respects period locks; a posted run cannot re-post.
+  async postPayrollRun(id: number): Promise<PayrollRun> {
+    const orgId = currentOrgId();
+    const run = await db.select().from(payrollRuns).where(and(eq(payrollRuns.id, id), eq(payrollRuns.orgId, orgId))).then((r: any[]) => r[0]);
+    if (!run) throw new Error("Pay run not found");
+    if (run.status === "posted") throw new Error(`Pay run ${id} is already posted.`);
+    if (run.status === "void") throw new Error(`Pay run ${id} is void.`);
+    const bank = await db.select().from(accounts).where(and(eq(accounts.id, run.bankAccountId), eq(accounts.orgId, orgId))).then((r: any[]) => r[0]);
+    if (!bank) throw new Error("The pay run's bank account no longer exists.");
+    const { wages, taxExpense, taxesPayable, deductionsPayable } = await this.ensurePayrollAccounts();
+
+    const items = await db.select().from(payrollItems).where(and(eq(payrollItems.runId, id), eq(payrollItems.orgId, orgId))).orderBy(payrollItems.id);
+    const year = run.payDate.slice(0, 4);
+    const computed: Array<{ id: number; r: EmployeePayrollResult }> = [];
+    const totals = { gross: 0, empTax: 0, erTax: 0, ded: 0, net: 0 };
+    for (const it of items) {
+      const emp = await this.getEmployee(it.employeeId);
+      if (!emp) throw new Error(`Employee ${it.employeeId} on this run no longer exists.`);
+      const ytd = await this.ytdGrossForEmployee(emp.id, year, id); // exclude this run
+      const r = computeEmployeePayroll({
+        grossCents: it.grossCents, ytdGrossCents: ytd,
+        preTaxCents: it.preTaxDeductionCents, postTaxCents: it.postTaxDeductionCents,
+        federalWithholdingRate: emp.federalWithholdingRate, stateWithholdingRate: emp.stateWithholdingRate,
+      });
+      computed.push({ id: it.id, r });
+      totals.gross += r.grossCents; totals.empTax += r.employeeTaxCents; totals.erTax += r.employerTaxCents;
+      totals.ded += r.preTaxCents + r.postTaxCents; totals.net += r.netCents;
+    }
+
+    // Build the balanced JE: Dr Wages + Dr Payroll Tax Expense; Cr Taxes Payable,
+    // Cr Deductions Payable, Cr Bank (net pay).
+    const jeLines: any[] = [{ accountId: wages.id, debit: totals.gross, credit: 0, description: "Payroll — gross wages" }];
+    if (totals.erTax > 0) jeLines.push({ accountId: taxExpense.id, debit: totals.erTax, credit: 0, description: "Payroll — employer taxes" });
+    const taxPayable = totals.empTax + totals.erTax;
+    if (taxPayable > 0) jeLines.push({ accountId: taxesPayable.id, debit: 0, credit: taxPayable, description: "Payroll — taxes payable" });
+    if (totals.ded > 0) jeLines.push({ accountId: deductionsPayable.id, debit: 0, credit: totals.ded, description: "Payroll — deductions withheld" });
+    if (totals.net > 0) jeLines.push({ accountId: bank.id, debit: 0, credit: totals.net, description: "Payroll — net pay" });
+
+    return await db.transaction(async (tx) => {
+      const je = await this.postJournalEntry({
+        date: run.payDate,
+        memo: `Payroll ${run.periodStart}–${run.periodEnd}`,
+        reference: `PAY-${run.id}`,
+        source: "payroll",
+        sourceId: run.id,
+        lines: jeLines,
+      }, { _tx: tx });
+      for (const c of computed) {
+        await tx.update(payrollItems).set(payrollItemColumns(c.r)).where(and(eq(payrollItems.id, c.id), eq(payrollItems.orgId, orgId)));
+      }
+      const updated = await tx.update(payrollRuns).set({
+        status: "posted", entryId: je.entry.id,
+        totalGrossCents: totals.gross, totalEmployeeTaxCents: totals.empTax, totalEmployerTaxCents: totals.erTax,
+        totalDeductionsCents: totals.ded, totalNetCents: totals.net, updatedAt: nowIso(),
+      }).where(and(eq(payrollRuns.id, id), eq(payrollRuns.orgId, orgId))).returning().then((r: any[]) => r[0]);
+      await this.audit("post", "payroll_run", id, `Posted pay run ${run.periodStart}–${run.periodEnd} (gross ${formatMoney(totals.gross)}, employer tax ${formatMoney(totals.erTax)}, net ${formatMoney(totals.net)})`);
+      return updated;
+    });
   }
 
   // ---------- Journal Entries ----------

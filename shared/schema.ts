@@ -5,6 +5,7 @@ export * from "./auth-schema";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 import { DEPRECIATION_METHODS } from "./depreciation";
+import { PAY_FREQUENCIES } from "./payroll";
 
 // ============================================================================
 // CHART OF ACCOUNTS
@@ -702,6 +703,118 @@ export const revalueFxSchema = z.object({
   currency: z.string().regex(/^[A-Z]{3}$/, "Use a 3-letter ISO currency code, e.g. EUR").optional(),
 });
 export type RevalueFxInput = z.infer<typeof revalueFxSchema>;
+
+// ============================================================================
+// PAYROLL — employees, pay runs, and automatic GL posting (QBO-style)
+// ============================================================================
+// A pay run computes each employee's gross, employee-withheld taxes, employer
+// taxes, and net pay (see shared/payroll.ts) and posts ONE balanced journal
+// entry: Dr Wages Expense + Dr Payroll Tax Expense, Cr Payroll Taxes Payable,
+// Cr Payroll Deductions Payable, Cr the bank account for net pay. All integer
+// cents; annual wage-base caps use posted year-to-date wages.
+export const EMPLOYEE_PAY_TYPES = ["salary", "hourly"] as const;
+export type EmployeePayType = (typeof EMPLOYEE_PAY_TYPES)[number];
+export const EMPLOYEE_STATUSES = ["active", "inactive"] as const;
+export const PAYROLL_RUN_STATUSES = ["draft", "posted", "void"] as const;
+export type PayrollRunStatus = (typeof PAYROLL_RUN_STATUSES)[number];
+
+export const employees = pgTable("employees", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(), // NOT NULL, no DB default — storage stamps currentOrgId()
+  name: text("name").notNull(),
+  email: text("email"),
+  payType: text("pay_type").notNull(), // salary | hourly
+  // Salary: ANNUAL salary in cents. Hourly: hourly rate in cents. Never REAL.
+  payRateCents: integer("pay_rate_cents").notNull(),
+  payFrequency: text("pay_frequency").notNull(), // PayFrequency
+  federalWithholdingRate: doublePrecision("federal_withholding_rate").notNull().default(0),
+  stateWithholdingRate: doublePrecision("state_withholding_rate").notNull().default(0),
+  status: text("status").notNull().default("active"), // active | inactive
+  hireDate: text("hire_date"),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type Employee = typeof employees.$inferSelect;
+
+export const payrollRuns = pgTable("payroll_runs", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(),
+  payDate: text("pay_date").notNull(),
+  periodStart: text("period_start").notNull(),
+  periodEnd: text("period_end").notNull(),
+  status: text("status").notNull().default("draft"), // draft | posted | void
+  bankAccountId: integer("bank_account_id").notNull(), // net pay is drawn from here
+  entryId: integer("entry_id"), // FK to journal_entries once posted
+  // All integer cents.
+  totalGrossCents: integer("total_gross_cents").notNull().default(0),
+  totalEmployeeTaxCents: integer("total_employee_tax_cents").notNull().default(0),
+  totalEmployerTaxCents: integer("total_employer_tax_cents").notNull().default(0),
+  totalDeductionsCents: integer("total_deductions_cents").notNull().default(0),
+  totalNetCents: integer("total_net_cents").notNull().default(0),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type PayrollRun = typeof payrollRuns.$inferSelect;
+
+export const payrollItems = pgTable("payroll_items", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(),
+  runId: integer("run_id").notNull(),
+  employeeId: integer("employee_id").notNull(),
+  hours: doublePrecision("hours"), // hourly employees only
+  // All integer cents.
+  grossCents: integer("gross_cents").notNull().default(0),
+  preTaxDeductionCents: integer("pretax_deduction_cents").notNull().default(0),
+  postTaxDeductionCents: integer("posttax_deduction_cents").notNull().default(0),
+  fedWithholdingCents: integer("fed_withholding_cents").notNull().default(0),
+  stateWithholdingCents: integer("state_withholding_cents").notNull().default(0),
+  ssEmployeeCents: integer("ss_employee_cents").notNull().default(0),
+  medicareEmployeeCents: integer("medicare_employee_cents").notNull().default(0),
+  additionalMedicareCents: integer("additional_medicare_cents").notNull().default(0),
+  ssEmployerCents: integer("ss_employer_cents").notNull().default(0),
+  medicareEmployerCents: integer("medicare_employer_cents").notNull().default(0),
+  futaCents: integer("futa_cents").notNull().default(0),
+  sutaCents: integer("suta_cents").notNull().default(0),
+  employeeTaxCents: integer("employee_tax_cents").notNull().default(0),
+  employerTaxCents: integer("employer_tax_cents").notNull().default(0),
+  netCents: integer("net_cents").notNull().default(0),
+});
+export type PayrollItem = typeof payrollItems.$inferSelect;
+
+const baseEmployeeSchema = z.object({
+  name: z.string().min(1, "Employee name is required").max(200),
+  email: z.string().email("Invalid email address").or(z.literal("")).nullable().optional(),
+  payType: z.enum(EMPLOYEE_PAY_TYPES),
+  // INTEGER CENTS — annual salary (salary) or hourly rate (hourly). Client converts at the boundary.
+  payRateCents: z.number().int().positive("Pay rate must be greater than zero"),
+  payFrequency: z.enum(PAY_FREQUENCIES),
+  federalWithholdingRate: z.number().min(0).max(1).default(0),
+  stateWithholdingRate: z.number().min(0).max(1).default(0),
+  status: z.enum(EMPLOYEE_STATUSES).default("active"),
+  hireDate: isoDate.nullable().optional(),
+});
+export const createEmployeeSchema = baseEmployeeSchema;
+export const updateEmployeeSchema = baseEmployeeSchema.partial();
+export type CreateEmployeeInput = z.infer<typeof createEmployeeSchema>;
+export type UpdateEmployeeInput = z.infer<typeof updateEmployeeSchema>;
+
+export const createPayrollRunSchema = z.object({
+  payDate: isoDate,
+  periodStart: isoDate,
+  periodEnd: isoDate,
+  bankAccountId: z.number().int().positive(),
+  lines: z.array(z.object({
+    employeeId: z.number().int().positive(),
+    hours: z.number().min(0).max(2000).optional(), // required for hourly (validated in storage)
+    additionalPayCents: z.number().int().min(0).default(0), // bonus/overtime dollars already in cents
+    preTaxDeductionCents: z.number().int().min(0).default(0),
+    postTaxDeductionCents: z.number().int().min(0).default(0),
+  })).min(1, "A pay run needs at least one employee"),
+}).refine((v) => v.periodEnd >= v.periodStart, {
+  message: "Period end must be on or after period start",
+  path: ["periodEnd"],
+});
+export type CreatePayrollRunInput = z.infer<typeof createPayrollRunSchema>;
 
 // ============================================================================
 // BILLS (purchases / accounts payable)
