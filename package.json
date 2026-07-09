@@ -8,7 +8,7 @@
     "dev": "NODE_ENV=development tsx server/index.ts",
     "build": "vite build && esbuild server/index.ts --platform=node --bundle --format=esm --outfile=dist/index.js --packages=external",
     "start": "NODE_ENV=production node dist/index.js",
-    "test": "node tests/cashflow_test.js && node tests/cashflow_property_test.js && node tests/balance_sheet_test.js && node tests/pl_date_range_test.js && node tests/invoice_rounding_test.js && node tests/multi_tenant_test.js && tsx tests/schema_tenancy_test.ts && tsx tests/taxjar_logic_test.ts && tsx tests/invoice_statement_effect_test.ts && tsx tests/credit_debit_note_test.ts && tsx tests/journal_balance_cents_test.ts && tsx tests/org_scope_guard_test.ts && tsx tests/fx_gain_loss_test.ts && tsx tests/totp_test.ts && tsx tests/webhook_hmac_test.ts && tsx tests/importer_dryrun_test.ts && tsx tests/credit_note_apply_concurrency_test.ts && tsx tests/stripe_clearing_account_test.ts && tsx tests/inventory_costing_test.ts && tsx tests/purchase_order_test.ts && tsx tests/estimate_test.ts",
+    "test": "node tests/cashflow_test.js && node tests/cashflow_property_test.js && node tests/balance_sheet_test.js && node tests/pl_date_range_test.js && node tests/invoice_rounding_test.js && node tests/multi_tenant_test.js && tsx tests/schema_tenancy_test.ts && tsx tests/taxjar_logic_test.ts && tsx tests/invoice_statement_effect_test.ts && tsx tests/credit_debit_note_test.ts && tsx tests/journal_balance_cents_test.ts && tsx tests/org_scope_guard_test.ts && tsx tests/fx_gain_loss_test.ts && tsx tests/totp_test.ts && tsx tests/webhook_hmac_test.ts && tsx tests/importer_dryrun_test.ts && tsx tests/credit_note_apply_concurrency_test.ts && tsx tests/stripe_clearing_account_test.ts && tsx tests/inventory_costing_test.ts && tsx tests/purchase_order_test.ts && tsx tests/estimate_test.ts && tsx tests/fixed_asset_test.ts",
     "test:cashflow": "node tests/cashflow_test.js",
     "test:property": "node tests/cashflow_property_test.js && node tests/balance_sheet_test.js && node tests/pl_date_range_test.js",
     "test:tenancy": "node tests/multi_tenant_test.js",
@@ -16,6 +16,7 @@
     "test:inventory": "tsx tests/inventory_costing_test.ts",
     "test:po": "tsx tests/purchase_order_test.ts",
     "test:estimate": "tsx tests/estimate_test.ts",
+    "test:fixedasset": "tsx tests/fixed_asset_test.ts",
     "check": "tsc --noEmit"
   },
   "dependencies": {

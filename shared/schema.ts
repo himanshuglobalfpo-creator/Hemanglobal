@@ -4,6 +4,7 @@ import { pgTable, text, integer, serial, boolean, doublePrecision, timestamp } f
 export * from "./auth-schema";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
+import { DEPRECIATION_METHODS } from "./depreciation";
 
 // ============================================================================
 // CHART OF ACCOUNTS
@@ -562,6 +563,95 @@ export const convertEstimateSchema = z.object({
   path: ["dueDate"],
 });
 export type ConvertEstimateInput = z.infer<typeof convertEstimateSchema>;
+
+// ============================================================================
+// FIXED ASSETS — register + automatic depreciation
+// ============================================================================
+// A capitalized asset that depreciates over a useful life. Depreciation is
+// posted monthly as Dr Depreciation Expense / Cr Accumulated Depreciation. The
+// schedule is computed in integer cents (see shared/depreciation.ts) with the
+// last period absorbing the rounding remainder, so the asset is never over- or
+// under-depreciated. depreciation_entries make each month's posting idempotent
+// via UNIQUE(org_id, asset_id, period).
+export const FIXED_ASSET_STATUSES = ["active", "disposed", "fully_depreciated"] as const;
+export type FixedAssetStatus = (typeof FIXED_ASSET_STATUSES)[number];
+
+export const fixedAssets = pgTable("fixed_assets", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(), // NOT NULL, no DB default — storage stamps currentOrgId()
+  name: text("name").notNull(),
+  assetAccountId: integer("asset_account_id").notNull(),                      // where the asset is capitalized (asset)
+  accumDepAccountId: integer("accum_dep_account_id").notNull(),               // contra-asset (accumulated depreciation)
+  depreciationExpenseAccountId: integer("depreciation_expense_account_id").notNull(), // expense
+  acquisitionDate: text("acquisition_date").notNull(), // YYYY-MM-DD
+  // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
+  costCents: integer("cost_cents").notNull(),
+  salvageCents: integer("salvage_cents").notNull().default(0),
+  usefulLifeMonths: integer("useful_life_months").notNull(),
+  method: text("method").notNull(), // DepreciationMethod
+  status: text("status").notNull().default("active"), // FixedAssetStatus
+  disposedDate: text("disposed_date"),
+  updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type FixedAsset = typeof fixedAssets.$inferSelect;
+
+// One row per posted (or recorded-zero) period. The UNIQUE constraint on
+// (org_id, asset_id, period) is what makes POST .../post-depreciation idempotent.
+export const depreciationEntries = pgTable("depreciation_entries", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(),
+  assetId: integer("asset_id").notNull(),
+  period: text("period").notNull(), // YYYY-MM
+  // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
+  amountCents: integer("amount_cents").notNull(),
+  entryId: integer("entry_id"), // FK to journal_entries (null for a recorded zero-amount period)
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type DepreciationEntry = typeof depreciationEntries.$inferSelect;
+
+const isoMonth = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "Period must be YYYY-MM");
+
+const baseFixedAssetSchema = z.object({
+  name: z.string().min(1, "Asset name is required").max(200),
+  assetAccountId: z.number().int().positive(),
+  accumDepAccountId: z.number().int().positive(),
+  depreciationExpenseAccountId: z.number().int().positive(),
+  acquisitionDate: isoDate,
+  // INTEGER CENTS — the client converts user dollars at the API boundary.
+  costCents: z.number().int().positive("Cost must be greater than zero"),
+  salvageCents: z.number().int().min(0).default(0),
+  usefulLifeMonths: z.number().int().min(1).max(1200),
+  method: z.enum(DEPRECIATION_METHODS),
+});
+function refineFixedAsset(v: { costCents?: number; salvageCents?: number }, ctx: z.RefinementCtx) {
+  if (v.costCents !== undefined && v.salvageCents !== undefined && v.salvageCents >= v.costCents) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["salvageCents"], message: "Salvage value must be less than cost" });
+  }
+}
+export const createFixedAssetSchema = baseFixedAssetSchema.superRefine(refineFixedAsset);
+export type CreateFixedAssetInput = z.infer<typeof createFixedAssetSchema>;
+
+// PATCH: the depreciable inputs (cost/salvage/life/method/acquisition) are frozen
+// once depreciation has been posted (enforced in storage); accounts + name are
+// always editable.
+export const updateFixedAssetSchema = baseFixedAssetSchema.partial().superRefine(refineFixedAsset);
+export type UpdateFixedAssetInput = z.infer<typeof updateFixedAssetSchema>;
+
+export const postDepreciationQuerySchema = z.object({ period: isoMonth });
+
+export const disposeFixedAssetSchema = z.object({
+  date: isoDate,
+  // Sale proceeds in INTEGER CENTS (0 for a scrap/write-off).
+  proceedsCents: z.number().int().min(0).default(0),
+  // Bank/receivable account the proceeds land in (required when proceeds > 0).
+  proceedsAccountId: z.number().int().positive().optional(),
+  // Where the gain or loss on disposal is booked (income or expense account).
+  gainLossAccountId: z.number().int().positive(),
+}).refine((v) => v.proceedsCents === 0 || v.proceedsAccountId !== undefined, {
+  message: "proceedsAccountId is required when proceedsCents > 0",
+  path: ["proceedsAccountId"],
+});
+export type DisposeFixedAssetInput = z.infer<typeof disposeFixedAssetSchema>;
 
 // ============================================================================
 // BILLS (purchases / accounts payable)

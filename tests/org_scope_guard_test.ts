@@ -66,6 +66,8 @@ const BUSINESS_TABLES = [
   "estimates",
   "estimateLines",
   "estimateShares",
+  "fixedAssets",
+  "depreciationEntries",
 ];
 
 // (method, table) pairs where an unscoped .from(table) inside that method is
@@ -162,6 +164,10 @@ const ALLOWLIST: Record<string, { tables: string[]; reason: string }> = {
   recordEstimateShareView: {
     tables: ["estimateShares"],
     reason: "public share page: token is the auth; only bumps the view counter on that share row",
+  },
+  runDepreciationCatchUp: {
+    tables: ["fixedAssets"],
+    reason: "boot-time sweep across ALL orgs; posts due depreciation, wrapping EACH asset in withOrg(a.orgId)",
   },
 };
 

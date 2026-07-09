@@ -13,6 +13,10 @@ import {
   createEstimateSchema,
   updateEstimateSchema,
   convertEstimateSchema,
+  createFixedAssetSchema,
+  updateFixedAssetSchema,
+  disposeFixedAssetSchema,
+  postDepreciationQuerySchema,
   insertCustomerSchema,
   insertVendorSchema,
   postJournalEntrySchema,
@@ -737,6 +741,46 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const url = `${appBaseUrl()}/p/estimate/${share.token}`;
       return { share, url };
     })
+  );
+
+  // ---------- Fixed Assets & Depreciation ----------
+  app.get("/api/fixed-assets", (req, res) =>
+    handle(res, () => {
+      const { limit, offset } = paginationQuerySchema.parse(req.query);
+      return storage.listFixedAssets(limit, offset);
+    })
+  );
+  app.get("/api/fixed-assets/:id", (req, res) =>
+    handle(res, async () => {
+      const asset = await storage.getFixedAssetDetail(parseId(req.params.id));
+      if (!asset) throw new Error("Fixed asset not found");
+      return asset;
+    })
+  );
+  app.post("/api/fixed-assets", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => storage.createFixedAsset(createFixedAssetSchema.parse(req.body)))
+  );
+  app.patch("/api/fixed-assets/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const id = parseId(req.params.id);
+      const { ifUnmodifiedSince, ...body } = req.body ?? {};
+      const data = updateFixedAssetSchema.parse(body);
+      assertUnmodifiedSince(await storage.getFixedAsset(id), ifUnmodifiedSince);
+      return storage.updateFixedAsset(id, data);
+    })
+  );
+  app.delete("/api/fixed-assets/:id", requireRole("owner", "admin"), (req, res) =>
+    handle(res, () => storage.deleteFixedAsset(parseId(req.params.id)))
+  );
+  app.post("/api/fixed-assets/:id/post-depreciation", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const id = parseId(req.params.id);
+      const { period } = postDepreciationQuerySchema.parse(req.query);
+      return storage.postDepreciation(id, period);
+    })
+  );
+  app.post("/api/fixed-assets/:id/dispose", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => storage.disposeFixedAsset(parseId(req.params.id), disposeFixedAssetSchema.parse(req.body)))
   );
 
   // ---------- Customers ----------

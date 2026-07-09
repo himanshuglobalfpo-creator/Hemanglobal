@@ -205,6 +205,15 @@ app.use((req, res, next) => {
     logger.error("Estimate expiry sweep failed", { error: e.message });
   }
 
+  // Depreciation catch-up on server start (same catch-up pattern): backfill any
+  // monthly depreciation postings missed while the server was down. Idempotent.
+  try {
+    const posted = await storage.runDepreciationCatchUp();
+    if (posted > 0) logger.info(`Depreciation catch-up: posted ${posted} monthly entr${posted === 1 ? "y" : "ies"}`);
+  } catch (e: any) {
+    logger.error("Depreciation catch-up failed", { error: e.message });
+  }
+
   app.use((err: any, req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";

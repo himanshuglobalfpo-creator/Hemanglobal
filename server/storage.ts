@@ -27,11 +27,14 @@ import {
   estimates,
   estimateLines,
   estimateShares,
+  fixedAssets,
+  depreciationEntries,
   type OrgNexusState,
   type NexusStateInput,
 } from "@shared/schema";
 import { organizations } from "@shared/auth-schema";
 import { applyPurchase, costOfSale, buildCogsJournalLines, type CogsComponent } from "@shared/inventory";
+import { computeDepreciationSchedule, lastDayOfPeriod, periodOf, type DepreciationPeriod } from "@shared/depreciation";
 import type {
   Account,
   InsertAccount,
@@ -85,6 +88,11 @@ import type {
   CreateEstimateInput,
   UpdateEstimateInput,
   ConvertEstimateInput,
+  FixedAsset,
+  DepreciationEntry,
+  CreateFixedAssetInput,
+  UpdateFixedAssetInput,
+  DisposeFixedAssetInput,
 } from "@shared/schema";
 import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
@@ -197,6 +205,7 @@ const DEFAULT_COA: InsertAccount[] = [
   { code: "1150", name: "Sales Tax Receivable", type: "asset", subtype: "current_asset", isActive: true },
   { code: "1200", name: "Inventory", type: "asset", subtype: "current_asset", isActive: true },
   { code: "1500", name: "Office Equipment", type: "asset", subtype: "fixed_asset", isActive: true },
+  { code: "1510", name: "Accumulated Depreciation", type: "asset", subtype: "accumulated_depreciation", isActive: true },
   // Liabilities (2000-2999)
   { code: "2000", name: "Accounts Payable", type: "liability", subtype: "current_liability", isActive: true },
   { code: "2100", name: "Sales Tax Payable", type: "liability", subtype: "current_liability", isActive: true },
@@ -208,8 +217,10 @@ const DEFAULT_COA: InsertAccount[] = [
   { code: "4000", name: "Sales Revenue", type: "income", subtype: "operating_income", isActive: true },
   { code: "4100", name: "Service Revenue", type: "income", subtype: "operating_income", isActive: true },
   { code: "4900", name: "Other Income", type: "income", subtype: "other_income", isActive: true },
+  { code: "4910", name: "Gain/Loss on Asset Disposal", type: "income", subtype: "other_income", isActive: true },
   // Expenses (5000-5999)
   { code: "5000", name: "Cost of Goods Sold", type: "expense", subtype: "cogs", isActive: true },
+  { code: "6800", name: "Depreciation Expense", type: "expense", subtype: "depreciation_expense", isActive: true },
   { code: "6000", name: "Rent Expense", type: "expense", subtype: "operating_expense", isActive: true },
   { code: "6100", name: "Utilities", type: "expense", subtype: "operating_expense", isActive: true },
   { code: "6200", name: "Office Supplies", type: "expense", subtype: "operating_expense", isActive: true },
@@ -1620,6 +1631,275 @@ export class DatabaseStorage {
     await db.update(estimateShares)
       .set({ viewedAt: new Date().toISOString(), viewCount: share.viewCount + 1 })
       .where(eq(estimateShares.id, share.id));
+  }
+
+  // ---------- Fixed Assets & Depreciation ----------
+  // A fixed asset capitalizes a purchase and depreciates over a useful life.
+  // The schedule (shared/depreciation.ts) is integer cents with the last period
+  // absorbing the remainder, so total depreciation exactly equals cost - salvage.
+  // Monthly posting is idempotent via UNIQUE(org_id, asset_id, period).
+  private async assertAssetAccounts(data: { assetAccountId?: number; accumDepAccountId?: number; depreciationExpenseAccountId?: number }): Promise<void> {
+    const all = await this.listAccounts();
+    const byId = new Map(all.map((a) => [a.id, a]));
+    const need = (id: number | undefined, label: string, wantType: string) => {
+      if (id === undefined) return;
+      const a = byId.get(id);
+      if (!a) throw new Error(`${label} account ${id} does not exist in this organization.`);
+      if (a.type !== wantType) throw new Error(`${label} account "${a.code} ${a.name}" must be of type ${wantType}.`);
+    };
+    need(data.assetAccountId, "Asset", "asset");
+    need(data.accumDepAccountId, "Accumulated depreciation", "asset"); // contra-asset is still type asset
+    need(data.depreciationExpenseAccountId, "Depreciation expense", "expense");
+  }
+
+  private scheduleFor(asset: FixedAsset): DepreciationPeriod[] {
+    return computeDepreciationSchedule({
+      costCents: asset.costCents,
+      salvageCents: asset.salvageCents,
+      usefulLifeMonths: asset.usefulLifeMonths,
+      method: asset.method as any,
+      acquisitionDate: asset.acquisitionDate,
+    });
+  }
+
+  private async getDepreciationEntry(assetId: number, period: string): Promise<DepreciationEntry | undefined> {
+    return await db.select().from(depreciationEntries)
+      .where(and(eq(depreciationEntries.assetId, assetId), eq(depreciationEntries.period, period), eq(depreciationEntries.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+  }
+
+  private async listDepreciationEntries(assetId: number): Promise<DepreciationEntry[]> {
+    return await db.select().from(depreciationEntries)
+      .where(and(eq(depreciationEntries.assetId, assetId), eq(depreciationEntries.orgId, currentOrgId())))
+      .orderBy(depreciationEntries.period);
+  }
+
+  private async accumulatedDepreciation(assetId: number): Promise<number> {
+    const rows = await this.listDepreciationEntries(assetId);
+    return rows.reduce((s, r) => s + r.amountCents, 0);
+  }
+
+  async listFixedAssets(limit = 50, offset = 0): Promise<Paginated<FixedAsset>> {
+    const where = eq(fixedAssets.orgId, currentOrgId());
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(fixedAssets).where(where);
+    const rows = await db.select().from(fixedAssets).where(where).orderBy(desc(fixedAssets.acquisitionDate), desc(fixedAssets.id)).limit(limit).offset(offset);
+    return { rows, total, limit, offset };
+  }
+
+  async getFixedAsset(id: number): Promise<FixedAsset | undefined> {
+    return await db.select().from(fixedAssets).where(and(eq(fixedAssets.id, id), eq(fixedAssets.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+
+  // Asset detail with its full schedule, per-period posted status, accumulated
+  // depreciation and current net book value.
+  async getFixedAssetDetail(id: number) {
+    const asset = await this.getFixedAsset(id);
+    if (!asset) return undefined;
+    const schedule = this.scheduleFor(asset);
+    const posted = await this.listDepreciationEntries(id);
+    const byPeriod = new Map(posted.map((p) => [p.period, p]));
+    const accumulatedDepreciationCents = posted.reduce((s, p) => s + p.amountCents, 0);
+    return {
+      ...asset,
+      accumulatedDepreciationCents,
+      netBookValueCents: asset.costCents - accumulatedDepreciationCents,
+      schedule: schedule.map((p) => ({ ...p, posted: byPeriod.has(p.period), entryId: byPeriod.get(p.period)?.entryId ?? null })),
+    };
+  }
+
+  async createFixedAsset(input: CreateFixedAssetInput): Promise<FixedAsset> {
+    await this.assertAssetAccounts(input);
+    const row = await db.insert(fixedAssets).values({
+      orgId: currentOrgId(),
+      name: input.name,
+      assetAccountId: input.assetAccountId,
+      accumDepAccountId: input.accumDepAccountId,
+      depreciationExpenseAccountId: input.depreciationExpenseAccountId,
+      acquisitionDate: input.acquisitionDate,
+      costCents: input.costCents,
+      salvageCents: input.salvageCents,
+      usefulLifeMonths: input.usefulLifeMonths,
+      method: input.method,
+      status: "active",
+      updatedAt: nowIso(),
+    }).returning().then((r: any[]) => r[0]);
+    await this.audit("create", "fixed_asset", row.id, `Registered fixed asset "${row.name}" (${formatMoney(row.costCents)}, ${row.usefulLifeMonths}mo ${row.method})`);
+    return row;
+  }
+
+  async updateFixedAsset(id: number, input: UpdateFixedAssetInput): Promise<FixedAsset | undefined> {
+    const existing = await this.getFixedAsset(id);
+    if (!existing) return undefined;
+    if (existing.status === "disposed") throw new Error(`Asset "${existing.name}" is disposed and cannot be edited.`);
+    // Once any depreciation has posted, freeze the inputs that define the schedule.
+    const postedCount = (await pool.query(`SELECT COUNT(*)::int AS c FROM depreciation_entries WHERE asset_id = $1 AND org_id = $2`, [id, currentOrgId()])).rows[0].c as number;
+    if (postedCount > 0) {
+      for (const f of ["costCents", "salvageCents", "usefulLifeMonths", "method", "acquisitionDate"] as const) {
+        if (input[f] !== undefined && input[f] !== (existing as any)[f]) {
+          throw new Error(`Cannot change ${f} of "${existing.name}" — depreciation has already been posted. Reverse those entries first.`);
+        }
+      }
+    }
+    await this.assertAssetAccounts({
+      assetAccountId: input.assetAccountId ?? existing.assetAccountId,
+      accumDepAccountId: input.accumDepAccountId ?? existing.accumDepAccountId,
+      depreciationExpenseAccountId: input.depreciationExpenseAccountId ?? existing.depreciationExpenseAccountId,
+    });
+    const patch: any = { updatedAt: nowIso() };
+    for (const k of ["name", "assetAccountId", "accumDepAccountId", "depreciationExpenseAccountId", "acquisitionDate", "costCents", "salvageCents", "usefulLifeMonths", "method"] as const) {
+      if (input[k] !== undefined) patch[k] = input[k];
+    }
+    const row = await db.update(fixedAssets).set(patch).where(and(eq(fixedAssets.id, id), eq(fixedAssets.orgId, currentOrgId()))).returning().then((r: any[]) => r[0]);
+    await this.audit("update", "fixed_asset", id, `Updated fixed asset "${existing.name}"`);
+    return row;
+  }
+
+  async deleteFixedAsset(id: number): Promise<{ ok: true }> {
+    const existing = await this.getFixedAsset(id);
+    if (!existing) throw new Error("Fixed asset not found");
+    const postedCount = (await pool.query(`SELECT COUNT(*)::int AS c FROM depreciation_entries WHERE asset_id = $1 AND org_id = $2`, [id, currentOrgId()])).rows[0].c as number;
+    if (postedCount > 0) throw new Error(`Cannot delete "${existing.name}" — it has ${postedCount} depreciation posting(s). Dispose it instead.`);
+    await db.delete(fixedAssets).where(and(eq(fixedAssets.id, id), eq(fixedAssets.orgId, currentOrgId())));
+    await this.audit("delete", "fixed_asset", id, `Deleted fixed asset "${existing.name}"`);
+    return { ok: true };
+  }
+
+  // Post one period's depreciation: Dr Depreciation Expense / Cr Accumulated
+  // Depreciation. Idempotent — a period already posted is a no-op (the UNIQUE
+  // constraint also guards against a concurrent double-post). Respects period
+  // locks (via postJournalEntry). A zero-amount period is recorded with no JE.
+  async postDepreciation(assetId: number, period: string): Promise<{ entry: DepreciationEntry; posted: boolean; amountCents: number }> {
+    const asset = await this.getFixedAsset(assetId);
+    if (!asset) throw new Error("Fixed asset not found");
+    if (asset.status === "disposed") throw new Error(`Asset "${asset.name}" is disposed; no further depreciation can be posted.`);
+    const schedule = this.scheduleFor(asset);
+    const sched = schedule.find((p) => p.period === period);
+    if (!sched) {
+      throw new Error(`${period} is outside the depreciation schedule for "${asset.name}" (${schedule[0].period} – ${schedule[schedule.length - 1].period}).`);
+    }
+    const already = await this.getDepreciationEntry(assetId, period);
+    if (already) return { entry: already, posted: false, amountCents: already.amountCents };
+
+    const amount = sched.amountCents;
+    const jeDate = lastDayOfPeriod(period);
+    try {
+      const row = await db.transaction(async (tx) => {
+        let entryId: number | null = null;
+        if (amount > 0) {
+          const je = await this.postJournalEntry({
+            date: jeDate,
+            memo: `Depreciation — ${asset.name} (${period})`,
+            reference: `DEP-${asset.id}-${period}`,
+            source: "depreciation",
+            sourceId: asset.id,
+            lines: [
+              { accountId: asset.depreciationExpenseAccountId, debit: amount, credit: 0, description: `Depreciation ${period}` },
+              { accountId: asset.accumDepAccountId, debit: 0, credit: amount, description: `Accumulated depreciation ${period}` },
+            ],
+          }, { _tx: tx });
+          entryId = je.entry.id;
+        }
+        const inserted = await tx.insert(depreciationEntries).values({
+          orgId: currentOrgId(), assetId: asset.id, period, amountCents: amount, entryId, createdAt: nowIso(),
+        }).returning().then((r: any[]) => r[0]);
+        await this.audit("post", "depreciation", asset.id, `Posted depreciation for "${asset.name}" ${period} (${formatMoney(amount)})`, { period, amountCents: amount });
+        return inserted as DepreciationEntry;
+      });
+      // Flip to fully_depreciated once accumulated reaches cost - salvage.
+      const accumulated = await this.accumulatedDepreciation(assetId);
+      if (asset.status === "active" && accumulated >= asset.costCents - asset.salvageCents) {
+        await db.update(fixedAssets).set({ status: "fully_depreciated", updatedAt: nowIso() })
+          .where(and(eq(fixedAssets.id, assetId), eq(fixedAssets.orgId, currentOrgId())));
+      }
+      return { entry: row, posted: true, amountCents: amount };
+    } catch (err: any) {
+      // Lost a race against a concurrent post — the winner's row stands; no-op.
+      if (err?.code === "23505" || err?.cause?.code === "23505") {
+        const e = await this.getDepreciationEntry(assetId, period);
+        if (e) return { entry: e, posted: false, amountCents: e.amountCents };
+      }
+      throw err;
+    }
+  }
+
+  // Boot-time depreciation catch-up (reuses the recurring catch-up cross-org
+  // pattern): for every active asset, post any scheduled period up to the current
+  // month that has not been posted yet. Idempotent, so restarting the server
+  // safely backfills missed months; a locked period is skipped, not fatal.
+  async runDepreciationCatchUp(asOfDate?: string): Promise<number> {
+    const today = asOfDate || new Date().toISOString().slice(0, 10);
+    const currentPeriod = periodOf(today);
+    // Cross-org sweep (allowlisted in the org-scope guard, like runCatchUp).
+    const assets = await db.select().from(fixedAssets).where(eq(fixedAssets.status, "active"));
+    let posted = 0;
+    for (const a of assets) {
+      await withOrg({ orgId: a.orgId, userId: 0 }, async () => {
+        const schedule = this.scheduleFor(a);
+        for (const p of schedule) {
+          if (p.period > currentPeriod) break; // future months aren't due yet
+          try {
+            const r = await this.postDepreciation(a.id, p.period);
+            if (r.posted) posted++;
+          } catch {
+            // e.g. that period is locked — leave it for a later run after reopen.
+          }
+        }
+      });
+    }
+    return posted;
+  }
+
+  // Dispose of an asset: remove its cost and accumulated depreciation, record any
+  // proceeds, and book the gain/loss to a configurable account — one balanced JE.
+  async disposeFixedAsset(assetId: number, input: DisposeFixedAssetInput): Promise<{ asset: FixedAsset; entry: JournalEntry; gainLossCents: number; netBookValueCents: number }> {
+    const asset = await this.getFixedAsset(assetId);
+    if (!asset) throw new Error("Fixed asset not found");
+    if (asset.status === "disposed") throw new Error(`Asset "${asset.name}" is already disposed.`);
+    const all = await this.listAccounts();
+    const byId = new Map(all.map((a) => [a.id, a]));
+    if (!byId.get(input.gainLossAccountId)) throw new Error("gainLossAccountId does not exist in this organization.");
+    if (input.proceedsCents > 0 && (input.proceedsAccountId === undefined || !byId.get(input.proceedsAccountId))) {
+      throw new Error("proceedsAccountId does not exist in this organization.");
+    }
+    const accumulated = await this.accumulatedDepreciation(assetId);
+    const netBookValueCents = asset.costCents - accumulated;
+    const gainLossCents = input.proceedsCents - netBookValueCents; // > 0 gain, < 0 loss
+
+    const entry = await db.transaction(async (tx) => {
+      const lines: any[] = [];
+      // Remove the asset at cost (Cr the asset account).
+      lines.push({ accountId: asset.assetAccountId, debit: 0, credit: asset.costCents, description: `Dispose ${asset.name}: remove cost` });
+      // Clear accumulated depreciation (Dr the contra-asset).
+      if (accumulated > 0) {
+        lines.push({ accountId: asset.accumDepAccountId, debit: accumulated, credit: 0, description: `Dispose ${asset.name}: clear accumulated depreciation` });
+      }
+      // Proceeds received.
+      if (input.proceedsCents > 0) {
+        lines.push({ accountId: input.proceedsAccountId!, debit: input.proceedsCents, credit: 0, description: `Dispose ${asset.name}: proceeds` });
+      }
+      // Plug the difference to gain (credit) or loss (debit).
+      if (gainLossCents > 0) {
+        lines.push({ accountId: input.gainLossAccountId, debit: 0, credit: gainLossCents, description: `Gain on disposal of ${asset.name}` });
+      } else if (gainLossCents < 0) {
+        lines.push({ accountId: input.gainLossAccountId, debit: -gainLossCents, credit: 0, description: `Loss on disposal of ${asset.name}` });
+      }
+      const je = await this.postJournalEntry({
+        date: input.date,
+        memo: `Disposal of ${asset.name}`,
+        reference: `DISP-${asset.id}`,
+        source: "asset_disposal",
+        sourceId: asset.id,
+        lines,
+      }, { _tx: tx });
+      await tx.update(fixedAssets).set({ status: "disposed", disposedDate: input.date, updatedAt: nowIso() })
+        .where(and(eq(fixedAssets.id, asset.id), eq(fixedAssets.orgId, currentOrgId())));
+      await this.audit("dispose", "fixed_asset", asset.id,
+        `Disposed "${asset.name}" (NBV ${formatMoney(netBookValueCents)}, proceeds ${formatMoney(input.proceedsCents)}, ${gainLossCents >= 0 ? "gain" : "loss"} ${formatMoney(Math.abs(gainLossCents))})`,
+        { proceedsCents: input.proceedsCents, gainLossCents, netBookValueCents });
+      return je.entry;
+    });
+    const updated = (await this.getFixedAsset(assetId))!;
+    return { asset: updated, entry, gainLossCents, netBookValueCents };
   }
 
   // ---------- Journal Entries ----------
