@@ -22,6 +22,8 @@ import {
   debitNotes,
   items,
   inventoryMovements,
+  purchaseOrders,
+  purchaseOrderLines,
   type OrgNexusState,
   type NexusStateInput,
 } from "@shared/schema";
@@ -69,6 +71,11 @@ import type {
   InsertItem,
   UpdateItem,
   InventoryMovement,
+  PurchaseOrder,
+  PurchaseOrderLine,
+  CreatePurchaseOrderInput,
+  UpdatePurchaseOrderInput,
+  ReceivePurchaseOrderInput,
 } from "@shared/schema";
 import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
@@ -1215,6 +1222,193 @@ export class DatabaseStorage {
     };
   }
 
+  // ---------- Purchase Orders ----------
+  // A PO is an AP commitment: it posts NO journal entry. Receiving it (below)
+  // creates a bill for the received portion, which is where the GL effect and
+  // any inventory movements happen.
+  async listPurchaseOrders(limit = 50, offset = 0): Promise<Paginated<PurchaseOrder & { vendorName?: string }>> {
+    const where = eq(purchaseOrders.orgId, currentOrgId());
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` })
+      .from(purchaseOrders).innerJoin(vendors, eq(purchaseOrders.vendorId, vendors.id)).where(where);
+    const rows = await db.select({ po: purchaseOrders, vendor: vendors })
+      .from(purchaseOrders).innerJoin(vendors, eq(purchaseOrders.vendorId, vendors.id))
+      .where(where).orderBy(desc(purchaseOrders.date), desc(purchaseOrders.id)).limit(limit).offset(offset);
+    return { rows: rows.map((r) => ({ ...r.po, vendorName: r.vendor.name })), total, limit, offset };
+  }
+
+  async getPurchaseOrder(id: number): Promise<(PurchaseOrder & { lines: PurchaseOrderLine[]; vendor?: Vendor }) | undefined> {
+    const po = await db.select().from(purchaseOrders).where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!po) return undefined;
+    const lines = await db.select().from(purchaseOrderLines)
+      .where(and(eq(purchaseOrderLines.poId, id), eq(purchaseOrderLines.orgId, currentOrgId())))
+      .orderBy(purchaseOrderLines.id);
+    const vendor = await db.select().from(vendors).where(and(eq(vendors.id, po.vendorId), eq(vendors.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    return { ...po, lines, vendor };
+  }
+
+  // Resolve the GL debit account for a PO/receipt line: an item line derives it
+  // (inventory → Inventory Asset; otherwise → the item's expense account); a
+  // plain line names its own expense account.
+  private resolvePoLineAccount(line: { itemId?: number; expenseAccountId?: number }, itemMap: Map<number, Item>): number {
+    if (line.itemId !== undefined) {
+      const it = itemMap.get(line.itemId)!;
+      return it.type === "inventory" ? it.inventoryAssetAccountId! : it.expenseAccountId;
+    }
+    if (line.expenseAccountId !== undefined) return line.expenseAccountId;
+    throw new Error("Purchase order line requires itemId or expenseAccountId");
+  }
+
+  async createPurchaseOrder(input: CreatePurchaseOrderInput): Promise<PurchaseOrder> {
+    const poNumber: string = input.number ?? await this.nextNumber("purchase_order");
+    const itemMap = await this.loadItemsForLines(input.lines.filter((l) => l.itemId !== undefined).map((l) => l.itemId as number));
+    const resolvedExpense: number[] = input.lines.map((l) => this.resolvePoLineAccount(l, itemMap));
+    const fx = await this.resolveDocumentFx(input.currency, input.fxRate);
+    try {
+      return await db.transaction(async (tx) => {
+        const po = await tx.insert(purchaseOrders).values({
+          orgId: currentOrgId(), number: poNumber, vendorId: input.vendorId, date: input.date,
+          expectedDate: input.expectedDate ?? null, status: "open",
+          currency: fx?.currency ?? "", fxRate: fx?.fxRate ?? 1, notes: input.notes ?? null, updatedAt: nowIso(),
+        }).returning().then((r) => r[0]);
+        for (let idx = 0; idx < input.lines.length; idx++) {
+          const l = input.lines[idx];
+          await tx.insert(purchaseOrderLines).values({
+            orgId: currentOrgId(), poId: po.id, description: l.description, quantity: l.quantity, rate: l.rate,
+            amountCents: Math.round(l.quantity * l.rate * 100), expenseAccountId: resolvedExpense[idx],
+            itemId: l.itemId ?? null, qtyReceived: 0,
+          });
+        }
+        // NO journal entry — a PO is a commitment, not a GL event.
+        await this.audit("create", "purchase_order", po.id, `Created purchase order ${poNumber} (${input.lines.length} line(s))`);
+        return po;
+      });
+    } catch (err: any) {
+      if (err?.code === "23505" || err?.cause?.code === "23505") {
+        throw new Error(`Purchase order number "${poNumber}" already exists in this organization.`);
+      }
+      throw err;
+    }
+  }
+
+  async updatePurchaseOrder(id: number, input: UpdatePurchaseOrderInput): Promise<PurchaseOrder | undefined> {
+    const existing = await this.getPurchaseOrder(id);
+    if (!existing) return undefined;
+    if (existing.status === "cancelled") throw new Error("A cancelled purchase order cannot be edited.");
+    const anyReceived = existing.lines.some((l) => l.qtyReceived > 0);
+    if (input.status === "cancelled" && anyReceived) {
+      throw new Error("Cannot cancel a purchase order that has already been (partly) received.");
+    }
+    if (input.lines && (existing.status !== "open" || anyReceived)) {
+      throw new Error("Purchase order lines can only be edited before anything is received.");
+    }
+    const fx = (input.currency !== undefined || input.fxRate !== undefined)
+      ? await this.resolveDocumentFx(input.currency ?? (existing.currency || undefined), input.fxRate ?? existing.fxRate)
+      : null;
+    const itemMap = input.lines
+      ? await this.loadItemsForLines(input.lines.filter((l) => l.itemId !== undefined).map((l) => l.itemId as number))
+      : new Map<number, Item>();
+    return await db.transaction(async (tx) => {
+      const patch: any = { updatedAt: nowIso() };
+      if (input.vendorId !== undefined) patch.vendorId = input.vendorId;
+      if (input.date !== undefined) patch.date = input.date;
+      if (input.expectedDate !== undefined) patch.expectedDate = input.expectedDate;
+      if (input.notes !== undefined) patch.notes = input.notes;
+      if (input.status !== undefined) patch.status = input.status;
+      if (fx) { patch.currency = fx.currency; patch.fxRate = fx.fxRate; }
+      if (input.lines) {
+        await tx.delete(purchaseOrderLines).where(and(eq(purchaseOrderLines.poId, id), eq(purchaseOrderLines.orgId, currentOrgId())));
+        for (const l of input.lines) {
+          await tx.insert(purchaseOrderLines).values({
+            orgId: currentOrgId(), poId: id, description: l.description, quantity: l.quantity, rate: l.rate,
+            amountCents: Math.round(l.quantity * l.rate * 100), expenseAccountId: this.resolvePoLineAccount(l, itemMap),
+            itemId: l.itemId ?? null, qtyReceived: 0,
+          });
+        }
+      }
+      const po = await tx.update(purchaseOrders).set(patch)
+        .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.orgId, currentOrgId()))).returning().then((r) => r[0]);
+      await this.audit("update", "purchase_order", id, `Updated purchase order ${existing.number}`);
+      return po;
+    });
+  }
+
+  async deletePurchaseOrder(id: number): Promise<{ ok: true }> {
+    const existing = await this.getPurchaseOrder(id);
+    if (!existing) throw new Error("Purchase order not found");
+    if (existing.lines.some((l) => l.qtyReceived > 0)) {
+      throw new Error(`Cannot delete purchase order ${existing.number} — it has received lines. Cancel or close it instead.`);
+    }
+    await db.transaction(async (tx) => {
+      await tx.delete(purchaseOrderLines).where(and(eq(purchaseOrderLines.poId, id), eq(purchaseOrderLines.orgId, currentOrgId())));
+      await tx.delete(purchaseOrders).where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.orgId, currentOrgId())));
+    });
+    await this.audit("delete", "purchase_order", id, `Deleted purchase order ${existing.number}`);
+    return { ok: true };
+  }
+
+  // Receive a PO (fully or partially). Builds a bill for ONLY the received
+  // portion via createBill() INSIDE ONE transaction, bumps qty_received, and
+  // moves the PO to 'partial' or 'received'. Over-receipt is rejected. If a
+  // received line links an inventory item, createBill records the inventory
+  // movement (MF-1) as part of the same atomic unit.
+  async receivePurchaseOrder(id: number, input: ReceivePurchaseOrderInput): Promise<{ purchaseOrder: PurchaseOrder; bill: Bill }> {
+    const po = await this.getPurchaseOrder(id);
+    if (!po) throw new Error("Purchase order not found");
+    if (po.status === "cancelled" || po.status === "closed") {
+      throw new Error(`Purchase order ${po.number} is ${po.status} and cannot receive more.`);
+    }
+    const lineById = new Map(po.lines.map((l) => [l.id, l]));
+    const receipts: { line: PurchaseOrderLine; qty: number }[] = [];
+    for (const r of input.lines) {
+      const line = lineById.get(r.poLineId);
+      if (!line) throw new Error(`Line ${r.poLineId} is not part of purchase order ${po.number}.`);
+      const remaining = line.quantity - line.qtyReceived;
+      if (r.quantity > remaining) {
+        throw new Error(`Over-receipt on "${line.description}": receiving ${r.quantity} but only ${remaining} of ${line.quantity} remain (already received ${line.qtyReceived}).`);
+      }
+      receipts.push({ line, qty: r.quantity });
+    }
+    const dueDate = input.dueDate ?? input.date;
+
+    const bill = await db.transaction(async (tx) => {
+      const billInput = {
+        vendorId: po.vendorId,
+        date: input.date,
+        dueDate,
+        taxRate: 0,
+        currency: po.currency || undefined,
+        fxRate: po.currency ? po.fxRate : undefined,
+        lines: receipts.map((rc) => ({
+          description: rc.line.description,
+          quantity: rc.qty,
+          rate: rc.line.rate,
+          itemId: rc.line.itemId ?? undefined,
+          expenseAccountId: rc.line.itemId ? undefined : rc.line.expenseAccountId,
+        })),
+      } as CreateBillInput;
+      // createBill joins THIS transaction via _tx, so the bill, its JE, and any
+      // inventory movements commit atomically with the PO updates below.
+      const b = await this.createBill(billInput, { _tx: tx });
+      await tx.update(bills).set({ poId: po.id }).where(and(eq(bills.id, b.id), eq(bills.orgId, currentOrgId())));
+
+      for (const rc of receipts) {
+        await tx.update(purchaseOrderLines).set({ qtyReceived: rc.line.qtyReceived + rc.qty })
+          .where(and(eq(purchaseOrderLines.id, rc.line.id), eq(purchaseOrderLines.orgId, currentOrgId())));
+      }
+      const receivedNow = new Map(receipts.map((rc) => [rc.line.id, rc.line.qtyReceived + rc.qty]));
+      const fullyReceived = po.lines.every((l) => (receivedNow.get(l.id) ?? l.qtyReceived) >= l.quantity);
+      const newStatus = fullyReceived ? "received" : "partial";
+      await tx.update(purchaseOrders).set({ status: newStatus, updatedAt: nowIso() })
+        .where(and(eq(purchaseOrders.id, po.id), eq(purchaseOrders.orgId, currentOrgId())));
+      await this.audit("receive", "purchase_order", po.id, `Received purchase order ${po.number} → bill ${b.number} (${newStatus})`);
+      return { ...b, poId: po.id } as Bill;
+    });
+    // bill.created webhook fires AFTER commit (createBill deferred it under _tx).
+    await emitWebhookEvent("bill.created", { id: bill.id, number: bill.number, total: bill.total, currency: bill.currency || null });
+    const updated = (await this.getPurchaseOrder(id))!;
+    return { purchaseOrder: updated, bill };
+  }
+
   // ---------- Journal Entries ----------
   // Sprint C: opts.bypassLock allows the year-end close itself to post on the lock date.
   // opts._tx: optional external drizzle transaction — pass when calling from within an
@@ -1788,7 +1982,13 @@ export class DatabaseStorage {
   }
 
   // ---------- Bills ----------
-  async createBill(input: CreateBillInput): Promise<Bill> {
+  // opts._tx: optional external drizzle transaction. When supplied (e.g. by
+  // receivePurchaseOrder) all of this bill's writes — the bill, its lines, the
+  // journal entry, and any inventory movements — join the caller's transaction
+  // so the whole receipt commits or rolls back atomically. In that mode the
+  // bill.created webhook is NOT emitted here; the caller fires it after the
+  // outer commit (a rolled-back bill must never notify).
+  async createBill(input: CreateBillInput, opts: { _tx?: any } = {}): Promise<Bill> {
     // Auto-numbering: same contract as createInvoice (see comment there).
     const billNumber: string = input.number ?? await this.nextNumber("bill");
     const ap = await db.select().from(accounts).where(and(eq(accounts.code, "2000"), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
@@ -1847,7 +2047,7 @@ export class DatabaseStorage {
       total = subtotal + tax; // exact integer cents
     }
 
-    return await db.transaction(async (tx) => {
+    const doCreate = async (tx: any): Promise<Bill> => {
       const b = await tx
         .insert(bills)
         .values({
@@ -1869,7 +2069,7 @@ export class DatabaseStorage {
           amountPaid: 0,
           notes: input.notes,
         })
-        .returning().then((r) => r[0]);
+        .returning().then((r: any[]) => r[0]);
       for (let idx = 0; idx < input.lines.length; idx++) {
         const l = input.lines[idx];
         await tx.insert(billLines)
@@ -1949,17 +2149,24 @@ export class DatabaseStorage {
         await this.audit("post", "inventory_receipt", b.id, `Received inventory on bill ${billNumber}`);
       }
       return b;
-    }).then(async (b) => {
+    };
+
+    try {
+      if (opts._tx) {
+        // Caller owns the transaction + commit; it emits bill.created afterwards.
+        return await doCreate(opts._tx);
+      }
+      const b = await db.transaction(doCreate);
       await emitWebhookEvent("bill.created", { id: b.id, number: b.number, total: b.total, currency: b.currency || null });
       return b;
-    }).catch((err: any) => {
+    } catch (err: any) {
       // Postgres unique-violation on UNIQUE(org_id, number) → clean business
       // error instead of a raw 500 (drizzle may wrap the pg error).
       if (err?.code === "23505" || err?.cause?.code === "23505") {
         throw new Error(`Bill number "${billNumber}" already exists in this organization.`);
       }
       throw err;
-    });
+    }
   }
 
   async listBills(limit = 50, offset = 0): Promise<Paginated<Bill & { vendorName?: string }>> {
@@ -2913,9 +3120,10 @@ export class DatabaseStorage {
     bill: { prefix: "BILL-", padding: 4 },
     credit_note: { prefix: "CN-", padding: 4 },
     debit_note: { prefix: "DN-", padding: 4 },
+    purchase_order: { prefix: "PO-", padding: 4 },
   };
 
-  async nextNumber(kind: "invoice" | "bill" | "credit_note" | "debit_note"): Promise<string> {
+  async nextNumber(kind: "invoice" | "bill" | "credit_note" | "debit_note" | "purchase_order"): Promise<string> {
     const def = DatabaseStorage.SEQUENCE_DEFAULTS[kind];
     if (!def) throw new Error(`Unknown sequence kind "${kind}"`);
     // Insert path: this call allocates 1, so the stored next_value becomes 2.
@@ -2935,7 +3143,7 @@ export class DatabaseStorage {
 
   // Read-only PREVIEW of the upcoming number — does NOT increment. The UI uses
   // this to prefill the form; the authoritative allocation happens at create.
-  async previewNextNumber(kind: "invoice" | "bill" | "credit_note" | "debit_note"): Promise<{ kind: string; next: string }> {
+  async previewNextNumber(kind: "invoice" | "bill" | "credit_note" | "debit_note" | "purchase_order"): Promise<{ kind: string; next: string }> {
     const def = DatabaseStorage.SEQUENCE_DEFAULTS[kind];
     if (!def) throw new Error(`Unknown sequence kind "${kind}"`);
     const row = (await pool.query(

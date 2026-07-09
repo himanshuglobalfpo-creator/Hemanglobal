@@ -7,6 +7,9 @@ import {
   updateAccountSchema,
   insertItemSchema,
   updateItemSchema,
+  createPurchaseOrderSchema,
+  updatePurchaseOrderSchema,
+  receivePurchaseOrderSchema,
   insertCustomerSchema,
   insertVendorSchema,
   postJournalEntrySchema,
@@ -651,6 +654,41 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   );
   app.delete("/api/items/:id", requireRole("owner", "admin"), (req, res) =>
     handle(res, () => storage.deleteItem(parseId(req.params.id)))
+  );
+
+  // ---------- Purchase Orders ----------
+  app.get("/api/purchase-orders", (req, res) =>
+    handle(res, () => {
+      const { limit, offset } = paginationQuerySchema.parse(req.query);
+      return storage.listPurchaseOrders(limit, offset);
+    })
+  );
+  app.get("/api/purchase-orders/:id", (req, res) =>
+    handle(res, async () => {
+      const po = await storage.getPurchaseOrder(parseId(req.params.id));
+      if (!po) throw new Error("Purchase order not found");
+      return po;
+    })
+  );
+  app.post("/api/purchase-orders", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => storage.createPurchaseOrder(createPurchaseOrderSchema.parse(req.body)))
+  );
+  app.patch("/api/purchase-orders/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const id = parseId(req.params.id);
+      const { ifUnmodifiedSince, ...body } = req.body ?? {};
+      const data = updatePurchaseOrderSchema.parse(body);
+      assertUnmodifiedSince(await storage.getPurchaseOrder(id), ifUnmodifiedSince);
+      return storage.updatePurchaseOrder(id, data);
+    })
+  );
+  app.delete("/api/purchase-orders/:id", requireRole("owner", "admin"), (req, res) =>
+    handle(res, () => storage.deletePurchaseOrder(parseId(req.params.id)))
+  );
+  app.post("/api/purchase-orders/:id/receive", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () =>
+      storage.receivePurchaseOrder(parseId(req.params.id), receivePurchaseOrderSchema.parse(req.body))
+    )
   );
 
   // ---------- Customers ----------
