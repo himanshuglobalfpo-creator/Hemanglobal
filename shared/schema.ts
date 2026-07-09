@@ -172,7 +172,7 @@ export type Paginated<T> = { rows: T[]; total: number; limit: number; offset: nu
 // Query for GET /api/settings/next-number — preview of the upcoming
 // auto-number for a document kind (read-only, does not increment).
 export const nextNumberQuerySchema = z.object({
-  kind: z.enum(["invoice", "bill", "credit_note", "debit_note", "purchase_order"]),
+  kind: z.enum(["invoice", "bill", "credit_note", "debit_note", "purchase_order", "estimate"]),
 });
 
 // ============================================================================
@@ -386,6 +386,7 @@ export const invoices = pgTable("invoices", {
   foreignTax: integer("foreign_tax").notNull().default(0),
   foreignTotal: integer("foreign_total").notNull().default(0),
   foreignAmountPaid: integer("foreign_amount_paid").notNull().default(0),
+  estimateId: integer("estimate_id"), // set when this invoice was created by converting an estimate
 });
 
 export const insertInvoiceSchema = createInsertSchema(invoices).omit({
@@ -450,6 +451,117 @@ export const createInvoiceSchema = z.object({
   path: ["dueDate"],
 });
 export type CreateInvoiceInput = z.infer<typeof createInvoiceSchema>;
+
+// ============================================================================
+// ESTIMATES (quotes) — a sales pre-document that converts into an invoice
+// ============================================================================
+// An estimate is a QUOTE: it posts NO GL entry. Its stored *_cents are a snapshot
+// computed with the SAME per-line rounding + tax math the invoice uses, so a
+// conversion (which runs through createInvoice) reproduces the totals exactly.
+// estimate_lines mirror invoice_lines.
+export const ESTIMATE_STATUSES = ["draft", "sent", "accepted", "declined", "expired", "invoiced"] as const;
+export type EstimateStatus = (typeof ESTIMATE_STATUSES)[number];
+
+export const estimates = pgTable("estimates", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(), // NOT NULL, no DB default — storage stamps currentOrgId()
+  number: text("number").notNull(), // UNIQUE(org_id, number) via number_sequences 'estimate' → EST-0001
+  customerId: integer("customer_id").notNull(),
+  date: text("date").notNull(),
+  expiryDate: text("expiry_date").notNull(),
+  status: text("status").notNull().default("draft"), // EstimateStatus
+  currency: text("currency").notNull().default(""),
+  fxRate: doublePrecision("fx_rate").notNull().default(1),
+  // Snapshot totals in the DOCUMENT currency. Stored in cents (integer). Never REAL.
+  subtotalCents: integer("subtotal_cents").notNull().default(0),
+  taxCents: integer("tax_cents").notNull().default(0),
+  totalCents: integer("total_cents").notNull().default(0),
+  notes: text("notes"),
+  updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type Estimate = typeof estimates.$inferSelect;
+
+export const estimateLines = pgTable("estimate_lines", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(),
+  estimateId: integer("estimate_id").notNull(),
+  description: text("description").notNull(),
+  quantity: doublePrecision("quantity").notNull().default(1),
+  rate: doublePrecision("rate").notNull().default(0), // unit price in DOLLARS as entered
+  // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
+  amount: integer("amount").notNull().default(0),
+  incomeAccountId: integer("income_account_id").notNull(),
+  itemId: integer("item_id"), // optional catalog item (drives income account on convert)
+});
+export type EstimateLine = typeof estimateLines.$inferSelect;
+
+// Public share tokens for the read-only /p/estimate/:token view (mirrors invoice_shares).
+export const estimateShares = pgTable("estimate_shares", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(),
+  estimateId: integer("estimate_id").notNull(),
+  token: text("token").notNull().unique(),
+  recipientEmail: text("recipient_email"),
+  viewedAt: text("viewed_at"),
+  viewCount: integer("view_count").notNull().default(0),
+  expiresAt: text("expires_at"),
+  revokedAt: text("revoked_at"),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type EstimateShare = typeof estimateShares.$inferSelect;
+
+export const createEstimateSchema = z.object({
+  number: z.string().min(1).max(50).optional(), // auto-allocated (EST-0001) when omitted
+  customerId: z.number().int().positive(),
+  date: isoDate,
+  expiryDate: isoDate,
+  currency: z.string().regex(/^[A-Z]{3}$/, "Use a 3-letter ISO currency code, e.g. EUR").optional(),
+  fxRate: z.number().positive().optional(),
+  notes: z.string().max(2000).optional(),
+  taxRate: z.number().min(0).max(100).default(0),
+  taxCodeId: z.number().int().positive().optional(),
+  lines: z
+    .array(
+      z.object({
+        description: z.string().min(1).max(500),
+        quantity: z.number().positive("Quantity must be greater than 0"),
+        rate: z.number().min(0),
+        itemId: z.number().int().positive().optional(),
+        incomeAccountId: z.number().int().positive().optional(),
+      }).refine((l) => l.itemId !== undefined || l.incomeAccountId !== undefined, {
+        message: "Each line must reference an itemId or an incomeAccountId",
+        path: ["incomeAccountId"],
+      })
+    )
+    .min(1, "Estimate must have at least one line"),
+}).refine((v) => v.expiryDate >= v.date, {
+  message: "Expiry date must be on or after the estimate date",
+  path: ["expiryDate"],
+});
+export type CreateEstimateInput = z.infer<typeof createEstimateSchema>;
+
+// Header-only edits (allowed before conversion) + manual status transitions.
+export const updateEstimateSchema = z.object({
+  customerId: z.number().int().positive().optional(),
+  date: isoDate.optional(),
+  expiryDate: isoDate.optional(),
+  notes: z.string().max(2000).nullable().optional(),
+  status: z.enum(["draft", "sent", "accepted", "declined"]).optional(),
+}).refine((v) => !v.date || !v.expiryDate || v.expiryDate >= v.date, {
+  message: "Expiry date must be on or after the estimate date",
+  path: ["expiryDate"],
+});
+export type UpdateEstimateInput = z.infer<typeof updateEstimateSchema>;
+
+// Convert → invoice. Dates are optional (invoice inherits sensible defaults).
+export const convertEstimateSchema = z.object({
+  date: isoDate.optional(),   // invoice issue date (default: today)
+  dueDate: isoDate.optional(), // invoice due date (default: issue date + 30 days)
+}).refine((v) => !v.date || !v.dueDate || v.dueDate >= v.date, {
+  message: "Due date must be on or after the invoice date",
+  path: ["dueDate"],
+});
+export type ConvertEstimateInput = z.infer<typeof convertEstimateSchema>;
 
 // ============================================================================
 // BILLS (purchases / accounts payable)

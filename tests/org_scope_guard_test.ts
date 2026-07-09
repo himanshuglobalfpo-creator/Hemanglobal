@@ -63,6 +63,9 @@ const BUSINESS_TABLES = [
   "inventoryMovements",
   "purchaseOrders",
   "purchaseOrderLines",
+  "estimates",
+  "estimateLines",
+  "estimateShares",
 ];
 
 // (method, table) pairs where an unscoped .from(table) inside that method is
@@ -147,6 +150,18 @@ const ALLOWLIST: Record<string, { tables: string[]; reason: string }> = {
   createInvoiceShare: {
     tables: ["invoiceShares"],
     reason: "invoice ownership verified via org-scoped getInvoice before insert",
+  },
+  expireEstimates: {
+    tables: ["estimates"],
+    reason: "boot-time sweep across ALL orgs; flips past-expiry estimates, wrapping EACH update in withOrg(e.orgId)",
+  },
+  getEstimateShareByToken: {
+    tables: ["estimateShares"],
+    reason: "public share page: unguessable token IS the auth; body resolves the estimate via withOrg(share.orgId)",
+  },
+  recordEstimateShareView: {
+    tables: ["estimateShares"],
+    reason: "public share page: token is the auth; only bumps the view counter on that share row",
   },
 };
 

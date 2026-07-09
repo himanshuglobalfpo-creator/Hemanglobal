@@ -196,6 +196,15 @@ app.use((req, res, next) => {
     logger.error("Recurring catch-up failed", { error: e.message });
   }
 
+  // Estimate-expiry sweep on server start (same catch-up pattern): flip
+  // past-expiry draft/sent estimates to 'expired' so a stale quote can't convert.
+  try {
+    const expired = await storage.expireEstimates();
+    if (expired > 0) logger.info(`Estimate expiry sweep: marked ${expired} estimate(s) expired`);
+  } catch (e: any) {
+    logger.error("Estimate expiry sweep failed", { error: e.message });
+  }
+
   app.use((err: any, req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";

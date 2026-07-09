@@ -10,6 +10,9 @@ import {
   createPurchaseOrderSchema,
   updatePurchaseOrderSchema,
   receivePurchaseOrderSchema,
+  createEstimateSchema,
+  updateEstimateSchema,
+  convertEstimateSchema,
   insertCustomerSchema,
   insertVendorSchema,
   postJournalEntrySchema,
@@ -689,6 +692,51 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     handle(res, async () =>
       storage.receivePurchaseOrder(parseId(req.params.id), receivePurchaseOrderSchema.parse(req.body))
     )
+  );
+
+  // ---------- Estimates (quotes) ----------
+  app.get("/api/estimates", (req, res) =>
+    handle(res, () => {
+      const { limit, offset } = paginationQuerySchema.parse(req.query);
+      return storage.listEstimates(limit, offset);
+    })
+  );
+  app.get("/api/estimates/:id", (req, res) =>
+    handle(res, async () => {
+      const est = await storage.getEstimate(parseId(req.params.id));
+      if (!est) throw new Error("Estimate not found");
+      return est;
+    })
+  );
+  app.post("/api/estimates", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => storage.createEstimate(createEstimateSchema.parse(req.body)))
+  );
+  app.patch("/api/estimates/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const id = parseId(req.params.id);
+      const { ifUnmodifiedSince, ...body } = req.body ?? {};
+      const data = updateEstimateSchema.parse(body);
+      assertUnmodifiedSince(await storage.getEstimate(id), ifUnmodifiedSince);
+      return storage.updateEstimate(id, data);
+    })
+  );
+  app.delete("/api/estimates/:id", requireRole("owner", "admin"), (req, res) =>
+    handle(res, () => storage.deleteEstimate(parseId(req.params.id)))
+  );
+  app.post("/api/estimates/:id/convert", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => storage.convertEstimate(parseId(req.params.id), convertEstimateSchema.parse(req.body ?? {})))
+  );
+  app.post("/api/estimates/:id/share", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const id = parseId(req.params.id);
+      const est = await storage.getEstimate(id);
+      if (!est) throw new Error("Estimate not found");
+      const recipient = (req.body?.email as string | undefined) || est.customer?.email || undefined;
+      const expiresInDays = req.body?.expiresInDays ? Number(req.body.expiresInDays) : 90;
+      const share = await storage.createEstimateShare(id, recipient, expiresInDays);
+      const url = `${appBaseUrl()}/p/estimate/${share.token}`;
+      return { share, url };
+    })
   );
 
   // ---------- Customers ----------
@@ -1720,6 +1768,100 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ============================================================================
   // Sprint C: Public Invoice View (no auth — token-based)
   // ============================================================================
+  app.get("/p/estimate/:token", publicLimiter, async (req, res) => {
+    try {
+      const token = req.params.token;
+      const data = await storage.getEstimateShareByToken(token);
+      if (!data || !data.estimate) {
+        res.status(404).type("html").send("<h1>Estimate not found</h1><p>This share link is invalid or has been revoked.</p>");
+        return;
+      }
+      await storage.recordEstimateShareView(token);
+      const est = data.estimate;
+      const cust = data.customer || { name: "Customer" };
+      const lines = (data.lines || []) as any[];
+      const fmtMoney = (n: number) =>
+        `$${Number((n || 0) / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+      const fmtRate = (n: number) =>
+        `$${Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+      const expired = est.status === "expired" || (est.expiryDate && est.expiryDate < new Date().toISOString().slice(0, 10) && est.status !== "invoiced");
+      const statusColor = est.status === "invoiced" ? "#15803d" : expired ? "#b91c1c" : "#0f766e";
+      const html = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Estimate ${escapeHtml(est.number)} — LedgerLite</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#f8fafc;color:#0f172a;}
+  .wrap{max-width:780px;margin:40px auto;padding:0 20px;}
+  .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:40px;box-shadow:0 1px 3px rgba(0,0,0,.04);}
+  .head{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:16px;margin-bottom:32px;border-bottom:1px solid #e2e8f0;padding-bottom:24px;}
+  .brand{font-weight:700;font-size:22px;letter-spacing:-0.02em;}
+  .brand small{display:block;font-weight:400;color:#64748b;font-size:12px;margin-top:4px;}
+  .num{text-align:right;}
+  .num .label{font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#64748b;}
+  .num .val{font-size:20px;font-weight:600;}
+  .pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#fff;background:${statusColor};margin-top:6px;}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:28px;}
+  .grid h4{margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#64748b;font-weight:600;}
+  .grid p{margin:0;line-height:1.5;}
+  table{width:100%;border-collapse:collapse;margin-bottom:24px;}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#64748b;border-bottom:1px solid #e2e8f0;padding:10px 8px;font-weight:600;}
+  td{padding:12px 8px;border-bottom:1px solid #f1f5f9;}
+  td.r,th.r{text-align:right;}
+  .totals{margin-left:auto;width:280px;}
+  .totals .row{display:flex;justify-content:space-between;padding:6px 0;}
+  .totals .total{border-top:2px solid #0f172a;margin-top:6px;padding-top:10px;font-weight:700;font-size:18px;}
+  .notes{margin-top:24px;padding:16px;background:#f8fafc;border-radius:8px;font-size:14px;color:#475569;}
+  .footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:24px;}
+</style></head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="head">
+        <div><div class="brand">LedgerLite <small>Modern small-business accounting</small></div></div>
+        <div class="num">
+          <div class="label">Estimate</div>
+          <div class="val">${escapeHtml(est.number)}</div>
+          <span class="pill">${escapeHtml(est.status || "draft")}</span>
+        </div>
+      </div>
+      <div class="grid">
+        <div>
+          <h4>Prepared for</h4>
+          <p><strong>${escapeHtml(cust.name || "Customer")}</strong>${cust.email ? `<br/>${escapeHtml(cust.email)}` : ""}${cust.address ? `<br/>${escapeHtml(cust.address).replace(/\n/g, "<br/>")}` : ""}</p>
+        </div>
+        <div>
+          <h4>Dates</h4>
+          <p>Issued: <strong>${escapeHtml(est.date)}</strong><br/>Valid until: <strong>${escapeHtml(est.expiryDate)}</strong></p>
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>Description</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead>
+        <tbody>
+          ${lines
+            .map((l: any) => `<tr><td>${escapeHtml(l.description || "")}</td><td class="r">${escapeHtml(l.quantity)}</td><td class="r">${fmtRate(l.rate)}</td><td class="r">${fmtMoney(l.amount)}</td></tr>`)
+            .join("")}
+        </tbody>
+      </table>
+      <div class="totals">
+        <div class="row"><span>Subtotal</span><span>${fmtMoney(est.subtotalCents)}</span></div>
+        <div class="row"><span>Tax</span><span>${fmtMoney(est.taxCents)}</span></div>
+        <div class="row total"><span>Total</span><span>${fmtMoney(est.totalCents)}</span></div>
+      </div>
+      ${est.notes ? `<div class="notes">${escapeHtml(est.notes).replace(/\n/g, "<br/>")}</div>` : ""}
+    </div>
+    <div class="footer">Powered by LedgerLite · This is a read-only quote shared with ${escapeHtml(cust.email || "you")}</div>
+  </div>
+</body></html>`;
+      res.type("html").send(html);
+    } catch (err: any) {
+      logger.error("Route error", { reqId: (res.req as any)?.reqId, error: err?.message });
+      res.status(500).type("html").send("<h1>Server error</h1>");
+    }
+  });
+
   app.get("/p/invoice/:token", publicLimiter, async (req, res) => {
     try {
       const token = req.params.token;

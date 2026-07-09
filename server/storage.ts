@@ -24,6 +24,9 @@ import {
   inventoryMovements,
   purchaseOrders,
   purchaseOrderLines,
+  estimates,
+  estimateLines,
+  estimateShares,
   type OrgNexusState,
   type NexusStateInput,
 } from "@shared/schema";
@@ -76,6 +79,12 @@ import type {
   CreatePurchaseOrderInput,
   UpdatePurchaseOrderInput,
   ReceivePurchaseOrderInput,
+  Estimate,
+  EstimateLine,
+  EstimateShare,
+  CreateEstimateInput,
+  UpdateEstimateInput,
+  ConvertEstimateInput,
 } from "@shared/schema";
 import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
@@ -1409,6 +1418,210 @@ export class DatabaseStorage {
     return { purchaseOrder: updated, bill };
   }
 
+  // ---------- Estimates (quotes) ----------
+  // An estimate is a QUOTE: it posts NO GL entry. Converting it runs through
+  // createInvoice() (reusing its rounding + tax + GL math). The stored *_cents
+  // are a snapshot computed with the same per-line formula so the converted
+  // invoice's totals match the estimate exactly.
+  async listEstimates(limit = 50, offset = 0): Promise<Paginated<Estimate & { customerName?: string }>> {
+    const where = eq(estimates.orgId, currentOrgId());
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` })
+      .from(estimates).innerJoin(customers, eq(estimates.customerId, customers.id)).where(where);
+    const rows = await db.select({ est: estimates, customer: customers })
+      .from(estimates).innerJoin(customers, eq(estimates.customerId, customers.id))
+      .where(where).orderBy(desc(estimates.date), desc(estimates.id)).limit(limit).offset(offset);
+    return { rows: rows.map((r) => ({ ...r.est, customerName: r.customer.name })), total, limit, offset };
+  }
+
+  async getEstimate(id: number): Promise<(Estimate & { lines: EstimateLine[]; customer?: Customer }) | undefined> {
+    const est = await db.select().from(estimates).where(and(eq(estimates.id, id), eq(estimates.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!est) return undefined;
+    const lines = await db.select().from(estimateLines)
+      .where(and(eq(estimateLines.estimateId, id), eq(estimateLines.orgId, currentOrgId())))
+      .orderBy(estimateLines.id);
+    const customer = await db.select().from(customers).where(and(eq(customers.id, est.customerId), eq(customers.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    return { ...est, lines, customer };
+  }
+
+  async createEstimate(input: CreateEstimateInput): Promise<Estimate> {
+    const estNumber: string = input.number ?? await this.nextNumber("estimate");
+    // Income account is DERIVED from the item when present (never from the body).
+    const itemMap = await this.loadItemsForLines(input.lines.filter((l) => l.itemId !== undefined).map((l) => l.itemId as number));
+    const resolvedIncome: number[] = input.lines.map((l) => {
+      if (l.itemId !== undefined) return itemMap.get(l.itemId)!.salesAccountId;
+      if (l.incomeAccountId !== undefined) return l.incomeAccountId;
+      throw new Error("Estimate line requires itemId or incomeAccountId");
+    });
+    // Snapshot totals in the DOCUMENT currency using the SAME per-line rounding
+    // + tax formula createInvoice uses, so a later conversion reproduces them.
+    let effectiveRate = input.taxRate;
+    if (input.taxCodeId) {
+      const code = await this.getTaxCode(input.taxCodeId);
+      if (!code) throw new Error("Tax code not found");
+      effectiveRate = code.rate;
+    }
+    const fx = await this.resolveDocumentFx(input.currency, input.fxRate);
+    const lineAmounts: number[] = input.lines.map((l) => Math.round(l.quantity * l.rate * 100)); // document-currency cents
+    const subtotalCents = lineAmounts.reduce((s, a) => s + a, 0);
+    const taxCents = Math.round((subtotalCents * effectiveRate) / 100);
+    const totalCents = subtotalCents + taxCents;
+    try {
+      return await db.transaction(async (tx) => {
+        const est = await tx.insert(estimates).values({
+          orgId: currentOrgId(), number: estNumber, customerId: input.customerId,
+          date: input.date, expiryDate: input.expiryDate, status: "draft",
+          currency: fx?.currency ?? "", fxRate: fx?.fxRate ?? 1,
+          subtotalCents, taxCents, totalCents, notes: input.notes ?? null, updatedAt: nowIso(),
+        }).returning().then((r: any[]) => r[0]);
+        for (let idx = 0; idx < input.lines.length; idx++) {
+          const l = input.lines[idx];
+          await tx.insert(estimateLines).values({
+            orgId: currentOrgId(), estimateId: est.id, description: l.description,
+            quantity: l.quantity, rate: l.rate, amount: lineAmounts[idx],
+            incomeAccountId: resolvedIncome[idx], itemId: l.itemId ?? null,
+          });
+        }
+        // NO journal entry — an estimate is a quote, not a GL event.
+        await this.audit("create", "estimate", est.id, `Created estimate ${estNumber} (${formatMoney(totalCents)})`);
+        return est;
+      });
+    } catch (err: any) {
+      if (err?.code === "23505" || err?.cause?.code === "23505") {
+        throw new Error(`Estimate number "${estNumber}" already exists in this organization.`);
+      }
+      throw err;
+    }
+  }
+
+  async updateEstimate(id: number, input: UpdateEstimateInput): Promise<Estimate | undefined> {
+    const existing = await this.getEstimate(id);
+    if (!existing) return undefined;
+    if (existing.status === "invoiced") throw new Error("A converted estimate can no longer be edited.");
+    const patch: any = { updatedAt: nowIso() };
+    if (input.customerId !== undefined) patch.customerId = input.customerId;
+    if (input.date !== undefined) patch.date = input.date;
+    if (input.expiryDate !== undefined) patch.expiryDate = input.expiryDate;
+    if (input.notes !== undefined) patch.notes = input.notes;
+    if (input.status !== undefined) patch.status = input.status;
+    const est = await db.update(estimates).set(patch)
+      .where(and(eq(estimates.id, id), eq(estimates.orgId, currentOrgId()))).returning().then((r: any[]) => r[0]);
+    await this.audit("update", "estimate", id, `Updated estimate ${existing.number}`);
+    return est;
+  }
+
+  async deleteEstimate(id: number): Promise<{ ok: true }> {
+    const existing = await this.getEstimate(id);
+    if (!existing) throw new Error("Estimate not found");
+    if (existing.status === "invoiced") throw new Error(`Estimate ${existing.number} has been converted to an invoice and cannot be deleted.`);
+    await db.transaction(async (tx) => {
+      await tx.delete(estimateLines).where(and(eq(estimateLines.estimateId, id), eq(estimateLines.orgId, currentOrgId())));
+      await tx.delete(estimateShares).where(and(eq(estimateShares.estimateId, id), eq(estimateShares.orgId, currentOrgId())));
+      await tx.delete(estimates).where(and(eq(estimates.id, id), eq(estimates.orgId, currentOrgId())));
+    });
+    await this.audit("delete", "estimate", id, `Deleted estimate ${existing.number}`);
+    return { ok: true };
+  }
+
+  // Convert an estimate into an invoice via createInvoice() (reusing its per-line
+  // rounding + tax + GL logic — no math duplicated). The estimate's exact tax is
+  // passed through as a taxOverride so the invoice totals equal the estimate's.
+  // Everything (invoice + JE + link + status flip) commits in ONE transaction.
+  async convertEstimate(id: number, input: ConvertEstimateInput): Promise<{ estimate: Estimate; invoice: Invoice }> {
+    const est = await this.getEstimate(id);
+    if (!est) throw new Error("Estimate not found");
+    if (est.status === "invoiced") throw new Error(`Estimate ${est.number} has already been converted to an invoice.`);
+    if (est.status === "expired") throw new Error(`Estimate ${est.number} has expired and cannot be converted. Re-issue it first.`);
+    if (est.status === "declined") throw new Error(`Estimate ${est.number} was declined and cannot be converted.`);
+
+    const date = input.date ?? new Date().toISOString().slice(0, 10);
+    const dueDate = input.dueDate ?? (() => { const d = new Date(date + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + 30); return d.toISOString().slice(0, 10); })();
+
+    const invoice = await db.transaction(async (tx) => {
+      const invInput = {
+        customerId: est.customerId,
+        date,
+        dueDate,
+        notes: est.notes ?? undefined,
+        currency: est.currency || undefined,
+        fxRate: est.currency ? est.fxRate : undefined,
+        taxRate: 0, // the estimate's exact tax is applied via taxOverride below
+        lines: est.lines.map((l) => ({
+          description: l.description,
+          quantity: l.quantity,
+          rate: l.rate,
+          itemId: l.itemId ?? undefined,
+          incomeAccountId: l.itemId ? undefined : l.incomeAccountId,
+        })),
+      } as CreateInvoiceInput;
+      const inv = await this.createInvoice(invInput, {
+        _tx: tx,
+        taxOverride: { taxCents: est.taxCents, ratePercent: 0, breakdownJson: JSON.stringify({ source: "estimate", estimateId: est.id }) },
+      });
+      await tx.update(invoices).set({ estimateId: est.id }).where(and(eq(invoices.id, inv.id), eq(invoices.orgId, currentOrgId())));
+      await tx.update(estimates).set({ status: "invoiced", updatedAt: nowIso() }).where(and(eq(estimates.id, est.id), eq(estimates.orgId, currentOrgId())));
+      await this.audit("convert", "estimate", est.id, `Converted estimate ${est.number} → invoice ${inv.number}`);
+      return { ...inv, estimateId: est.id } as Invoice;
+    });
+    await emitWebhookEvent("invoice.created", { id: invoice.id, number: invoice.number, total: invoice.total, currency: invoice.currency || null });
+    const updated = (await this.getEstimate(id))!;
+    return { estimate: updated, invoice };
+  }
+
+  // Daily-style sweep (reuses the recurring catch-up pattern): flip past-expiry
+  // draft/sent estimates to 'expired' across ALL orgs, each in its own context.
+  async expireEstimates(asOfDate?: string): Promise<number> {
+    const today = asOfDate || new Date().toISOString().slice(0, 10);
+    // Cross-org boot-time sweep (allowlisted in the org-scope guard, like runCatchUp).
+    const due = await db.select().from(estimates)
+      .where(and(inArray(estimates.status, ["draft", "sent"]), lte(estimates.expiryDate, today)));
+    let expired = 0;
+    for (const e of due) {
+      if (e.expiryDate >= today) continue; // expiry_date < today ⇒ strictly past (today is still valid)
+      await withOrg({ orgId: e.orgId, userId: 0 }, async () => {
+        await db.update(estimates).set({ status: "expired", updatedAt: nowIso() })
+          .where(and(eq(estimates.id, e.id), eq(estimates.orgId, e.orgId)));
+        await this.audit("expire", "estimate", e.id, `Estimate ${e.number} expired (expiry ${e.expiryDate})`);
+      });
+      expired++;
+    }
+    return expired;
+  }
+
+  // ---------- Estimate share tokens (mirror invoice shares) ----------
+  async createEstimateShare(estimateId: number, recipientEmail?: string, expiresInDays = 90): Promise<EstimateShare> {
+    const est = await db.select().from(estimates).where(and(eq(estimates.id, estimateId), eq(estimates.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!est) throw new Error("Estimate not found");
+    if (expiresInDays < 1 || expiresInDays > 3650) throw new Error("expiresInDays must be between 1 and 3650");
+    const token = crypto.randomBytes(24).toString("base64url");
+    const exp = new Date();
+    exp.setUTCDate(exp.getUTCDate() + expiresInDays);
+    const row = await db.insert(estimateShares).values({
+      orgId: currentOrgId(), estimateId, token, recipientEmail: recipientEmail ?? null,
+      expiresAt: exp.toISOString(), createdAt: nowIso(),
+    }).returning().then((r: any[]) => r[0]);
+    await this.audit("share", "estimate", estimateId, `Share token created (expires ${exp.toISOString().slice(0, 10)})`);
+    return row;
+  }
+
+  async getEstimateShareByToken(token: string): Promise<(EstimateShare & { estimate?: any; customer?: any; lines?: any[] }) | undefined> {
+    const share = await db.select().from(estimateShares).where(eq(estimateShares.token, token)).then((r: any[]) => r[0]);
+    if (!share) return undefined;
+    if (share.revokedAt) return undefined;
+    if (share.expiresAt && new Date(share.expiresAt).getTime() < Date.now()) return undefined;
+    // Public share page runs outside any session — the unguessable token IS the
+    // authorization; resolve the estimate inside the share row's own org.
+    const est = await withOrg({ orgId: share.orgId, userId: 0 }, () => this.getEstimate(share.estimateId));
+    return { ...share, estimate: est, customer: est?.customer, lines: est?.lines };
+  }
+
+  async recordEstimateShareView(token: string) {
+    const share = await db.select().from(estimateShares).where(eq(estimateShares.token, token)).then((r: any[]) => r[0]);
+    if (!share) return;
+    await db.update(estimateShares)
+      .set({ viewedAt: new Date().toISOString(), viewCount: share.viewCount + 1 })
+      .where(eq(estimateShares.id, share.id));
+  }
+
   // ---------- Journal Entries ----------
   // Sprint C: opts.bypassLock allows the year-end close itself to post on the lock date.
   // opts._tx: optional external drizzle transaction — pass when calling from within an
@@ -1550,9 +1763,13 @@ export class DatabaseStorage {
   }
 
   // ---------- Invoices ----------
+  // opts._tx: optional external drizzle transaction. When supplied (e.g. by
+  // convertEstimate) the invoice, its lines, its journal entry and any COGS/
+  // inventory effects join the caller's transaction so everything commits or
+  // rolls back atomically; the invoice.created webhook is then the caller's job.
   async createInvoice(
     input: CreateInvoiceInput,
-    opts: { taxOverride?: { taxCents: number; ratePercent: number; breakdownJson: string } } = {}
+    opts: { taxOverride?: { taxCents: number; ratePercent: number; breakdownJson: string }; _tx?: any } = {}
   ): Promise<Invoice> {
     // Auto-numbering: when the caller omits `number`, allocate the next per-org
     // value atomically. Manual override remains legal; duplicates are caught by
@@ -1631,7 +1848,7 @@ export class DatabaseStorage {
       total = subtotal + tax; // exact integer cents
     }
 
-    return await db.transaction(async (tx) => {
+    const doCreate = async (tx: any): Promise<Invoice> => {
       const inv = await tx
         .insert(invoices)
         .values({
@@ -1654,7 +1871,7 @@ export class DatabaseStorage {
           taxBreakdown: opts.taxOverride?.breakdownJson ?? null,
           notes: input.notes,
         })
-        .returning().then((r) => r[0]);
+        .returning().then((r: any[]) => r[0]);
       for (let idx = 0; idx < input.lines.length; idx++) {
         const l = input.lines[idx];
         await tx.insert(invoiceLines)
@@ -1754,11 +1971,18 @@ export class DatabaseStorage {
         await this.audit("post", "inventory_cogs", inv.id, `Relieved inventory for invoice ${invNumber} (COGS ${formatMoney(totalCogs)})`);
       }
       return inv;
-    }).then(async (inv) => {
+    };
+
+    try {
+      if (opts._tx) {
+        // Caller owns the transaction + commit; it emits invoice.created afterwards.
+        return await doCreate(opts._tx);
+      }
+      const inv = await db.transaction(doCreate);
       // Webhooks fire AFTER commit — a rolled-back invoice must never notify.
       await emitWebhookEvent("invoice.created", { id: inv.id, number: inv.number, total: inv.total, currency: inv.currency || null });
       return inv;
-    }).catch((err: any) => {
+    } catch (err: any) {
       // Postgres unique-violation on UNIQUE(org_id, number) → clean business
       // error instead of a raw 500. Drizzle may wrap the pg error, so check
       // both err.code and err.cause.code. "already" maps to HTTP 400 via
@@ -1767,7 +1991,7 @@ export class DatabaseStorage {
         throw new Error(`Invoice number "${invNumber}" already exists in this organization.`);
       }
       throw err;
-    });
+    }
   }
 
   async listInvoices(limit = 50, offset = 0): Promise<Paginated<Invoice & { customerName?: string }>> {
@@ -3121,9 +3345,10 @@ export class DatabaseStorage {
     credit_note: { prefix: "CN-", padding: 4 },
     debit_note: { prefix: "DN-", padding: 4 },
     purchase_order: { prefix: "PO-", padding: 4 },
+    estimate: { prefix: "EST-", padding: 4 },
   };
 
-  async nextNumber(kind: "invoice" | "bill" | "credit_note" | "debit_note" | "purchase_order"): Promise<string> {
+  async nextNumber(kind: "invoice" | "bill" | "credit_note" | "debit_note" | "purchase_order" | "estimate"): Promise<string> {
     const def = DatabaseStorage.SEQUENCE_DEFAULTS[kind];
     if (!def) throw new Error(`Unknown sequence kind "${kind}"`);
     // Insert path: this call allocates 1, so the stored next_value becomes 2.
@@ -3143,7 +3368,7 @@ export class DatabaseStorage {
 
   // Read-only PREVIEW of the upcoming number — does NOT increment. The UI uses
   // this to prefill the form; the authoritative allocation happens at create.
-  async previewNextNumber(kind: "invoice" | "bill" | "credit_note" | "debit_note" | "purchase_order"): Promise<{ kind: string; next: string }> {
+  async previewNextNumber(kind: "invoice" | "bill" | "credit_note" | "debit_note" | "purchase_order" | "estimate"): Promise<{ kind: string; next: string }> {
     const def = DatabaseStorage.SEQUENCE_DEFAULTS[kind];
     if (!def) throw new Error(`Unknown sequence kind "${kind}"`);
     const row = (await pool.query(
