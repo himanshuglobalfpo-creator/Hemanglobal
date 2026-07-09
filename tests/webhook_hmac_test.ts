@@ -1,20 +1,29 @@
 // Webhook HMAC signature determinism + SSRF guard IP classification.
-import { signWebhookPayload, assertSafeWebhookUrl } from "../server/webhooks";
+// Pure unit test: it imports server/webhooks, which transitively loads
+// server/storage (a lazy pg Pool). Give storage a dummy connection string so
+// module init doesn't throw — this test never issues a query.
+process.env.DATABASE_URL ||= "postgresql://unused:unused@127.0.0.1:1/unused";
 import crypto from "node:crypto";
+
 let fail = 0;
 const check = (n: string, c: boolean) => { console.log(`  ${c ? "✅" : "❌"} ${n}`); if (!c) fail++; };
-console.log("Test: Webhook HMAC + SSRF guard");
-const secret = "supersecretkey1234567890";
-const body = JSON.stringify({ event: "invoice.paid", data: { id: 1 } });
-const sig = signWebhookPayload(secret, body);
-// matches an independent HMAC computation
-const expected = crypto.createHmac("sha256", secret).update(body, "utf8").digest("hex");
-check("signature matches independent HMAC-SHA256", sig === expected);
-check("signature is 64 hex chars", /^[0-9a-f]{64}$/.test(sig));
-check("different body → different sig", signWebhookPayload(secret, body + " ") !== sig);
-check("different secret → different sig", signWebhookPayload(secret + "x", body) !== sig);
 
 (async () => {
+  // Dynamic import so the DATABASE_URL default above is set before storage's
+  // module-level pool is constructed.
+  const { signWebhookPayload, assertSafeWebhookUrl } = await import("../server/webhooks");
+
+  console.log("Test: Webhook HMAC + SSRF guard");
+  const secret = "supersecretkey1234567890";
+  const body = JSON.stringify({ event: "invoice.paid", data: { id: 1 } });
+  const sig = signWebhookPayload(secret, body);
+  // matches an independent HMAC computation
+  const expected = crypto.createHmac("sha256", secret).update(body, "utf8").digest("hex");
+  check("signature matches independent HMAC-SHA256", sig === expected);
+  check("signature is 64 hex chars", /^[0-9a-f]{64}$/.test(sig));
+  check("different body → different sig", signWebhookPayload(secret, body + " ") !== sig);
+  check("different secret → different sig", signWebhookPayload(secret + "x", body) !== sig);
+
   // SSRF: private/loopback/metadata rejected; public accepted.
   const rejected = async (url: string) => { try { await assertSafeWebhookUrl(url); return false; } catch { return true; } };
   check("rejects 127.0.0.1", await rejected("http://127.0.0.1/hook"));

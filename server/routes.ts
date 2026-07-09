@@ -5,6 +5,8 @@ import { storage, dbHealthCheck, pool } from "./storage";
 import {
   insertAccountSchema,
   updateAccountSchema,
+  insertItemSchema,
+  updateItemSchema,
   insertCustomerSchema,
   insertVendorSchema,
   postJournalEntrySchema,
@@ -618,6 +620,39 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     })
   );
 
+  // ---------- Items / Inventory ----------
+  app.get("/api/items", (req, res) =>
+    handle(res, () => {
+      const { limit, offset } = paginationQuerySchema.parse(req.query);
+      return storage.listItems(limit, offset);
+    })
+  );
+  app.get("/api/items/:id", (req, res) =>
+    handle(res, async () => {
+      const item = await storage.getItem(parseId(req.params.id));
+      if (!item) throw new Error("Item not found");
+      return item;
+    })
+  );
+  app.post("/api/items", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const data = insertItemSchema.parse(req.body);
+      return storage.createItem(data);
+    })
+  );
+  app.patch("/api/items/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const id = parseId(req.params.id);
+      const { ifUnmodifiedSince, ...body } = req.body ?? {};
+      const data = updateItemSchema.parse(body);
+      assertUnmodifiedSince(await storage.getItem(id), ifUnmodifiedSince);
+      return storage.updateItem(id, data);
+    })
+  );
+  app.delete("/api/items/:id", requireRole("owner", "admin"), (req, res) =>
+    handle(res, () => storage.deleteItem(parseId(req.params.id)))
+  );
+
   // ---------- Customers ----------
   app.get("/api/customers", (req, res) =>
     handle(res, () => {
@@ -786,6 +821,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   );
   app.get("/api/reports/ar-aging", (req, res) =>
     handle(res, () => storage.arAging(req.query.asOf as string | undefined))
+  );
+  app.get("/api/reports/inventory-valuation", (req, res) =>
+    handle(res, () => storage.inventoryValuation(req.query.asOf as string | undefined))
   );
   app.get("/api/reports/ap-aging", (req, res) =>
     handle(res, () => storage.apAging(req.query.asOf as string | undefined))

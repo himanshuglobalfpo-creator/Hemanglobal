@@ -14,6 +14,7 @@ import {
   insertAccountSchema,
   insertCustomerSchema,
   insertVendorSchema,
+  insertItemSchema,
   bankRuleSchema,
   bankRuleUpdateSchema,
   createRecurringSchema,
@@ -38,6 +39,23 @@ console.log("Test: insert schemas strip client-supplied orgId");
     code: "9999", name: "Sneaky", type: "expense", subtype: "other_expense", isActive: true, orgId: 999,
   } as any);
   check("account: orgId stripped from parsed output", !("orgId" in acct));
+
+  // Inventory items: a request must not be able to choose its tenant OR forge
+  // stock levels — quantityOnHand / avgCostCents are derived from movements.
+  const item = insertItemSchema.parse({
+    sku: "SKU-1", name: "Widget", type: "inventory",
+    salesAccountId: 1, expenseAccountId: 2, inventoryAssetAccountId: 3, cogsAccountId: 4,
+    orgId: 999, quantityOnHand: 100000, avgCostCents: 1,
+  } as any);
+  check("item: orgId stripped from parsed output", !("orgId" in item));
+  check("item: quantityOnHand stripped (cannot forge stock)", !("quantityOnHand" in item));
+  check("item: avgCostCents stripped (cannot forge cost)", !("avgCostCents" in item));
+
+  const badItem = insertItemSchema.safeParse({
+    sku: "SKU-2", name: "No Asset", type: "inventory",
+    salesAccountId: 1, expenseAccountId: 2, cogsAccountId: 4,
+  } as any);
+  check("item: inventory type without inventoryAssetAccountId rejected", !badItem.success);
 }
 
 console.log("Test: bank rule PATCH schema");

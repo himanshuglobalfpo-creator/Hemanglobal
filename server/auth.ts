@@ -114,6 +114,7 @@ export async function listOrgsForUser(userId: number): Promise<Array<Organizatio
     baseCurrency: r.base_currency,
     timezone: r.timezone,
     stripeClearingAccountId: r.stripe_clearing_account_id ?? null,
+    allowNegativeStock: r.allow_negative_stock ?? false,
     addressCity: r.address_city ?? null,
     addressState: r.address_state ?? null,
     addressZip: r.address_zip ?? null,

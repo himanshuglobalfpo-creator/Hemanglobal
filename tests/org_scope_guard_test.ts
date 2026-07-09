@@ -59,6 +59,8 @@ const BUSINESS_TABLES = [
   "nexusRegions",
   "auditLog",
   "plaidItems",
+  "items",
+  "inventoryMovements",
 ];
 
 // (method, table) pairs where an unscoped .from(table) inside that method is

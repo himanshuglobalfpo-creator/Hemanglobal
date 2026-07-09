@@ -254,6 +254,108 @@ export const postJournalEntrySchema = z.object({
 export type PostJournalEntry = z.infer<typeof postJournalEntrySchema>;
 
 // ============================================================================
+// INVENTORY ITEMS
+// ============================================================================
+// A catalog item that invoice/bill lines can reference. Three kinds:
+//   - 'inventory'    : stock-tracked. Purchases capitalize to the Inventory
+//                      Asset account and raise quantity_on_hand at a
+//                      WEIGHTED-AVERAGE cost; sales relieve inventory and post
+//                      COGS (Dr COGS / Cr Inventory Asset). Requires
+//                      inventory_asset_account_id.
+//   - 'service'      : no stock. Sold from sales_account_id, bought to
+//                      expense_account_id. inventory_asset_account_id is null.
+//   - 'noninventory' : a physical good we don't track quantities for. Same GL
+//                      wiring as a service.
+// Money: avg_cost_cents is INTEGER CENTS (weighted-average unit cost).
+// quantity_on_hand is WHOLE units. Both are server-maintained from
+// inventory_movements — never accepted from a request body.
+export const ITEM_TYPES = ["inventory", "service", "noninventory"] as const;
+export type ItemType = (typeof ITEM_TYPES)[number];
+
+export const items = pgTable("items", {
+  id: serial("id").primaryKey(),
+  // NOT NULL, no DB default (migration 0013). A forgotten orgId is a loud NOT
+  // NULL violation instead of silently landing in org 1 — storage stamps
+  // currentOrgId() on insert (same discipline as reconciliation_items).
+  orgId: integer("org_id").notNull(),
+  sku: text("sku").notNull(), // UNIQUE(org_id, sku) enforced in migration 0013
+  name: text("name").notNull(),
+  description: text("description"),
+  type: text("type").notNull(), // ItemType
+  salesAccountId: integer("sales_account_id").notNull(),   // income credited on sale
+  expenseAccountId: integer("expense_account_id").notNull(), // expense debited on a service/non-inventory purchase
+  inventoryAssetAccountId: integer("inventory_asset_account_id"), // null for service/non-inventory
+  cogsAccountId: integer("cogs_account_id").notNull(),     // COGS debited when inventory is sold
+  quantityOnHand: integer("quantity_on_hand").notNull().default(0), // whole units
+  // Weighted-average unit cost. Stored in cents (integer). $2.50 = 250. Never REAL.
+  avgCostCents: integer("avg_cost_cents").notNull().default(0),
+  isActive: boolean("is_active").notNull().default(true),
+  updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type Item = typeof items.$inferSelect;
+
+// Base (unrefined) so it can be .partial()'d for PATCH.
+const baseItemSchema = createInsertSchema(items)
+  // quantityOnHand + avgCostCents are DERIVED from movements; orgId is stamped
+  // server-side. .omit them so a request body can neither set its tenant nor
+  // forge stock levels (mass-assignment protection — tenancy test).
+  .omit({ id: true, orgId: true, quantityOnHand: true, avgCostCents: true, updatedAt: true })
+  .extend({
+    sku: z.string().min(1, "SKU is required").max(60),
+    name: z.string().min(1, "Item name is required").max(200),
+    description: z.string().max(2000).nullable().optional(),
+    type: z.enum(ITEM_TYPES),
+    salesAccountId: z.number().int().positive(),
+    expenseAccountId: z.number().int().positive(),
+    inventoryAssetAccountId: z.number().int().positive().nullable().optional(),
+    cogsAccountId: z.number().int().positive(),
+    isActive: z.boolean().default(true),
+  });
+
+// Cross-field: an inventory item MUST have an inventory asset account (that is
+// where purchases capitalize and sales relieve). On PATCH the rule only fires
+// when `type` is present in the payload; storage re-validates the merged row.
+function refineItemShape(v: { type?: string; inventoryAssetAccountId?: number | null }, ctx: z.RefinementCtx) {
+  if (v.type === "inventory" && !v.inventoryAssetAccountId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["inventoryAssetAccountId"],
+      message: "Inventory items require an inventoryAssetAccountId (where stock is capitalized).",
+    });
+  }
+}
+
+export const insertItemSchema = baseItemSchema.superRefine(refineItemShape);
+export const updateItemSchema = baseItemSchema.partial().superRefine(refineItemShape);
+export type InsertItem = z.infer<typeof insertItemSchema>;
+export type UpdateItem = z.infer<typeof updateItemSchema>;
+
+// ============================================================================
+// INVENTORY MOVEMENTS — the append-only ledger behind quantity_on_hand
+// ============================================================================
+// One row per stock change. qty_delta is SIGNED whole units (+ on purchase,
+// - on sale). unit_cost_cents is the per-unit cost that drove the change (the
+// landed cost on a purchase; the weighted-average cost at time of sale).
+// entry_id links to the journal entry that posted the matching GL effect.
+export const INVENTORY_MOVEMENT_SOURCES = ["bill", "invoice", "adjustment", "opening"] as const;
+export type InventoryMovementSource = (typeof INVENTORY_MOVEMENT_SOURCES)[number];
+
+export const inventoryMovements = pgTable("inventory_movements", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(), // NOT NULL, no DB default — storage stamps currentOrgId()
+  itemId: integer("item_id").notNull(),
+  date: text("date").notNull(), // YYYY-MM-DD
+  qtyDelta: integer("qty_delta").notNull(), // signed whole units
+  // Stored in cents (integer). $2.50 = 250. Never use REAL for money.
+  unitCostCents: integer("unit_cost_cents").notNull(),
+  source: text("source").notNull(), // InventoryMovementSource
+  sourceId: integer("source_id"), // FK to the bill/invoice/etc. that caused it
+  entryId: integer("entry_id"), // FK to journal_entries (the GL effect)
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type InventoryMovement = typeof inventoryMovements.$inferSelect;
+
+// ============================================================================
 // INVOICES (sales / accounts receivable)
 // ============================================================================
 export const invoices = pgTable("invoices", {
@@ -305,6 +407,7 @@ export const invoiceLines = pgTable("invoice_lines", {
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
   amount: integer("amount").notNull().default(0),
   incomeAccountId: integer("income_account_id").notNull(), // which income account this line credits
+  itemId: integer("item_id"), // optional link to a catalog item (drives income account + COGS)
 });
 
 export const insertInvoiceLineSchema = createInsertSchema(invoiceLines).omit({ id: true });
@@ -332,7 +435,13 @@ export const createInvoiceSchema = z.object({
         description: z.string().min(1).max(500),
         quantity: z.number().positive("Quantity must be greater than 0"),
         rate: z.number().min(0),
-        incomeAccountId: z.number().int().positive(),
+        // Reference a catalog item (income account + COGS are derived from it)
+        // OR name the income account directly. At least one is required.
+        itemId: z.number().int().positive().optional(),
+        incomeAccountId: z.number().int().positive().optional(),
+      }).refine((l) => l.itemId !== undefined || l.incomeAccountId !== undefined, {
+        message: "Each line must reference an itemId or an incomeAccountId",
+        path: ["incomeAccountId"],
       })
     )
     .min(1, "Invoice must have at least one line"),
@@ -390,6 +499,7 @@ export const billLines = pgTable("bill_lines", {
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
   amount: integer("amount").notNull().default(0),
   expenseAccountId: integer("expense_account_id").notNull(),
+  itemId: integer("item_id"), // optional link to a catalog item (drives GL account + stock)
 });
 
 export const insertBillLineSchema = createInsertSchema(billLines).omit({ id: true });
@@ -414,7 +524,14 @@ export const createBillSchema = z.object({
         description: z.string().min(1).max(500),
         quantity: z.number().positive("Quantity must be greater than 0"),
         rate: z.number().min(0),
-        expenseAccountId: z.number().int().positive(),
+        // Reference a catalog item (GL account is derived from it: inventory
+        // items capitalize to the Inventory Asset account and raise stock;
+        // service/non-inventory items expense) OR name the expense account.
+        itemId: z.number().int().positive().optional(),
+        expenseAccountId: z.number().int().positive().optional(),
+      }).refine((l) => l.itemId !== undefined || l.expenseAccountId !== undefined, {
+        message: "Each line must reference an itemId or an expenseAccountId",
+        path: ["expenseAccountId"],
       })
     )
     .min(1, "Bill must have at least one line"),

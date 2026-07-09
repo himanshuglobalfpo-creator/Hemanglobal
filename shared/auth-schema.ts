@@ -28,6 +28,10 @@ export const organizations = pgTable("organizations", {
   // when unset, online payments are disabled and the Stripe webhook fails
   // loudly rather than guessing an account (see server/stripe.ts).
   stripeClearingAccountId: integer("stripe_clearing_account_id"),
+  // Inventory policy: when false (default), selling a stock item below zero
+  // on-hand is BLOCKED. When true, the sale is allowed and the resulting
+  // negative stock surfaces as a warning on the inventory-valuation report.
+  allowNegativeStock: boolean("allow_negative_stock").notNull().default(false),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
 });
 export type Organization = typeof organizations.$inferSelect;

@@ -20,10 +20,13 @@ import {
   orgNexusStates,
   creditNotes,
   debitNotes,
+  items,
+  inventoryMovements,
   type OrgNexusState,
   type NexusStateInput,
 } from "@shared/schema";
 import { organizations } from "@shared/auth-schema";
+import { applyPurchase, costOfSale, buildCogsJournalLines, type CogsComponent } from "@shared/inventory";
 import type {
   Account,
   InsertAccount,
@@ -62,6 +65,10 @@ import type {
   AuditEntry,
   InvoiceShare,
   Paginated,
+  Item,
+  InsertItem,
+  UpdateItem,
+  InventoryMovement,
 } from "@shared/schema";
 import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
@@ -1034,6 +1041,180 @@ export class DatabaseStorage {
       .returning().then((r) => r[0]);
   }
 
+  // ---------- Items / Inventory ----------
+  // Internal: load the items referenced by a set of line itemIds, org-scoped,
+  // validating each exists in THIS org and is active. Returns them keyed by id.
+  private async loadItemsForLines(itemIds: number[]): Promise<Map<number, Item>> {
+    const uniq = [...new Set(itemIds)];
+    if (uniq.length === 0) return new Map();
+    const rows = await db.select().from(items).where(and(inArray(items.id, uniq), eq(items.orgId, currentOrgId())));
+    const map = new Map(rows.map((r) => [r.id, r]));
+    for (const id of uniq) {
+      const it = map.get(id);
+      if (!it) throw new Error(`Item ${id} not found in this organization.`);
+      if (!it.isActive) throw new Error(`Item "${it.sku}" is inactive and cannot be used on new documents.`);
+    }
+    return map;
+  }
+
+  // Internal: this org's negative-stock policy (organizations is a global table,
+  // scoped here by id === currentOrgId()).
+  private async orgAllowsNegativeStock(): Promise<boolean> {
+    const row = await db
+      .select({ v: organizations.allowNegativeStock })
+      .from(organizations)
+      .where(eq(organizations.id, currentOrgId()))
+      .then((r: any[]) => r[0]);
+    return !!row?.v;
+  }
+
+  // Internal: validate that the GL accounts an item points at exist in this org
+  // and have the expected normal type (income/expense/asset).
+  private async assertItemAccounts(data: {
+    type?: string;
+    salesAccountId?: number;
+    expenseAccountId?: number;
+    inventoryAssetAccountId?: number | null;
+    cogsAccountId?: number;
+  }): Promise<void> {
+    const all = await this.listAccounts();
+    const byId = new Map(all.map((a) => [a.id, a]));
+    const need = (id: number | undefined | null, label: string, wantType?: string) => {
+      if (id === undefined || id === null) return;
+      const a = byId.get(id);
+      if (!a) throw new Error(`${label} account ${id} does not exist in this organization.`);
+      if (wantType && a.type !== wantType) {
+        throw new Error(`${label} account "${a.code} ${a.name}" must be of type ${wantType}.`);
+      }
+    };
+    need(data.salesAccountId, "Sales", "income");
+    need(data.expenseAccountId, "Expense", "expense");
+    need(data.cogsAccountId, "COGS", "expense");
+    need(data.inventoryAssetAccountId ?? undefined, "Inventory asset", "asset");
+  }
+
+  async listItems(limit = 50, offset = 0): Promise<Paginated<Item>> {
+    const where = eq(items.orgId, currentOrgId());
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(items).where(where);
+    const rows = await db.select().from(items).where(where).orderBy(items.sku).limit(limit).offset(offset);
+    return { rows, total, limit, offset };
+  }
+
+  async getItem(id: number): Promise<Item | undefined> {
+    return await db.select().from(items).where(and(eq(items.id, id), eq(items.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+
+  async createItem(data: InsertItem): Promise<Item> {
+    // Per-org SKU uniqueness (DB enforces UNIQUE(org_id, sku); nicer error here).
+    const bySku = await db.select().from(items).where(and(eq(items.sku, data.sku), eq(items.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (bySku) throw new Error(`An item with SKU "${data.sku}" already exists ("${bySku.name}").`);
+    await this.assertItemAccounts(data);
+    // quantity_on_hand / avg_cost_cents start at zero and are only ever moved by
+    // inventory_movements — never seeded from the request body.
+    const row = await db.insert(items).values({
+      ...data,
+      orgId: currentOrgId(),
+      inventoryAssetAccountId: data.inventoryAssetAccountId ?? null,
+      quantityOnHand: 0,
+      avgCostCents: 0,
+      updatedAt: nowIso(),
+    }).returning().then((r) => r[0]);
+    await this.audit("create", "item", row.id, `Created ${row.type} item ${row.sku} — ${row.name}`);
+    return row;
+  }
+
+  async updateItem(id: number, data: UpdateItem): Promise<Item | undefined> {
+    const existing = await this.getItem(id);
+    if (!existing) return undefined;
+    const effectiveType = data.type ?? existing.type;
+    const effectiveInvAsset = data.inventoryAssetAccountId ?? existing.inventoryAssetAccountId;
+    if (effectiveType === "inventory" && !effectiveInvAsset) {
+      throw new Error("Inventory items require an inventoryAssetAccountId.");
+    }
+    // Once stock has moved, freeze the type and the inventory asset account —
+    // changing either would strand quantity_on_hand against a different GL
+    // account and break the valuation tie-out.
+    const moved = (await pool.query(`SELECT COUNT(*)::int AS c FROM inventory_movements WHERE item_id = $1 AND org_id = $2`, [id, currentOrgId()])).rows[0] as { c: number };
+    if (moved.c > 0) {
+      if (data.type !== undefined && data.type !== existing.type) {
+        throw new Error(`Cannot change the type of "${existing.sku}" — it has ${moved.c} stock movement(s).`);
+      }
+      if (data.inventoryAssetAccountId !== undefined && data.inventoryAssetAccountId !== existing.inventoryAssetAccountId) {
+        throw new Error(`Cannot change the inventory asset account of "${existing.sku}" — it has ${moved.c} stock movement(s).`);
+      }
+    }
+    await this.assertItemAccounts({ ...data, type: effectiveType });
+    const row = await db.update(items).set({ ...data, updatedAt: nowIso() }).where(and(eq(items.id, id), eq(items.orgId, currentOrgId()))).returning().then((r) => r[0]);
+    await this.audit("update", "item", id, `Updated item ${existing.sku}`);
+    return row;
+  }
+
+  async deleteItem(id: number): Promise<{ ok: true }> {
+    const existing = await this.getItem(id);
+    if (!existing) throw new Error("Item not found");
+    const moved = (await pool.query(`SELECT COUNT(*)::int AS c FROM inventory_movements WHERE item_id = $1 AND org_id = $2`, [id, currentOrgId()])).rows[0] as { c: number };
+    if (moved.c > 0) {
+      throw new Error(`Cannot delete "${existing.sku}" — it has ${moved.c} stock movement(s). Mark it inactive instead.`);
+    }
+    await db.delete(items).where(and(eq(items.id, id), eq(items.orgId, currentOrgId())));
+    await this.audit("delete", "item", id, `Deleted item ${existing.sku}`);
+    return { ok: true };
+  }
+
+  // Stock-valuation report: sum(quantity_on_hand * avg_cost_cents) per inventory
+  // item, tied out to the Inventory Asset GL balance(s). Mirrors the A/R aging
+  // self-check — a divergence surfaces as a warning rather than a hard error,
+  // since it means the GL was touched outside the purchase/sale workflow.
+  async inventoryValuation(asOfDate?: string) {
+    const rowsRaw = await db
+      .select()
+      .from(items)
+      .where(and(eq(items.orgId, currentOrgId()), eq(items.type, "inventory")));
+    const rows = rowsRaw
+      .map((it) => ({
+        id: it.id,
+        sku: it.sku,
+        name: it.name,
+        quantityOnHand: it.quantityOnHand,
+        avgCostCents: it.avgCostCents,
+        valuationCents: it.quantityOnHand * it.avgCostCents,
+        inventoryAssetAccountId: it.inventoryAssetAccountId,
+        isActive: it.isActive,
+      }))
+      .sort((a, b) => b.valuationCents - a.valuationCents);
+    const totalValuationCents = rows.reduce((s, r) => s + r.valuationCents, 0);
+
+    // Tie-out: sum the GL balances of the DISTINCT inventory asset accounts these
+    // items capitalize into.
+    const balances = await this.accountBalances(asOfDate);
+    const all = await this.listAccounts();
+    const acctMap = new Map(all.map((a) => [a.id, a]));
+    const assetAccountIds = [...new Set(rows.map((r) => r.inventoryAssetAccountId).filter((x): x is number => x != null))];
+    const glAccounts = assetAccountIds.map((accountId) => ({
+      accountId,
+      code: acctMap.get(accountId)?.code ?? null,
+      name: acctMap.get(accountId)?.name ?? null,
+      glBalance: balances.get(accountId)?.balance ?? 0,
+    }));
+    const glTotal = glAccounts.reduce((s, a) => s + a.glBalance, 0);
+    const diff = totalValuationCents - glTotal;
+    let warning: string | undefined;
+    if (diff !== 0) {
+      warning =
+        `Inventory valuation (${formatMoney(totalValuationCents)}) does not match the Inventory Asset GL balance (${formatMoney(glTotal)}). ` +
+        `Difference: ${formatMoney(diff)}. This usually means a journal entry was posted directly to an inventory account, ` +
+        `or negative stock was sold — reconcile before relying on the balance sheet.`;
+    }
+    return {
+      asOfDate: asOfDate ?? new Date().toISOString().slice(0, 10),
+      rows,
+      totalValuationCents,
+      glAccounts,
+      glTotal,
+      warning,
+    };
+  }
+
   // ---------- Journal Entries ----------
   // Sprint C: opts.bypassLock allows the year-end close itself to post on the lock date.
   // opts._tx: optional external drizzle transaction — pass when calling from within an
@@ -1190,6 +1371,19 @@ export class DatabaseStorage {
       .then((r: any[]) => r[0]);
     if (!ar) throw new Error("Accounts Receivable account (1100) missing");
 
+    // Resolve catalog items referenced by lines. For an item line the income
+    // account is DERIVED from the item (never taken from the request). Inventory
+    // items additionally relieve stock and post COGS after the sale entry below.
+    const invItemMap = await this.loadItemsForLines(
+      input.lines.filter((l) => l.itemId !== undefined).map((l) => l.itemId as number)
+    );
+    const allowNegative = await this.orgAllowsNegativeStock();
+    const resolvedIncomeAccountIds: number[] = input.lines.map((l) => {
+      if (l.itemId !== undefined) return invItemMap.get(l.itemId)!.salesAccountId;
+      if (l.incomeAccountId !== undefined) return l.incomeAccountId;
+      throw new Error("Invoice line requires itemId or incomeAccountId");
+    });
+
     let effectiveRate = input.taxRate;
     let taxLiabAccountId: number | undefined;
     if (input.taxCodeId) {
@@ -1279,7 +1473,8 @@ export class DatabaseStorage {
             // FX docs: line detail lives in the DOCUMENT currency (qty × rate
             // are foreign); the GL/base view lives on the header columns.
             amount: fx ? lineAmountsRaw[idx] : lineAmounts[idx],
-            incomeAccountId: l.incomeAccountId,
+            incomeAccountId: resolvedIncomeAccountIds[idx],
+            itemId: l.itemId ?? null,
           });
       }
       // Post journal entry: Dr A/R, Cr each Income account, Cr Sales Tax Payable
@@ -1287,7 +1482,7 @@ export class DatabaseStorage {
       // Group by income account using the per-line rounded amounts
       const incomeMap = new Map<number, number>();
       input.lines.forEach((l, idx) => {
-        incomeMap.set(l.incomeAccountId, ((incomeMap.get(l.incomeAccountId) || 0) + lineAmounts[idx]));
+        incomeMap.set(resolvedIncomeAccountIds[idx], ((incomeMap.get(resolvedIncomeAccountIds[idx]) || 0) + lineAmounts[idx]));
       });
       for (const [acctId, amt] of incomeMap.entries()) {
         lines.push({ accountId: acctId, debit: 0, credit: amt, description: `Invoice ${invNumber}` });
@@ -1304,6 +1499,66 @@ export class DatabaseStorage {
         lines,
       }, { _tx: tx });
       await this.audit("create", "invoice", inv.id, `Created invoice ${invNumber} (${formatMoney(total)})`);
+
+      // ---- Inventory: relieve stock at weighted-average cost + post COGS ----
+      // Sales of inventory items decrement quantity_on_hand and book their own
+      // balanced entry (Dr COGS / Cr Inventory Asset) in THIS SAME transaction,
+      // so a rolled-back invoice never leaves an orphaned COGS entry or stray
+      // stock change. The COGS entry goes through postJournalEntry, which
+      // enforces the period lock just like the sale entry above.
+      const cogsComponents: CogsComponent[] = [];
+      const saleMovements: { itemId: number; qty: number; avgCostCents: number }[] = [];
+      const workingQty = new Map<number, number>(); // item id -> running on-hand
+      for (let idx = 0; idx < input.lines.length; idx++) {
+        const l = input.lines[idx];
+        if (l.itemId === undefined) continue;
+        const item = invItemMap.get(l.itemId)!;
+        if (item.type !== "inventory") continue;
+        if (!Number.isInteger(l.quantity)) {
+          throw new Error(`Inventory item "${item.sku}" must be sold in whole units (got ${l.quantity}).`);
+        }
+        const startQty = workingQty.get(item.id) ?? item.quantityOnHand;
+        const sale = costOfSale({ qtyOnHand: startQty, avgCostCents: item.avgCostCents }, l.quantity);
+        if (sale.qtyOnHand < 0 && !allowNegative) {
+          throw new Error(
+            `Selling ${l.quantity} of "${item.sku}" would drive stock to ${sale.qtyOnHand} (on hand ${startQty}). ` +
+            `Enable allow_negative_stock for this organization to permit overselling.`
+          );
+        }
+        workingQty.set(item.id, sale.qtyOnHand);
+        // inventoryAssetAccountId is guaranteed non-null for type 'inventory' (schema refine + createItem).
+        cogsComponents.push({ cogsAccountId: item.cogsAccountId, inventoryAssetAccountId: item.inventoryAssetAccountId!, cogsCents: sale.cogsCents });
+        saleMovements.push({ itemId: item.id, qty: l.quantity, avgCostCents: item.avgCostCents });
+      }
+      const cogsLines = buildCogsJournalLines(cogsComponents, `COGS for ${invNumber}`);
+      if (cogsLines.length > 0) {
+        const cogsEntry = await this.postJournalEntry({
+          date: input.date,
+          memo: `COGS for invoice ${invNumber}`,
+          reference: invNumber,
+          source: "cogs",
+          sourceId: inv.id,
+          lines: cogsLines,
+        }, { _tx: tx });
+        for (const mv of saleMovements) {
+          await tx.insert(inventoryMovements).values({
+            orgId: currentOrgId(),
+            itemId: mv.itemId,
+            date: input.date,
+            qtyDelta: -mv.qty,
+            unitCostCents: mv.avgCostCents,
+            source: "invoice",
+            sourceId: inv.id,
+            entryId: cogsEntry.entry.id,
+          });
+        }
+        for (const [itemId, qtyOnHand] of workingQty) {
+          await tx.update(items).set({ quantityOnHand: qtyOnHand, updatedAt: nowIso() })
+            .where(and(eq(items.id, itemId), eq(items.orgId, currentOrgId())));
+        }
+        const totalCogs = cogsComponents.reduce((s, c) => s + c.cogsCents, 0);
+        await this.audit("post", "inventory_cogs", inv.id, `Relieved inventory for invoice ${invNumber} (COGS ${formatMoney(totalCogs)})`);
+      }
       return inv;
     }).then(async (inv) => {
       // Webhooks fire AFTER commit — a rolled-back invoice must never notify.
@@ -1539,6 +1794,22 @@ export class DatabaseStorage {
     const ap = await db.select().from(accounts).where(and(eq(accounts.code, "2000"), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
     if (!ap) throw new Error("Accounts Payable account (2000) missing");
 
+    // Resolve catalog items referenced by lines. The GL debit account is DERIVED
+    // from the item (never taken from the request): an inventory item capitalizes
+    // its purchase to the Inventory Asset account and raises stock; a
+    // service/non-inventory item debits its expense account.
+    const billItemMap = await this.loadItemsForLines(
+      input.lines.filter((l) => l.itemId !== undefined).map((l) => l.itemId as number)
+    );
+    const resolvedDebitAccountIds: number[] = input.lines.map((l) => {
+      if (l.itemId !== undefined) {
+        const item = billItemMap.get(l.itemId)!;
+        return item.type === "inventory" ? item.inventoryAssetAccountId! : item.expenseAccountId;
+      }
+      if (l.expenseAccountId !== undefined) return l.expenseAccountId;
+      throw new Error("Bill line requires itemId or expenseAccountId");
+    });
+
     // Resolve tax rate and a dedicated tax account.
     // For purchases we use Sales Tax Receivable (asset, code 1150) when available
     // — this represents recoverable VAT/GST. If 1150 is missing (older datasets),
@@ -1609,14 +1880,16 @@ export class DatabaseStorage {
             quantity: l.quantity,
             rate: l.rate,
             amount: fx ? lineAmountsRaw[idx] : lineAmounts[idx], // document-currency detail for FX
-            expenseAccountId: l.expenseAccountId,
+            expenseAccountId: resolvedDebitAccountIds[idx],
+            itemId: l.itemId ?? null,
           });
       }
-      // Dr each Expense (rounded line amounts), Dr Sales Tax Receivable (or first expense acct as fallback), Cr A/P
+      // Dr each Expense/Inventory account (rounded line amounts), Dr Sales Tax
+      // Receivable (or first debit acct as fallback), Cr A/P.
       const lines: any[] = [];
       const expMap = new Map<number, number>();
       input.lines.forEach((l, idx) => {
-        expMap.set(l.expenseAccountId, ((expMap.get(l.expenseAccountId) || 0) + lineAmounts[idx]));
+        expMap.set(resolvedDebitAccountIds[idx], ((expMap.get(resolvedDebitAccountIds[idx]) || 0) + lineAmounts[idx]));
       });
       for (const [acctId, amt] of expMap.entries()) {
         lines.push({ accountId: acctId, debit: amt, credit: 0, description: `Bill ${billNumber}` });
@@ -1627,7 +1900,7 @@ export class DatabaseStorage {
         lines.push({ accountId: taxAcctId, debit: tax, credit: 0, description: `${taxLabel} on ${billNumber}` });
       }
       lines.push({ accountId: ap.id, debit: 0, credit: total, description: `Bill ${billNumber}` });
-      await this.postJournalEntry({
+      const billEntry = await this.postJournalEntry({
         date: input.date,
         memo: `Bill ${billNumber}`,
         reference: billNumber,
@@ -1636,6 +1909,45 @@ export class DatabaseStorage {
         lines,
       }, { _tx: tx });
       await this.audit("create", "bill", b.id, `Created bill ${billNumber} (${formatMoney(total)})`);
+
+      // ---- Inventory: raise stock at WEIGHTED-AVERAGE cost for item lines ----
+      // The purchase was already capitalized to the Inventory Asset account by
+      // the bill entry above (its debit is `lineAmounts[idx]` base cents). Here
+      // we mirror that into quantity_on_hand and recompute the running average
+      // in the SAME transaction. Same-item lines are folded sequentially.
+      const working = new Map<number, { qtyOnHand: number; avgCostCents: number }>();
+      let touchedInventory = false;
+      for (let idx = 0; idx < input.lines.length; idx++) {
+        const l = input.lines[idx];
+        if (l.itemId === undefined) continue;
+        const item = billItemMap.get(l.itemId)!;
+        if (item.type !== "inventory") continue;
+        if (!Number.isInteger(l.quantity)) {
+          throw new Error(`Inventory item "${item.sku}" must be purchased in whole units (got ${l.quantity}).`);
+        }
+        touchedInventory = true;
+        const state = working.get(item.id) ?? { qtyOnHand: item.quantityOnHand, avgCostCents: item.avgCostCents };
+        const valueCents = lineAmounts[idx]; // base-currency cents debited to inventory
+        const res = applyPurchase(state, l.quantity, valueCents);
+        working.set(item.id, { qtyOnHand: res.qtyOnHand, avgCostCents: res.avgCostCents });
+        await tx.insert(inventoryMovements).values({
+          orgId: currentOrgId(),
+          itemId: item.id,
+          date: input.date,
+          qtyDelta: l.quantity,
+          unitCostCents: res.unitCostCents,
+          source: "bill",
+          sourceId: b.id,
+          entryId: billEntry.entry.id,
+        });
+      }
+      if (touchedInventory) {
+        for (const [itemId, st] of working) {
+          await tx.update(items).set({ quantityOnHand: st.qtyOnHand, avgCostCents: st.avgCostCents, updatedAt: nowIso() })
+            .where(and(eq(items.id, itemId), eq(items.orgId, currentOrgId())));
+        }
+        await this.audit("post", "inventory_receipt", b.id, `Received inventory on bill ${billNumber}`);
+      }
       return b;
     }).then(async (b) => {
       await emitWebhookEvent("bill.created", { id: b.id, number: b.number, total: b.total, currency: b.currency || null });
