@@ -68,6 +68,8 @@ const BUSINESS_TABLES = [
   "estimateShares",
   "fixedAssets",
   "depreciationEntries",
+  "fxRevaluations",
+  "fxRevaluationLines",
 ];
 
 // (method, table) pairs where an unscoped .from(table) inside that method is
@@ -168,6 +170,10 @@ const ALLOWLIST: Record<string, { tables: string[]; reason: string }> = {
   runDepreciationCatchUp: {
     tables: ["fixedAssets"],
     reason: "boot-time sweep across ALL orgs; posts due depreciation, wrapping EACH asset in withOrg(a.orgId)",
+  },
+  reverseFxRevaluation: {
+    tables: ["journalLines"],
+    reason: "journalLines fetched by entryId of the org-scoped revaluation's own entry (the revaluation lookup is org-filtered)",
   },
 };
 

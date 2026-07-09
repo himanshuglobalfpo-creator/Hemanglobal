@@ -17,6 +17,7 @@ import {
   updateFixedAssetSchema,
   disposeFixedAssetSchema,
   postDepreciationQuerySchema,
+  revalueFxSchema,
   insertCustomerSchema,
   insertVendorSchema,
   postJournalEntrySchema,
@@ -611,6 +612,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       await storage.upsertFxRate(data);
       return { ok: true };
     })
+  );
+
+  // ---------- FX revaluation (period-end unrealized adjustment) ----------
+  app.get("/api/fx/revaluations", (req, res) =>
+    handle(res, () => {
+      const { limit, offset } = paginationQuerySchema.parse(req.query);
+      return storage.listFxRevaluations(limit, offset);
+    })
+  );
+  app.get("/api/fx/revaluations/:id", (req, res) =>
+    handle(res, async () => {
+      const rev = await storage.getFxRevaluation(parseId(req.params.id));
+      if (!rev) throw new Error("FX revaluation not found");
+      return rev;
+    })
+  );
+  app.post("/api/fx/revalue", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => storage.revalueFx(revalueFxSchema.parse(req.body)))
+  );
+  app.post("/api/fx/revalue/:id/reverse", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => storage.reverseFxRevaluation(parseId(req.params.id)))
   );
 
   app.get("/api/accounts", (_req, res) => handle(res, () => storage.listAccounts()));

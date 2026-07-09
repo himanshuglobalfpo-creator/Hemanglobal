@@ -654,6 +654,56 @@ export const disposeFixedAssetSchema = z.object({
 export type DisposeFixedAssetInput = z.infer<typeof disposeFixedAssetSchema>;
 
 // ============================================================================
+// FX REVALUATION (period-end unrealized foreign-currency adjustment)
+// ============================================================================
+// The ledger books REALIZED FX on payment (see 4950 FX Gain / 6950 FX Loss).
+// This adds UNREALIZED FX: at period end, the base-currency carrying value of an
+// OPEN foreign invoice/bill is remeasured at the as-of-date rate, and the
+// difference is posted to Unrealized FX Gain/Loss against A/R (1100) or A/P
+// (2000). Unrealized revaluations REVERSE at the start of the next period (only
+// realized FX is permanent), so each run is stored and can be reversed.
+export const FX_REVALUATION_STATUSES = ["posted", "reversed"] as const;
+export type FxRevaluationStatus = (typeof FX_REVALUATION_STATUSES)[number];
+
+export const fxRevaluations = pgTable("fx_revaluations", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(), // NOT NULL, no DB default — storage stamps currentOrgId()
+  asOfDate: text("as_of_date").notNull(), // YYYY-MM-DD
+  currency: text("currency"), // null = all foreign currencies in this run
+  entryId: integer("entry_id"), // the adjusting JE (null when nothing needed adjusting)
+  reversalEntryId: integer("reversal_entry_id"), // the reversing JE (set once reversed)
+  reversalDate: text("reversal_date"),
+  status: text("status").notNull().default("posted"), // FxRevaluationStatus
+  // Stored in cents (integer). Never use REAL for money.
+  totalGainCents: integer("total_gain_cents").notNull().default(0),
+  totalLossCents: integer("total_loss_cents").notNull().default(0),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type FxRevaluation = typeof fxRevaluations.$inferSelect;
+
+// Per-document detail of a revaluation run (audit trail + explainability).
+export const fxRevaluationLines = pgTable("fx_revaluation_lines", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(),
+  revaluationId: integer("revaluation_id").notNull(),
+  docType: text("doc_type").notNull(), // 'invoice' | 'bill'
+  docId: integer("doc_id").notNull(),
+  currency: text("currency").notNull(),
+  rate: doublePrecision("rate").notNull(), // as-of-date rate, base units per 1 foreign unit
+  foreignOutstandingCents: integer("foreign_outstanding_cents").notNull(),
+  bookingBaseCents: integer("booking_base_cents").notNull(),   // carrying value before revaluation
+  revaluedBaseCents: integer("revalued_base_cents").notNull(), // carrying value at the as-of rate
+  diffCents: integer("diff_cents").notNull(),                  // revalued - booking (signed)
+});
+export type FxRevaluationLine = typeof fxRevaluationLines.$inferSelect;
+
+export const revalueFxSchema = z.object({
+  asOfDate: isoDate,
+  currency: z.string().regex(/^[A-Z]{3}$/, "Use a 3-letter ISO currency code, e.g. EUR").optional(),
+});
+export type RevalueFxInput = z.infer<typeof revalueFxSchema>;
+
+// ============================================================================
 // BILLS (purchases / accounts payable)
 // ============================================================================
 export const bills = pgTable("bills", {

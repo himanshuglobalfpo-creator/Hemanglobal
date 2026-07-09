@@ -29,12 +29,14 @@ import {
   estimateShares,
   fixedAssets,
   depreciationEntries,
+  fxRevaluations,
+  fxRevaluationLines,
   type OrgNexusState,
   type NexusStateInput,
 } from "@shared/schema";
 import { organizations } from "@shared/auth-schema";
 import { applyPurchase, costOfSale, buildCogsJournalLines, type CogsComponent } from "@shared/inventory";
-import { computeDepreciationSchedule, lastDayOfPeriod, periodOf, type DepreciationPeriod } from "@shared/depreciation";
+import { computeDepreciationSchedule, lastDayOfPeriod, periodOf, addMonthsToPeriod, type DepreciationPeriod } from "@shared/depreciation";
 import type {
   Account,
   InsertAccount,
@@ -93,6 +95,9 @@ import type {
   CreateFixedAssetInput,
   UpdateFixedAssetInput,
   DisposeFixedAssetInput,
+  FxRevaluation,
+  FxRevaluationLine,
+  RevalueFxInput,
 } from "@shared/schema";
 import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
@@ -102,7 +107,7 @@ import { encryptSecret, decryptSecret, isLegacyPlaintext, encryptionAvailable, a
 import { logger } from "./logger";
 import { emitWebhookEvent } from "./webhooks";
 import { calculateSalesTax, taxjarConfigured, type CalculateSalesTaxResult } from "./taxjar";
-import { eq, sql, and, gt, gte, lte, desc, inArray } from "drizzle-orm";
+import { eq, ne, sql, and, gt, gte, lte, desc, inArray } from "drizzle-orm";
 import pg from "pg";
 import fs from "node:fs";
 import path from "node:path";
@@ -3597,6 +3602,214 @@ export class DatabaseStorage {
       [currentOrgId(), input.date, input.fromCode, input.toCode, input.rate, input.source ?? "manual"]
     );
     await this.audit("upsert", "fx_rate", null, `FX rate ${input.fromCode}→${input.toCode} @ ${input.rate} for ${input.date}`);
+  }
+
+  // Idempotent per-org seeds for the UNREALIZED-FX accounts (distinct from the
+  // realized 4950/6950 pair). Mirrors ensureFxAccounts().
+  async ensureUnrealizedFxAccounts(): Promise<{ gain: Account; loss: Account }> {
+    const orgId = currentOrgId();
+    const find = async (code: string) =>
+      db.select().from(accounts).where(and(eq(accounts.code, code), eq(accounts.orgId, orgId))).then((r: any[]) => r[0]);
+    let gain = await find("4960");
+    if (!gain) {
+      gain = await db.insert(accounts)
+        .values({ orgId, code: "4960", name: "Unrealized FX Gain", type: "income", subtype: "other_income", description: "Unrealized foreign-exchange gains (period-end revaluation)", isActive: true })
+        .returning().then((r) => r[0]);
+    }
+    let loss = await find("6960");
+    if (!loss) {
+      loss = await db.insert(accounts)
+        .values({ orgId, code: "6960", name: "Unrealized FX Loss", type: "expense", subtype: "other_expense", description: "Unrealized foreign-exchange losses (period-end revaluation)", isActive: true })
+        .returning().then((r) => r[0]);
+    }
+    return { gain, loss };
+  }
+
+  // Exact-date FX rate lookup (base units per 1 foreign unit). Never guesses a
+  // nearby date — a revaluation must use an explicitly recorded period-end rate.
+  private async getFxRateExact(fromCode: string, toCode: string, date: string): Promise<number | undefined> {
+    const row = (await pool.query(
+      `SELECT rate FROM fx_rates WHERE org_id = $1 AND date = $2 AND from_code = $3 AND to_code = $4`,
+      [currentOrgId(), date, fromCode, toCode]
+    )).rows[0];
+    return row ? Number(row.rate) : undefined;
+  }
+
+  // ============================================================================
+  // FX REVALUATION — period-end unrealized adjustment of OPEN foreign balances
+  // ============================================================================
+  async listFxRevaluations(limit = 50, offset = 0): Promise<Paginated<FxRevaluation>> {
+    const where = eq(fxRevaluations.orgId, currentOrgId());
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(fxRevaluations).where(where);
+    const rows = await db.select().from(fxRevaluations).where(where).orderBy(desc(fxRevaluations.id)).limit(limit).offset(offset);
+    return { rows, total, limit, offset };
+  }
+
+  async getFxRevaluation(id: number): Promise<(FxRevaluation & { lines: FxRevaluationLine[] }) | undefined> {
+    const rev = await db.select().from(fxRevaluations).where(and(eq(fxRevaluations.id, id), eq(fxRevaluations.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!rev) return undefined;
+    const lines = await db.select().from(fxRevaluationLines)
+      .where(and(eq(fxRevaluationLines.revaluationId, id), eq(fxRevaluationLines.orgId, currentOrgId())))
+      .orderBy(fxRevaluationLines.id);
+    return { ...rev, lines };
+  }
+
+  // Remeasure every OPEN foreign invoice/bill (dated on/before asOfDate) at the
+  // as-of-date rate and post ONE adjusting JE for the net difference to the
+  // Unrealized FX Gain/Loss accounts against A/R (1100) / A/P (2000). Integer
+  // cents, one transaction, respects period locks. A rate must exist for the
+  // as-of date for every currency in scope — no guessing.
+  async revalueFx(input: RevalueFxInput): Promise<{ revaluation: FxRevaluation; lines: FxRevaluationLine[] }> {
+    const orgId = currentOrgId();
+    const base = await this.orgBaseCurrency();
+    const asOf = input.asOfDate;
+
+    // ---- gather OPEN foreign documents in scope -----------------------------
+    type Doc = { docType: "invoice" | "bill"; docId: number; currency: string; foreignOutstanding: number; bookingBase: number };
+    const docs: Doc[] = [];
+
+    const openInvoices = await db.select().from(invoices).where(and(
+      eq(invoices.orgId, orgId), eq(invoices.status, "open"), ne(invoices.currency, ""), lte(invoices.date, asOf),
+      ...(input.currency ? [eq(invoices.currency, input.currency)] : []),
+    ));
+    for (const iv of openInvoices) {
+      if (iv.currency === base) continue;
+      const foreignOutstanding = iv.foreignTotal - iv.foreignAmountPaid;
+      if (foreignOutstanding <= 0) continue;
+      docs.push({ docType: "invoice", docId: iv.id, currency: iv.currency, foreignOutstanding, bookingBase: iv.total - iv.amountPaid });
+    }
+
+    const openBills = await db.select().from(bills).where(and(
+      eq(bills.orgId, orgId), eq(bills.status, "open"), ne(bills.currency, ""), lte(bills.date, asOf),
+      ...(input.currency ? [eq(bills.currency, input.currency)] : []),
+    ));
+    for (const bl of openBills) {
+      if (bl.currency === base) continue;
+      const foreignOutstanding = bl.foreignTotal - bl.foreignAmountPaid;
+      if (foreignOutstanding <= 0) continue;
+      docs.push({ docType: "bill", docId: bl.id, currency: bl.currency, foreignOutstanding, bookingBase: bl.total - bl.amountPaid });
+    }
+
+    // ---- resolve a rate for EVERY currency in scope (fail loudly) -----------
+    const currencies = [...new Set(docs.map((d) => d.currency))];
+    const rateByCurrency = new Map<string, number>();
+    for (const cur of currencies) {
+      const rate = await this.getFxRateExact(cur, base, asOf);
+      if (rate === undefined || !(rate > 0)) {
+        throw new Error(`No FX rate for ${cur}→${base} on ${asOf}. Add the period-end rate before revaluing (rates are never guessed).`);
+      }
+      rateByCurrency.set(cur, rate);
+    }
+
+    // ---- accounts -----------------------------------------------------------
+    const ar = await db.select().from(accounts).where(and(eq(accounts.code, "1100"), eq(accounts.orgId, orgId))).then((r: any[]) => r[0]);
+    const ap = await db.select().from(accounts).where(and(eq(accounts.code, "2000"), eq(accounts.orgId, orgId))).then((r: any[]) => r[0]);
+    const { gain, loss } = await this.ensureUnrealizedFxAccounts();
+
+    // ---- compute per-doc diffs + aggregate JE (net debit per account) -------
+    const perDoc: Array<Doc & { rate: number; revaluedBase: number; diff: number }> = [];
+    const acc = new Map<number, { debit: number; credit: number }>();
+    const add = (id: number, debit: number, credit: number) => {
+      const e = acc.get(id) ?? { debit: 0, credit: 0 };
+      e.debit += debit; e.credit += credit; acc.set(id, e);
+    };
+    let totalGain = 0, totalLoss = 0;
+    for (const d of docs) {
+      const rate = rateByCurrency.get(d.currency)!;
+      const revaluedBase = Math.round(d.foreignOutstanding * rate);
+      const diff = revaluedBase - d.bookingBase; // signed
+      perDoc.push({ ...d, rate, revaluedBase, diff });
+      if (diff === 0) continue;
+      if (d.docType === "invoice") {
+        if (!ar) throw new Error("Accounts Receivable account (1100) missing");
+        if (diff > 0) { add(ar.id, diff, 0); add(gain.id, 0, diff); totalGain += diff; }
+        else { add(ar.id, 0, -diff); add(loss.id, -diff, 0); totalLoss += -diff; }
+      } else {
+        if (!ap) throw new Error("Accounts Payable account (2000) missing");
+        if (diff > 0) { add(ap.id, 0, diff); add(loss.id, diff, 0); totalLoss += diff; } // payable base up = loss
+        else { add(ap.id, -diff, 0); add(gain.id, 0, -diff); totalGain += -diff; }       // payable base down = gain
+      }
+    }
+
+    // Net each account to a single debit OR credit line.
+    const jeLines: Array<{ accountId: number; debit: number; credit: number; description: string }> = [];
+    for (const [accountId, { debit, credit }] of acc) {
+      const net = debit - credit;
+      if (net > 0) jeLines.push({ accountId, debit: net, credit: 0, description: `Unrealized FX revaluation ${asOf}` });
+      else if (net < 0) jeLines.push({ accountId, debit: 0, credit: -net, description: `Unrealized FX revaluation ${asOf}` });
+    }
+
+    // ---- persist run + post JE in one transaction ---------------------------
+    return await db.transaction(async (tx) => {
+      const rev = await tx.insert(fxRevaluations).values({
+        orgId, asOfDate: asOf, currency: input.currency ?? null, status: "posted",
+        totalGainCents: totalGain, totalLossCents: totalLoss, createdAt: nowIso(),
+      }).returning().then((r: any[]) => r[0]);
+
+      let entryId: number | null = null;
+      if (jeLines.length >= 2) {
+        const je = await this.postJournalEntry({
+          date: asOf,
+          memo: `Unrealized FX revaluation ${asOf}${input.currency ? ` (${input.currency})` : ""}`,
+          reference: `FXREVAL-${rev.id}`,
+          source: "fx_revaluation",
+          sourceId: rev.id,
+          lines: jeLines,
+        }, { _tx: tx });
+        entryId = je.entry.id;
+        await tx.update(fxRevaluations).set({ entryId }).where(and(eq(fxRevaluations.id, rev.id), eq(fxRevaluations.orgId, orgId)));
+      }
+
+      const insertedLines: FxRevaluationLine[] = [];
+      for (const d of perDoc) {
+        const row = await tx.insert(fxRevaluationLines).values({
+          orgId, revaluationId: rev.id, docType: d.docType, docId: d.docId, currency: d.currency,
+          rate: d.rate, foreignOutstandingCents: d.foreignOutstanding, bookingBaseCents: d.bookingBase,
+          revaluedBaseCents: d.revaluedBase, diffCents: d.diff,
+        }).returning().then((r: any[]) => r[0]);
+        insertedLines.push(row);
+      }
+      await this.audit("revalue", "fx_revaluation", rev.id,
+        `FX revaluation ${asOf}: ${perDoc.length} document(s), gain ${formatMoney(totalGain)}, loss ${formatMoney(totalLoss)}`,
+        { asOfDate: asOf, currency: input.currency ?? null, entryId });
+      return { revaluation: { ...rev, entryId }, lines: insertedLines };
+    });
+  }
+
+  // Reverse a revaluation at the start of the next period (standard practice:
+  // unrealized adjustments reverse, realized ones don't). Posts the exact
+  // opposite of the adjusting JE, restoring the prior carrying value.
+  async reverseFxRevaluation(id: number): Promise<FxRevaluation> {
+    const rev = await this.getFxRevaluation(id);
+    if (!rev) throw new Error("FX revaluation not found");
+    if (rev.status === "reversed") throw new Error(`FX revaluation ${id} has already been reversed.`);
+    // First day of the month AFTER the as-of date's period.
+    const reversalDate = `${addMonthsToPeriod(periodOf(rev.asOfDate), 1)}-01`;
+    if (!rev.entryId) {
+      // No adjusting JE was posted (nothing to revalue) — just mark reversed.
+      const row = await db.update(fxRevaluations).set({ status: "reversed", reversalDate })
+        .where(and(eq(fxRevaluations.id, id), eq(fxRevaluations.orgId, currentOrgId()))).returning().then((r: any[]) => r[0]);
+      await this.audit("reverse", "fx_revaluation", id, `Reversed FX revaluation ${id} (no-op — no adjusting entry)`);
+      return row;
+    }
+    // Load the original JE lines and post their mirror image.
+    const origLines = await db.select().from(journalLines).where(eq(journalLines.entryId, rev.entryId));
+    const reversedLines = origLines.map((l) => ({ accountId: l.accountId, debit: l.credit, credit: l.debit, description: `Reversal of FX revaluation ${rev.asOfDate}` }));
+    return await db.transaction(async (tx) => {
+      const je = await this.postJournalEntry({
+        date: reversalDate,
+        memo: `Reversal of unrealized FX revaluation ${rev.asOfDate}`,
+        reference: `FXREVAL-${rev.id}-REV`,
+        source: "fx_revaluation_reversal",
+        sourceId: rev.id,
+        lines: reversedLines,
+      }, { _tx: tx });
+      const row = await tx.update(fxRevaluations)
+        .set({ status: "reversed", reversalEntryId: je.entry.id, reversalDate })
+        .where(and(eq(fxRevaluations.id, id), eq(fxRevaluations.orgId, currentOrgId()))).returning().then((r: any[]) => r[0]);
+      await this.audit("reverse", "fx_revaluation", id, `Reversed FX revaluation ${rev.asOfDate} on ${reversalDate}`);
+      return row;
+    });
   }
 
   // Resolves currency/fxRate for a new document. Returns null for base-currency
