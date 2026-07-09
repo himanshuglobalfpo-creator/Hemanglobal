@@ -34,6 +34,8 @@ import {
   employees,
   payrollRuns,
   payrollItems,
+  payrollLiabilityPayments,
+  payrollLiabilityPaymentLines,
   type OrgNexusState,
   type NexusStateInput,
 } from "@shared/schema";
@@ -108,6 +110,8 @@ import type {
   CreateEmployeeInput,
   UpdateEmployeeInput,
   CreatePayrollRunInput,
+  PayrollLiabilityPayment,
+  PayPayrollLiabilitiesInput,
 } from "@shared/schema";
 import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
@@ -2151,6 +2155,83 @@ export class DatabaseStorage {
       }).where(and(eq(payrollRuns.id, id), eq(payrollRuns.orgId, orgId))).returning().then((r: any[]) => r[0]);
       await this.audit("post", "payroll_run", id, `Posted pay run ${run.periodStart}–${run.periodEnd} (gross ${formatMoney(totals.gross)}, employer tax ${formatMoney(totals.erTax)}, net ${formatMoney(totals.net)})`);
       return updated;
+    });
+  }
+
+  // Pay stub for one employee on one run: the paycheck breakdown plus inclusive
+  // year-to-date figures (from posted runs up to and including this pay date).
+  async getPayStub(runId: number, employeeId: number) {
+    const run = await db.select().from(payrollRuns).where(and(eq(payrollRuns.id, runId), eq(payrollRuns.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!run) throw new Error("Pay run not found");
+    const item = await db.select().from(payrollItems)
+      .where(and(eq(payrollItems.runId, runId), eq(payrollItems.employeeId, employeeId), eq(payrollItems.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!item) throw new Error("This employee is not on that pay run.");
+    const employee = await this.getEmployee(employeeId);
+    // Inclusive YTD from POSTED runs in the pay year, up to this pay date.
+    const year = run.payDate.slice(0, 4);
+    const ytd = (await pool.query(
+      `SELECT COALESCE(SUM(pi.gross_cents),0)::int AS gross,
+              COALESCE(SUM(pi.employee_tax_cents),0)::int AS employee_tax,
+              COALESCE(SUM(pi.net_cents),0)::int AS net
+       FROM payroll_items pi JOIN payroll_runs pr ON pr.id = pi.run_id
+       WHERE pi.org_id = $1 AND pi.employee_id = $2 AND pr.status = 'posted'
+         AND substr(pr.pay_date,1,4) = $3 AND pr.pay_date <= $4`,
+      [currentOrgId(), employeeId, year, run.payDate]
+    )).rows[0];
+    return {
+      run: { id: run.id, payDate: run.payDate, periodStart: run.periodStart, periodEnd: run.periodEnd, status: run.status },
+      employee: employee ? { id: employee.id, name: employee.name, payType: employee.payType } : { id: employeeId, name: "Employee", payType: null },
+      item,
+      ytd: { grossCents: Number(ytd.gross), employeeTaxCents: Number(ytd.employee_tax), netCents: Number(ytd.net) },
+    };
+  }
+
+  // ---------- Pay payroll liabilities (QBO "Pay Taxes") ----------
+  // What the org currently owes on its payroll-liability accounts (2300/2310).
+  async payrollLiabilityBalances(asOfDate?: string): Promise<Array<{ accountId: number; code: string; name: string; balanceCents: number }>> {
+    const { taxesPayable, deductionsPayable } = await this.ensurePayrollAccounts();
+    const balances = await this.accountBalances(asOfDate);
+    return [taxesPayable, deductionsPayable].map((a) => ({
+      accountId: a.id, code: a.code, name: a.name, balanceCents: balances.get(a.id)?.balance ?? 0,
+    }));
+  }
+
+  // Remit accrued payroll liabilities: Dr each liability account / Cr Bank, in
+  // one balanced transaction. Respects period locks.
+  async payPayrollLiabilities(input: PayPayrollLiabilitiesInput): Promise<PayrollLiabilityPayment> {
+    const orgId = currentOrgId();
+    const bank = await db.select().from(accounts).where(and(eq(accounts.id, input.bankAccountId), eq(accounts.orgId, orgId))).then((r: any[]) => r[0]);
+    if (!bank) throw new Error("bankAccountId does not exist in this organization.");
+    if (bank.type !== "asset") throw new Error(`Payments must be drawn from an asset (bank) account; "${bank.code} ${bank.name}" is ${bank.type}.`);
+    const all = await this.listAccounts();
+    const byId = new Map(all.map((a) => [a.id, a]));
+    for (const l of input.lines) {
+      const a = byId.get(l.accountId);
+      if (!a) throw new Error(`Liability account ${l.accountId} does not exist in this organization.`);
+      if (a.type !== "liability") throw new Error(`"${a.code} ${a.name}" is not a liability account and cannot be remitted here.`);
+    }
+    const total = input.lines.reduce((s, l) => s + l.amountCents, 0);
+
+    return await db.transaction(async (tx) => {
+      const jeLines = input.lines.map((l) => ({ accountId: l.accountId, debit: l.amountCents, credit: 0, description: `Remit ${byId.get(l.accountId)!.name}` }));
+      jeLines.push({ accountId: bank.id, debit: 0, credit: total, description: "Payroll liability remittance" });
+      const je = await this.postJournalEntry({
+        date: input.payDate,
+        memo: input.memo || `Payroll liability remittance ${input.payDate}`,
+        reference: `PAYLIAB-${input.payDate}`,
+        source: "payroll_liability",
+        lines: jeLines,
+      }, { _tx: tx });
+      const payment = await tx.insert(payrollLiabilityPayments).values({
+        orgId, payDate: input.payDate, bankAccountId: input.bankAccountId, entryId: je.entry.id,
+        memo: input.memo ?? null, totalCents: total, createdAt: nowIso(),
+      }).returning().then((r: any[]) => r[0]);
+      for (const l of input.lines) {
+        await tx.insert(payrollLiabilityPaymentLines).values({ orgId, paymentId: payment.id, accountId: l.accountId, amountCents: l.amountCents });
+      }
+      await this.audit("pay", "payroll_liability", payment.id, `Remitted payroll liabilities (${formatMoney(total)}) from ${bank.name}`);
+      return payment;
     });
   }
 

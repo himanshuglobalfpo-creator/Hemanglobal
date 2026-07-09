@@ -21,6 +21,7 @@ import {
   createEmployeeSchema,
   updateEmployeeSchema,
   createPayrollRunSchema,
+  payPayrollLiabilitiesSchema,
   insertCustomerSchema,
   insertVendorSchema,
   postJournalEntrySchema,
@@ -686,6 +687,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   );
   app.post("/api/payroll/runs/:id/post", requireRole("owner", "admin", "accountant"), (req, res) =>
     handle(res, () => storage.postPayrollRun(parseId(req.params.id)))
+  );
+  app.get("/api/payroll/runs/:id/employees/:employeeId/stub", (req, res) =>
+    handle(res, () => storage.getPayStub(parseId(req.params.id), parseId(req.params.employeeId, "employeeId")))
+  );
+
+  // Pay payroll liabilities (remittance to tax agencies — QBO "Pay Taxes")
+  app.get("/api/payroll/liabilities", (req, res) =>
+    handle(res, () => storage.payrollLiabilityBalances(req.query.asOf as string | undefined))
+  );
+  app.post("/api/payroll/liabilities/pay", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => storage.payPayrollLiabilities(payPayrollLiabilitiesSchema.parse(req.body)))
   );
 
   app.get("/api/accounts", (_req, res) => handle(res, () => storage.listAccounts()));

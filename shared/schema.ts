@@ -816,6 +816,42 @@ export const createPayrollRunSchema = z.object({
 });
 export type CreatePayrollRunInput = z.infer<typeof createPayrollRunSchema>;
 
+// ---- Paying payroll liabilities (remittance to tax agencies, QBO "Pay Taxes") ----
+// Running payroll accrues Payroll Taxes Payable / Deductions Payable. Remitting
+// them posts Dr <liability account> / Cr Bank, closing the loop.
+export const payrollLiabilityPayments = pgTable("payroll_liability_payments", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(),
+  payDate: text("pay_date").notNull(),
+  bankAccountId: integer("bank_account_id").notNull(),
+  entryId: integer("entry_id"), // the remittance JE
+  memo: text("memo"),
+  totalCents: integer("total_cents").notNull().default(0),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type PayrollLiabilityPayment = typeof payrollLiabilityPayments.$inferSelect;
+
+export const payrollLiabilityPaymentLines = pgTable("payroll_liability_payment_lines", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(),
+  paymentId: integer("payment_id").notNull(),
+  accountId: integer("account_id").notNull(), // the payroll-liability account being remitted
+  amountCents: integer("amount_cents").notNull(),
+});
+export type PayrollLiabilityPaymentLine = typeof payrollLiabilityPaymentLines.$inferSelect;
+
+export const payPayrollLiabilitiesSchema = z.object({
+  payDate: isoDate,
+  bankAccountId: z.number().int().positive(),
+  memo: z.string().max(500).optional(),
+  lines: z.array(z.object({
+    accountId: z.number().int().positive(),
+    // INTEGER CENTS — the amount remitted for this liability account.
+    amountCents: z.number().int().positive("Remittance amount must be greater than zero"),
+  })).min(1, "Provide at least one liability to pay"),
+});
+export type PayPayrollLiabilitiesInput = z.infer<typeof payPayrollLiabilitiesSchema>;
+
 // ============================================================================
 // BILLS (purchases / accounts payable)
 // ============================================================================
