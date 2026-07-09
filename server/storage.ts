@@ -1,1221 +1,4487 @@
-/**
- * server/storage.ts — org-scoped storage methods.
- * GLOBAL RULES honored here:
- *  - every query filters by org_id;
- *  - multi-statement writes run inside db.transaction();
- *  - money is integer cents; the GL is 100% org base currency;
- *  - documents in a foreign currency store BOTH foreign cents and base cents
- *    converted at the document-date rate (per-line rounding, then summed).
- */
-import { z } from "zod";
-import { db } from "./db.js";
 import {
-  insertInvoiceSchema,
-  insertBillSchema,
-  paymentSchema,
-  insertCreditNoteSchema,
-} from "../shared/schema.js";
-import { convertCents } from "../shared/money.js";
+  accounts,
+  customers,
+  vendors,
+  journalEntries,
+  journalLines,
+  invoices,
+  invoiceLines,
+  bills,
+  billLines,
+  bankTransactions,
+  bankRules,
+  reconciliations,
+  reconciliationItems,
+  recurringTemplates,
+  taxCodes,
+  periodLocks,
+  auditLog,
+  invoiceShares,
+  orgNexusStates,
+  creditNotes,
+  debitNotes,
+  type OrgNexusState,
+  type NexusStateInput,
+} from "@shared/schema";
+import { organizations } from "@shared/auth-schema";
+import type {
+  Account,
+  InsertAccount,
+  Customer,
+  InsertCustomer,
+  Vendor,
+  InsertVendor,
+  JournalEntry,
+  JournalLine,
+  PostJournalEntry,
+  Invoice,
+  InvoiceLine,
+  CreateInvoiceInput,
+  Bill,
+  BillLine,
+  CreateBillInput,
+  PayInvoiceInput,
+  PayBillInput,
+  BankTransaction,
+  PostBankTransactionInput,
+  ImportBankTransactionsInput,
+  MatchBankTransactionInput,
+  BankRule,
+  BankRuleInput,
+  Reconciliation,
+  ReconciliationItem,
+  StartReconciliationInput,
+  RecurringTemplate,
+  CreateRecurringInput,
+  ReclassifyInput,
+  TaxCode,
+  TaxCodeInput,
+  PeriodLock,
+  ClosePeriodInput,
+  YearEndCloseInput,
+  AuditEntry,
+  InvoiceShare,
+  Paginated,
+} from "@shared/schema";
+import crypto from "node:crypto";
+import { toCents, formatMoney } from "@shared/money";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { currentOrgId, currentUserId, withOrg } from "./org-scope";
+import { encryptSecret, decryptSecret, isLegacyPlaintext, encryptionAvailable, assertEncryptionKey } from "./crypto-vault";
+import { logger } from "./logger";
+import { emitWebhookEvent } from "./webhooks";
+import { calculateSalesTax, taxjarConfigured, type CalculateSalesTaxResult } from "./taxjar";
+import { eq, sql, and, gt, gte, lte, desc, inArray } from "drizzle-orm";
+import pg from "pg";
+import fs from "node:fs";
+import path from "node:path";
 
-type InvoiceInput = z.infer<typeof insertInvoiceSchema>;
-type PaymentInput = z.infer<typeof paymentSchema>;
-type CreditNoteInput = z.infer<typeof insertCreditNoteSchema>;
+// ----------------------------------------------------------------------------
+// PostgreSQL connection — SINGLE shared pool for the entire app.
+// auth.ts and creditNoteService.ts import { db, pool } from here; nothing else
+// may open its own connection.
+// ----------------------------------------------------------------------------
+const { Pool, types } = pg;
 
-export class HttpError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-    public code?: string,
-  ) {
-    super(message);
+// PostgreSQL returns BIGINT (int8) and NUMERIC as strings by default (JS number
+// precision caveat). This ledger stores integer cents well inside 2^53, so we
+// parse both to Number globally — otherwise every SUM() in the report queries
+// would come back as a string and silently concatenate instead of add.
+types.setTypeParser(20, (v: string) => parseInt(v, 10));      // int8 / BIGINT (COUNT, SUM of int)
+types.setTypeParser(1700, (v: string) => parseFloat(v));      // NUMERIC
+
+// DATABASE_URL is required. Format: postgresql://user:pass@host:5432/dbname
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  throw new Error(
+    "DATABASE_URL is not set. Example: postgresql://user:pass@localhost:5432/ledgerlite"
+  );
+}
+
+export const pool = new Pool({
+  connectionString: DATABASE_URL,
+  min: Number(process.env.PG_POOL_MIN || 2),
+  max: Number(process.env.PG_POOL_MAX || 10),
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 10_000,
+});
+
+// Surface pool-level errors (e.g. backend restarts) instead of crashing silently.
+pool.on("error", (err) => {
+  console.error("[pg] idle client error:", err.message);
+});
+
+export const db = drizzle(pool);
+
+// ----------------------------------------------------------------------------
+// DB health check — used by GET /api/health.
+// ----------------------------------------------------------------------------
+export async function dbHealthCheck(): Promise<{ db: "ok" } | { db: "error"; message: string }> {
+  try {
+    await pool.query("SELECT 1");
+    return { db: "ok" };
+  } catch (err: any) {
+    return { db: "error", message: err?.message || "unknown error" };
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Rows                                                                */
-/* ------------------------------------------------------------------ */
+// ----------------------------------------------------------------------------
+// Migrations — ordered .sql files in migrations/pg/, tracked in
+// schema_migrations so each runs exactly once. Replaces the old SQLite
+// initSchema()/sqlite.exec() bootstrap.
+// ----------------------------------------------------------------------------
+const MIGRATIONS_DIR = path.resolve(process.cwd(), "migrations", "pg");
 
-export interface OrgRow {
-  id: number;
-  name: string;
-  base_currency: string;
-}
-export interface AccountRow {
-  id: number;
-  org_id: number;
-  code: string;
-  name: string;
-  type: string;
-  subtype: string;
-  is_active: number;
-}
-export interface InvoiceRow {
-  id: number;
-  org_id: number;
-  customer_id: number;
-  number: string;
-  date: string;
-  due_date: string;
-  status: string;
-  subtotal: number;
-  tax: number;
-  total: number;
-  amount_paid: number;
-  journal_entry_id: number | null;
-  currency: string;
-  fx_rate: number;
-  foreign_subtotal: number;
-  foreign_tax: number;
-  foreign_total: number;
-  foreign_amount_paid: number;
-}
-export type BillRow = Omit<InvoiceRow, "customer_id"> & { vendor_id: number };
+export async function runMigrations(): Promise<void> {
+  await pool.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+    name TEXT PRIMARY KEY,
+    applied_at TIMESTAMP NOT NULL DEFAULT now()
+  )`);
+  const { rows: appliedRows } = await pool.query("SELECT name FROM schema_migrations");
+  const applied = new Set(appliedRows.map((r: any) => r.name));
 
-/* ------------------------------------------------------------------ */
-/* Org + chart of accounts                                             */
-/* ------------------------------------------------------------------ */
+  const files = fs.existsSync(MIGRATIONS_DIR)
+    ? fs.readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith(".sql")).sort()
+    : [];
 
-const DEFAULT_ACCOUNTS: Array<[string, string, string, string]> = [
-  ["1000", "Bank", "asset", "bank"],
-  ["1100", "Accounts Receivable", "asset", "accounts_receivable"],
-  ["1500", "Fixed Assets", "asset", "fixed_asset"],
-  ["2000", "Accounts Payable", "liability", "accounts_payable"],
-  ["2100", "Sales Tax Payable", "liability", "current_liability"],
-  ["3000", "Opening Balance Equity", "equity", "equity"],
-  ["3900", "Retained Earnings", "equity", "equity"],
-  ["4000", "Sales", "income", "sales"],
-  ["5000", "Cost of Goods Sold", "expense", "cost_of_goods_sold"],
-  ["6000", "General Expense", "expense", "operating_expense"],
+  for (const file of files) {
+    if (applied.has(file)) continue;
+    const sqlText = fs.readFileSync(path.join(MIGRATIONS_DIR, file), "utf-8");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(sqlText);
+      await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
+      await client.query("COMMIT");
+      console.log(`[migration] applied ${file}`);
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw new Error(`Migration ${file} failed: ${(err as Error).message}`);
+    } finally {
+      client.release();
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Default Chart of Accounts (US-style for SMB)
+// ----------------------------------------------------------------------------
+const DEFAULT_COA: InsertAccount[] = [
+  // Assets (1000-1999)
+  { code: "1000", name: "Checking Account", type: "asset", subtype: "bank", isActive: true },
+  { code: "1010", name: "Savings Account", type: "asset", subtype: "bank", isActive: true },
+  { code: "1100", name: "Accounts Receivable", type: "asset", subtype: "current_asset", isActive: true },
+  { code: "1150", name: "Sales Tax Receivable", type: "asset", subtype: "current_asset", isActive: true },
+  { code: "1200", name: "Inventory", type: "asset", subtype: "current_asset", isActive: true },
+  { code: "1500", name: "Office Equipment", type: "asset", subtype: "fixed_asset", isActive: true },
+  // Liabilities (2000-2999)
+  { code: "2000", name: "Accounts Payable", type: "liability", subtype: "current_liability", isActive: true },
+  { code: "2100", name: "Sales Tax Payable", type: "liability", subtype: "current_liability", isActive: true },
+  { code: "2200", name: "Credit Card", type: "liability", subtype: "credit_card", isActive: true },
+  // Equity (3000-3999)
+  { code: "3000", name: "Owner's Equity", type: "equity", subtype: "equity", isActive: true },
+  { code: "3100", name: "Retained Earnings", type: "equity", subtype: "equity", isActive: true },
+  // Income (4000-4999)
+  { code: "4000", name: "Sales Revenue", type: "income", subtype: "operating_income", isActive: true },
+  { code: "4100", name: "Service Revenue", type: "income", subtype: "operating_income", isActive: true },
+  { code: "4900", name: "Other Income", type: "income", subtype: "other_income", isActive: true },
+  // Expenses (5000-5999)
+  { code: "5000", name: "Cost of Goods Sold", type: "expense", subtype: "cogs", isActive: true },
+  { code: "6000", name: "Rent Expense", type: "expense", subtype: "operating_expense", isActive: true },
+  { code: "6100", name: "Utilities", type: "expense", subtype: "operating_expense", isActive: true },
+  { code: "6200", name: "Office Supplies", type: "expense", subtype: "operating_expense", isActive: true },
+  { code: "6300", name: "Salaries & Wages", type: "expense", subtype: "operating_expense", isActive: true },
+  { code: "6400", name: "Marketing & Advertising", type: "expense", subtype: "operating_expense", isActive: true },
+  { code: "6500", name: "Software & Subscriptions", type: "expense", subtype: "operating_expense", isActive: true },
+  { code: "6600", name: "Professional Fees", type: "expense", subtype: "operating_expense", isActive: true },
+  { code: "6700", name: "Travel & Meals", type: "expense", subtype: "operating_expense", isActive: true },
+  { code: "6900", name: "Bank Fees", type: "expense", subtype: "operating_expense", isActive: true },
 ];
 
-/** TASK 1: idempotent FX account seeds — safe to call on every boot/org. */
-export function ensureFxAccounts(orgId: number): void {
-  const seed = db.prepare(
-    `INSERT INTO accounts (org_id, code, name, type, subtype)
-     SELECT ?, ?, ?, ?, ?
-     WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE org_id = ? AND code = ?)`,
-  );
-  seed.run(orgId, "4950", "FX Gain", "income", "other_income", orgId, "4950");
-  seed.run(orgId, "6950", "FX Loss", "expense", "other_expense", orgId, "6950");
+function nowIso(): string {
+  return new Date().toISOString().replace("T", " ").slice(0, 19);
 }
 
-export function seedChartOfAccounts(orgId: number): void {
-  const seed = db.prepare(
-    `INSERT INTO accounts (org_id, code, name, type, subtype)
-     SELECT ?, ?, ?, ?, ?
-     WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE org_id = ? AND code = ?)`,
-  );
-  for (const [code, name, type, subtype] of DEFAULT_ACCOUNTS) {
-    seed.run(orgId, code, name, type, subtype, orgId, code);
+// Seed the default chart of accounts for a specific org. Called at org creation
+// (signup and POST /api/orgs). Idempotent: skips if the org already has accounts.
+export async function seedOrgDefaults(orgId: number): Promise<void> {
+  const { rows } = await pool.query("SELECT COUNT(*)::int AS c FROM accounts WHERE org_id = $1", [orgId]);
+  if (rows[0].c > 0) return;
+  await db.transaction(async (tx) => {
+    for (const a of DEFAULT_COA) {
+      await tx.insert(accounts).values({ ...a, orgId });
+    }
+  });
+}
+
+// Legacy bootstrap: seed org 1 if the whole table is empty (first boot of a fresh DB).
+async function seedDefaultsIfEmpty(): Promise<void> {
+  const { rows } = await pool.query("SELECT COUNT(*)::int AS c FROM accounts");
+  if (rows[0].c === 0) await seedOrgDefaults(1);
+}
+
+// ----------------------------------------------------------------------------
+// initDatabase — the async bootstrap. index.ts MUST await this before
+// registering routes. Replaces the old import-time initSchema() side effect
+// (PostgreSQL connections are async; import-time DDL is impossible).
+// ----------------------------------------------------------------------------
+let initialized = false;
+// Connection-class error codes worth retrying at boot: the database container
+// may simply not be up yet (docker compose start ordering). SQL errors — a
+// broken migration — must FAIL FAST, not retry ten times into the same wall.
+const RETRYABLE_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "ETIMEDOUT", "ECONNRESET", "57P03" /* cannot_connect_now */]);
+function isConnectionError(err: any): boolean {
+  return RETRYABLE_CODES.has(err?.code) || RETRYABLE_CODES.has(err?.errors?.[0]?.code /* AggregateError from net */);
+}
+
+export async function initDatabase(): Promise<void> {
+  if (initialized) return;
+  // Encryption key contract (crypto-vault): production refuses to boot
+  // without a valid APP_ENCRYPTION_KEY — never silently store plaintext secrets.
+  assertEncryptionKey();
+  // Boot retry (Task: docker compose ordering). Delays 1s,2s,4s,8s,15s,15s...
+  // capped at 15s, max 10 attempts. Connection-class errors only.
+  const MAX_ATTEMPTS = 10;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      await runMigrations();
+      break;
+    } catch (err: any) {
+      if (!isConnectionError(err) || attempt === MAX_ATTEMPTS) throw err;
+      const delayS = Math.min(2 ** (attempt - 1), 15);
+      logger.warn(`[db] connection attempt ${attempt} failed: ${err.message}, retrying in ${delayS}s`);
+      await new Promise((r) => setTimeout(r, delayS * 1000));
+    }
   }
-  ensureFxAccounts(orgId);
+  await seedDefaultsIfEmpty();
+  initialized = true;
+  logger.info(`[db] PostgreSQL ready (pool min=${process.env.PG_POOL_MIN || 2} max=${process.env.PG_POOL_MAX || 10})`);
 }
 
-export function getOrg(orgId: number): OrgRow {
-  const org = db.prepare("SELECT id, name, base_currency FROM orgs WHERE id = ?").get(orgId) as OrgRow | undefined;
-  if (!org) throw new HttpError(404, "org not found");
-  return org;
+// Graceful shutdown — drain the pool.
+export async function closeDatabase(): Promise<void> {
+  await pool.end();
 }
 
-export function accountByCode(orgId: number, code: string): AccountRow {
-  const row = db.prepare("SELECT * FROM accounts WHERE org_id = ? AND code = ?").get(orgId, code) as
-    | AccountRow
-    | undefined;
-  if (!row) throw new HttpError(500, `system account ${code} missing for org ${orgId}`);
-  return row;
-}
-
-export function accountById(orgId: number, id: number): AccountRow | undefined {
-  return db.prepare("SELECT * FROM accounts WHERE org_id = ? AND id = ?").get(orgId, id) as AccountRow | undefined;
-}
-
-/* ------------------------------------------------------------------ */
-/* Audit                                                               */
-/* ------------------------------------------------------------------ */
-
-export function audit(
-  orgId: number,
-  userId: number | null,
-  action: string,
-  entityType: string,
-  entityId: number | null,
-  summary: string,
-): void {
-  db.prepare(
-    "INSERT INTO audit_log (org_id, user_id, action, entity_type, entity_id, summary) VALUES (?,?,?,?,?,?)",
-  ).run(orgId, userId, action, entityType, entityId, summary);
-}
-
-/* ------------------------------------------------------------------ */
-/* Closed-period guard                                                 */
-/* ------------------------------------------------------------------ */
-
-export function assertPeriodOpen(orgId: number, date: string): void {
-  const row = db
-    .prepare("SELECT MAX(through_date) AS through FROM closed_periods WHERE org_id = ?")
-    .get(orgId) as { through: string | null };
-  if (row.through && date <= row.through) {
-    throw new HttpError(409, `period closed through ${row.through}`, "PERIOD_CLOSED");
+// ----------------------------------------------------------------------------
+// Storage
+// ----------------------------------------------------------------------------
+export class DatabaseStorage {
+  // ============================================================================
+  // SPRINT C: AUDIT LOG
+  // ============================================================================
+  async audit(action: string, entityType: string, entityId: number | null, summary: string, metadata?: any) {
+    try {
+      await db.insert(auditLog)
+        .values({
+          orgId: currentOrgId(),
+          ts: nowIso(),
+          user: String(currentUserId() ?? "system"),
+          action,
+          entityType,
+          entityId: entityId ?? null,
+          summary,
+          metadata: metadata ? JSON.stringify(metadata) : null,
+        })
+        ;
+    } catch (e) {
+      // Audit must never break the operation
+      console.warn("audit log write failed:", e);
+    }
   }
-}
-
-/* ------------------------------------------------------------------ */
-/* Journal                                                             */
-/* ------------------------------------------------------------------ */
-
-export interface JournalLineInput {
-  accountId: number;
-  debit: number;
-  credit: number;
-}
-
-/** Inserts a balanced journal entry. Caller must already be inside a tx. */
-export function postJournalEntry(
-  orgId: number,
-  date: string,
-  memo: string,
-  source: string,
-  sourceId: number | null,
-  lines: JournalLineInput[],
-): number {
-  const clean = lines.filter((l) => l.debit !== 0 || l.credit !== 0);
-  const dr = clean.reduce((s, l) => s + l.debit, 0);
-  const cr = clean.reduce((s, l) => s + l.credit, 0);
-  if (dr !== cr) throw new HttpError(500, `unbalanced journal entry: DR ${dr} != CR ${cr}`);
-  if (clean.length === 0) throw new HttpError(400, "journal entry has no lines");
-  const entry = db
-    .prepare("INSERT INTO journal_entries (org_id, date, memo, source, source_id) VALUES (?,?,?,?,?)")
-    .run(orgId, date, memo, source, sourceId);
-  const entryId = Number(entry.lastInsertRowid);
-  const insLine = db.prepare(
-    "INSERT INTO journal_lines (org_id, entry_id, account_id, debit, credit) VALUES (?,?,?,?,?)",
-  );
-  for (const l of clean) insLine.run(orgId, entryId, l.accountId, l.debit, l.credit);
-  return entryId;
-}
-
-/* ------------------------------------------------------------------ */
-/* FX rates — TASK 1                                                   */
-/* ------------------------------------------------------------------ */
-
-export function upsertFxRate(orgId: number, date: string, fromCode: string, toCode: string, rate: number, source = "manual"): void {
-  db.prepare(
-    `INSERT INTO fx_rates (org_id, date, from_code, to_code, rate, source) VALUES (?,?,?,?,?,?)
-     ON CONFLICT(org_id, date, from_code, to_code) DO UPDATE SET rate = excluded.rate, source = excluded.source`,
-  ).run(orgId, date, fromCode, toCode, rate, source);
-}
-
-export function listFxRates(orgId: number, limit = 500): unknown[] {
-  return db
-    .prepare("SELECT date, from_code AS fromCode, to_code AS toCode, rate, source FROM fx_rates WHERE org_id = ? ORDER BY date DESC LIMIT ?")
-    .all(orgId, limit);
-}
-
-/** Latest stored rate on or before `date`, or undefined. */
-export function lookupFxRate(orgId: number, date: string, fromCode: string, toCode: string): number | undefined {
-  const row = db
-    .prepare(
-      `SELECT rate FROM fx_rates WHERE org_id = ? AND from_code = ? AND to_code = ? AND date <= ?
-       ORDER BY date DESC LIMIT 1`,
-    )
-    .get(orgId, fromCode, toCode, date) as { rate: number } | undefined;
-  return row?.rate;
-}
-
-/* ------------------------------------------------------------------ */
-/* Document currency resolution — TASK 1                               */
-/* ------------------------------------------------------------------ */
-
-interface ResolvedCurrency {
-  /** '' means "base currency document" (legacy-compatible sentinel) */
-  currency: string;
-  fxRate: number;
-  isForeign: boolean;
-}
-
-function resolveDocCurrency(orgId: number, input: { currency?: string; fxRate?: number; date: string }): ResolvedCurrency {
-  const base = getOrg(orgId).base_currency;
-  const cur = input.currency && input.currency !== base ? input.currency : "";
-  if (!cur) return { currency: "", fxRate: 1, isForeign: false };
-  // Rate is required for foreign documents: explicit beats stored table.
-  const rate = input.fxRate ?? lookupFxRate(orgId, input.date, cur, base);
-  if (!rate || !(rate > 0)) {
-    throw new HttpError(400, `fxRate required for ${cur} document (no stored rate on/before ${input.date})`, "FX_RATE_REQUIRED");
+  async listAuditLog(
+    opts: { limit?: number; offset?: number; entityType?: string; action?: string; from?: string; to?: string; userId?: string; entityId?: number; q?: string } = {}
+  ): Promise<Paginated<AuditEntry>> {
+    // Pagination contract: limit 1..200 (default 50), offset >= 0 (default 0).
+    const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+    const offset = Math.max(opts.offset ?? 0, 0);
+    const conditions: any[] = [eq(auditLog.orgId, currentOrgId())];
+    if (opts.entityType) conditions.push(eq(auditLog.entityType, opts.entityType));
+    if (opts.action) conditions.push(eq(auditLog.action, opts.action));
+    if (opts.from) conditions.push(gte(auditLog.ts, opts.from));
+    if (opts.to) conditions.push(lte(auditLog.ts, opts.to + " 23:59:59"));
+    if (opts.userId) conditions.push(eq(auditLog.user, opts.userId));
+    if (opts.entityId !== undefined) conditions.push(eq(auditLog.entityId, opts.entityId));
+    if (opts.q) {
+      // Free-text search on summary. % and _ are LIKE wildcards — escape them
+      // so a user searching for "50%" doesn't match everything.
+      const escaped = opts.q.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+      conditions.push(sql`${auditLog.summary} ILIKE ${"%" + escaped + "%"}`);
+    }
+    const where = and(...conditions);
+    // total MUST use the SAME WHERE clause as the page query.
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(auditLog).where(where);
+    const rows = await db.select().from(auditLog).where(where).orderBy(desc(auditLog.id)).limit(limit).offset(offset);
+    return { rows, total, limit, offset };
   }
-  return { currency: cur, fxRate: rate, isForeign: true };
-}
 
-/* ------------------------------------------------------------------ */
-/* Invoices — TASK 1 aware                                             */
-/* ------------------------------------------------------------------ */
-
-function nextDocNumber(orgId: number, table: "invoices" | "bills" | "credit_notes", prefix: string): string {
-  const row = db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE org_id = ?`).get(orgId) as { n: number };
-  let n = row.n + 1;
-  // Skip over collisions from imported/custom numbers.
-  for (;;) {
-    const candidate = `${prefix}-${String(n).padStart(5, "0")}`;
-    const exists = db.prepare(`SELECT 1 FROM ${table} WHERE org_id = ? AND number = ?`).get(orgId, candidate);
-    if (!exists) return candidate;
-    n++;
+  // ============================================================================
+  // SPRINT C: PERIOD LOCKS
+  // ============================================================================
+  async listPeriodLocks(): Promise<PeriodLock[]> {
+    return await db.select().from(periodLocks).where(eq(periodLocks.orgId, currentOrgId())).orderBy(desc(periodLocks.lockDate));
   }
-}
+  // Returns the most recent lockDate (the effective close cutoff). Postings with date <= this are blocked.
+  async effectiveLockDate(): Promise<string | null> {
+    const row = (await db
+      .select()
+      .from(periodLocks)
+      .where(eq(periodLocks.orgId, currentOrgId()))
+      .orderBy(desc(periodLocks.lockDate))
+      .limit(1)
+    )[0];
+    return row?.lockDate ?? null;
+  }
+  async isDateLocked(date: string): Promise<boolean> {
+    const lock = await this.effectiveLockDate();
+    return lock !== null && date <= lock;
+  }
+  async closePeriod(input: ClosePeriodInput): Promise<PeriodLock> {
+    // Sanity: must be after the previous lock date
+    const prev = await this.effectiveLockDate();
+    if (prev && input.lockDate <= prev) {
+      throw new Error(`A later period is already closed through ${prev}. Choose a date after that.`);
+    }
+    const row = await db
+      .insert(periodLocks)
+      .values({ orgId: currentOrgId(), lockDate: input.lockDate, reason: input.reason, isYearEnd: false, createdAt: nowIso() })
+      .returning().then((r) => r[0]);
+    await this.audit("close", "period", row.id, `Closed period through ${input.lockDate}`, { reason: input.reason });
+    await emitWebhookEvent("period.closed", { lockDate: input.lockDate, reason: input.reason ?? null });
+    return row;
+  }
+  async reopenPeriod(id: number): Promise<{ ok: true }> {
+    const lock = await db
+      .select()
+      .from(periodLocks)
+      .where(and(eq(periodLocks.id, id), eq(periodLocks.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!lock) throw new Error("Period lock not found");
 
-interface ComputedLine {
-  description: string;
-  quantity: number;
-  rate: number;
-  taxRate: number;
-  accountId: number;
-  foreignAmount: number; // document-currency cents (== base when not foreign)
-  foreignTax: number;
-  baseAmount: number; // base-currency cents at the document-date rate
-  baseTax: number;
-}
+    // Block reopening if a NEWER period lock exists — that would create inconsistency
+    // (reopening Q4 2024 when 2025 year-end has been closed leaves the 2025 closing
+    // entry built on assumptions about Q4 2024 that may no longer hold).
+    const newer = await db
+      .select()
+      .from(periodLocks)
+      .where(and(gt(periodLocks.lockDate, lock.lockDate), eq(periodLocks.orgId, currentOrgId())))
+      ;
+    if (newer.length > 0) {
+      throw new Error(
+        `Cannot reopen ${lock.lockDate}: ${newer.length} newer period lock(s) exist (latest: ${newer[newer.length - 1].lockDate}). Reopen newer periods first.`
+      );
+    }
 
-/**
- * Line math discipline (same as pre-FX code): round PER LINE, then sum.
- * For foreign documents each line's base cents = round(foreignCents * fxRate)
- * — rounded per line THEN summed, so totals always equal the sum of lines.
- */
-function computeLines(lines: InvoiceInput["lines"], fx: ResolvedCurrency): ComputedLine[] {
-  return lines.map((l) => {
-    const foreignAmount = Math.round(l.quantity * l.rate);
-    const foreignTax = Math.round((foreignAmount * (l.taxRate ?? 0)) / 100);
-    const baseAmount = fx.isForeign ? convertCents(foreignAmount, fx.fxRate) : foreignAmount;
-    const baseTax = fx.isForeign ? convertCents(foreignTax, fx.fxRate) : foreignTax;
+    if (lock.isYearEnd && lock.closingEntryId) {
+      // Delete the closing JE so books rebalance
+      await db.delete(journalLines).where(eq(journalLines.entryId, lock.closingEntryId));
+      await db.delete(journalEntries).where(eq(journalEntries.id, lock.closingEntryId));
+    }
+    await db.delete(periodLocks).where(eq(periodLocks.id, id));
+    await this.audit("reopen", "period", id, `Reopened period (was closed through ${lock.lockDate})`);
+    return { ok: true };
+  }
+  async yearEndClose(input: YearEndCloseInput): Promise<{ lock: PeriodLock; entry: JournalEntry; netIncome: number }> {
+    const fyEnd = input.fiscalYearEnd;
+    // Fiscal year start: use input.fiscalYearStart if provided, else compute the date
+    // exactly one year minus one day before fyEnd. Calendar-year fyStart=Jan 1 is the
+    // common case but customers with July or April year-ends need this flexibility.
+    const fyStart = (input as any).fiscalYearStart ?? (() => {
+      const d = new Date(fyEnd + "T00:00:00Z");
+      d.setUTCFullYear(d.getUTCFullYear() - 1);
+      d.setUTCDate(d.getUTCDate() + 1);
+      return d.toISOString().slice(0, 10);
+    })();
+
+    // Prevent double-close: a year-end lock for this fyEnd already exists
+    const existing = await db
+      .select()
+      .from(periodLocks)
+      .where(and(eq(periodLocks.lockDate, fyEnd), eq(periodLocks.isYearEnd, true), eq(periodLocks.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (existing) {
+      throw new Error(
+        `Year ending ${fyEnd} is already closed (lock #${existing.id}). Reopen it first if you need to re-run.`
+      );
+    }
+
+    const re = await db
+      .select()
+      .from(accounts)
+      .where(and(eq(accounts.code, "3100"), eq(accounts.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!re) throw new Error("Retained Earnings account (3100) is missing");
+
+    // Compute net income = income credits - income debits - (expense debits - expense credits)
+    const allAccounts = await this.listAccounts();
+    const lines: any[] = [];
+    let netIncome = 0;
+    for (const a of allAccounts) {
+      if (a.type !== "income" && a.type !== "expense") continue;
+      const sums = (await pool.query(`SELECT COALESCE(SUM(jl.debit),0) as dr, COALESCE(SUM(jl.credit),0) as cr
+           FROM journal_lines jl
+           JOIN journal_entries je ON je.id = jl.entry_id
+           WHERE jl.account_id = $1 AND je.date >= $2 AND je.date <= $3`, [a.id, fyStart, fyEnd])).rows[0] as { dr: number; cr: number };
+      const dr = sums.dr || 0;
+      const cr = sums.cr || 0;
+      if (a.type === "income") {
+        const bal = (cr - dr);
+        if (bal === 0) continue;
+        netIncome += bal;
+        if (bal > 0) {
+          lines.push({ accountId: a.id, debit: bal, credit: 0, description: `Year-end close: ${a.name}` });
+        } else {
+          lines.push({ accountId: a.id, debit: 0, credit: -bal, description: `Year-end close: ${a.name}` });
+        }
+      } else {
+        const bal = (dr - cr);
+        if (bal === 0) continue;
+        netIncome -= bal;
+        if (bal > 0) {
+          lines.push({ accountId: a.id, debit: 0, credit: bal, description: `Year-end close: ${a.name}` });
+        } else {
+          lines.push({ accountId: a.id, debit: -bal, credit: 0, description: `Year-end close: ${a.name}` });
+        }
+      }
+    }
+    netIncome = netIncome;
+    if (netIncome > 0) {
+      lines.push({ accountId: re.id, debit: 0, credit: netIncome, description: `Net income to Retained Earnings` });
+    } else if (netIncome < 0) {
+      lines.push({ accountId: re.id, debit: -netIncome, credit: 0, description: `Net loss from Retained Earnings` });
+    } else {
+      throw new Error("No income or expense activity to close for the year");
+    }
+
+    if (lines.length < 2) throw new Error("Nothing to close for this year");
+
+    // Post the closing entry with bypassLock=true since we're posting AT the close date
+    const { entry } = await this.postJournalEntry({
+      date: fyEnd,
+      memo: `Year-end close ${fyEnd.slice(0, 4)}`,
+      reference: `YE-${fyEnd.slice(0, 4)}`,
+      source: "manual",
+      lines,
+    }, { bypassLock: true });
+
+    const lock = await db
+      .insert(periodLocks)
+      .values({
+          orgId: currentOrgId(),
+        lockDate: fyEnd,
+        reason: `Year-end close ${fyEnd.slice(0, 4)} (net ${netIncome >= 0 ? "income" : "loss"} ${formatMoney(Math.abs(netIncome))})`,
+        isYearEnd: true,
+        closingEntryId: entry.id,
+        createdAt: nowIso(),
+      })
+      .returning().then((r) => r[0]);
+    await this.audit("yearEndClose", "period", lock.id, `Year-end close ${fyEnd}: net ${netIncome >= 0 ? "income" : "loss"} ${formatMoney(Math.abs(netIncome))}`, {
+      netIncome,
+      entryId: entry.id,
+    });
+    return { lock, entry, netIncome };
+  }
+
+  // ============================================================================
+  // SPRINT C: TAX CODES
+  // ============================================================================
+  async listTaxCodes(): Promise<TaxCode[]> {
+    return await db.select().from(taxCodes).where(eq(taxCodes.orgId, currentOrgId())).orderBy(taxCodes.name);
+  }
+  async getTaxCode(id: number): Promise<TaxCode | undefined> {
+    return await db.select().from(taxCodes).where(and(eq(taxCodes.id, id), eq(taxCodes.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+  async createTaxCode(data: TaxCodeInput): Promise<TaxCode> {
+    const liab = await db
+      .select()
+      .from(accounts)
+      .where(and(eq(accounts.id, data.liabilityAccountId), eq(accounts.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!liab) throw new Error("Liability account not found");
+    if (liab.type !== "liability") throw new Error("Tax code must point at a liability account");
+    const row = await db.insert(taxCodes).values({ ...data, orgId: currentOrgId(), createdAt: nowIso() }).returning().then((r) => r[0]);
+    await this.audit("create", "tax_code", row.id, `Created tax code ${row.name} ${row.rate}%`);
+    return row;
+  }
+  async updateTaxCode(id: number, data: Partial<TaxCodeInput>): Promise<TaxCode> {
+    const existing = await this.getTaxCode(id);
+    if (!existing) throw new Error("Tax code not found");
+    if (data.liabilityAccountId !== undefined) {
+      const liab = await this.getAccount(data.liabilityAccountId);
+      if (!liab) throw new Error("Liability account not found");
+      if (liab.type !== "liability") throw new Error("Tax code must point at a liability account");
+    }
+    const row = await db
+      .update(taxCodes)
+      .set(data)
+      .where(and(eq(taxCodes.id, id), eq(taxCodes.orgId, currentOrgId())))
+      .returning().then((r) => r[0]);
+    await this.audit("update", "tax_code", id, `Updated tax code ${row.name}`);
+    return row;
+  }
+  async deleteTaxCode(id: number) {
+    const existing = await this.getTaxCode(id);
+    if (!existing) throw new Error("Tax code not found");
+    await db.delete(taxCodes).where(and(eq(taxCodes.id, id), eq(taxCodes.orgId, currentOrgId())));
+    await this.audit("delete", "tax_code", id, `Deleted tax code ${id}`);
+  }
+  // ============================================================================
+  // SALES-TAX NEXUS (TaxJar integration)
+  // ============================================================================
+  async listNexusStates(): Promise<OrgNexusState[]> {
+    return db
+      .select()
+      .from(orgNexusStates)
+      .where(eq(orgNexusStates.orgId, currentOrgId()))
+      .orderBy(orgNexusStates.stateCode)
+      ;
+  }
+  async addNexusState(input: NexusStateInput): Promise<OrgNexusState> {
+    const code = input.stateCode.toUpperCase();
+    const existing = await db
+      .select()
+      .from(orgNexusStates)
+      .where(and(eq(orgNexusStates.orgId, currentOrgId()), eq(orgNexusStates.stateCode, code)))
+      .then((r: any[]) => r[0]);
+    if (existing) throw new Error(`Nexus for ${code} already exists`);
+    const row = await db
+      .insert(orgNexusStates)
+      .values({
+        orgId: currentOrgId(),
+        stateCode: code,
+        registrationNumber: input.registrationNumber ?? null,
+        effectiveDate: input.effectiveDate ?? null,
+        createdAt: nowIso(),
+      })
+      .returning().then((r) => r[0]);
+    await this.audit("create", "nexus_state", row.id, `Added sales-tax nexus: ${code}`);
+    return row;
+  }
+  async deleteNexusState(id: number) {
+    const existing = await db
+      .select()
+      .from(orgNexusStates)
+      .where(and(eq(orgNexusStates.id, id), eq(orgNexusStates.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!existing) throw new Error("Nexus state not found");
+    await db.delete(orgNexusStates)
+      .where(and(eq(orgNexusStates.id, id), eq(orgNexusStates.orgId, currentOrgId())))
+      ;
+    await this.audit("delete", "nexus_state", id, `Removed sales-tax nexus: ${existing.stateCode}`);
+  }
+
+  // Context needed for a TaxJar calculation on behalf of the active org:
+  // ship-from address + nexus list + a manual fallback rate (first tax code, or
+  // the explicitly requested one).
+  async taxCalculationContext(taxCodeId?: number): Promise<{
+    fromZip?: string; fromState?: string; fromCity?: string;
+    nexusStates: string[];
+    fallback?: { rate: number; label?: string };
+  }> {
+    const org = await db.select().from(organizations).where(eq(organizations.id, currentOrgId())).then((r: any[]) => r[0]);
+    const nexus = (await this.listNexusStates()).map((n) => n.stateCode);
+    let fallback: { rate: number; label?: string } | undefined;
+    if (taxCodeId) {
+      const code = await this.getTaxCode(taxCodeId);
+      if (code) fallback = { rate: code.rate, label: code.name };
+    } else {
+      const first = (await this.listTaxCodes()).find((c) => c.isActive);
+      if (first) fallback = { rate: first.rate, label: first.name };
+    }
     return {
-      description: l.description,
-      quantity: l.quantity,
-      rate: l.rate,
-      taxRate: l.taxRate ?? 0,
-      accountId: l.accountId,
-      foreignAmount,
-      foreignTax,
-      baseAmount,
-      baseTax,
+      fromZip: org?.addressZip ?? undefined,
+      fromState: org?.addressState ?? undefined,
+      fromCity: org?.addressCity ?? undefined,
+      nexusStates: nexus,
+      fallback,
     };
-  });
-}
-
-export function createInvoice(orgId: number, userId: number, raw: unknown): InvoiceRow {
-  const input = insertInvoiceSchema.parse(raw);
-  assertPeriodOpen(orgId, input.date);
-  const customer = db
-    .prepare("SELECT * FROM customers WHERE org_id = ? AND id = ?")
-    .get(orgId, input.customerId) as { id: number; name: string; currency: string | null; is_active: number } | undefined;
-  if (!customer) throw new HttpError(404, "customer not found");
-  if (!customer.is_active) throw new HttpError(409, "customer is deactivated — reactivate before invoicing", "PARTY_INACTIVE");
-
-  // Customer's currency is the default document currency when none is given.
-  const wanted = input.currency ?? customer.currency ?? undefined;
-  const fx = resolveDocCurrency(orgId, { currency: wanted, fxRate: input.fxRate, date: input.date });
-
-  for (const l of input.lines) {
-    const acct = accountById(orgId, l.accountId);
-    if (!acct) throw new HttpError(400, `line account ${l.accountId} not found in org`);
   }
 
-  const computed = computeLines(input.lines, fx);
-  const foreignSubtotal = computed.reduce((s, l) => s + l.foreignAmount, 0);
-  const foreignTax = computed.reduce((s, l) => s + l.foreignTax, 0);
-  const foreignTotal = foreignSubtotal + foreignTax;
-  const baseSubtotal = computed.reduce((s, l) => s + l.baseAmount, 0);
-  const baseTax = computed.reduce((s, l) => s + l.baseTax, 0);
-  const baseTotal = baseSubtotal + baseTax;
+  // Async wrapper around createInvoice(): computes tax via TaxJar FIRST (async),
+  // then runs the synchronous better-sqlite3 transaction with the result.
+  // Falls back to the plain manual path whenever automation can't apply — it
+  // NEVER throws because of TaxJar (rule: don't block invoice creation).
+  async createInvoiceWithAutoTax(input: CreateInvoiceInput): Promise<Invoice> {
+    const cust = await this.getCustomer(input.customerId);
+    const ctx = await this.taxCalculationContext(input.taxCodeId);
 
-  if (baseTotal <= 0) {
-    throw new HttpError(400, "invoice total must be greater than zero", "ZERO_DOCUMENT");
-  }
-  const ar = accountByCode(orgId, "1100");
-  const taxAcct = accountByCode(orgId, "2100");
-  const number = input.number ?? nextDocNumber(orgId, "invoices", "INV");
-  if (input.number && db.prepare("SELECT 1 FROM invoices WHERE org_id = ? AND number = ?").get(orgId, input.number)) {
-    throw new HttpError(409, `invoice number ${input.number} already exists`, "DUPLICATE_NUMBER");
+    const canAutoCalc =
+      taxjarConfigured() &&
+      !!cust?.shippingZip &&
+      !!cust?.shippingState &&
+      !!ctx.fromZip &&
+      !!ctx.fromState;
+
+    if (!canAutoCalc) {
+      if (taxjarConfigured() && cust && (!cust.shippingZip || !cust.shippingState)) {
+        console.warn(
+          `[taxjar] invoice ${input.number ?? "(auto)"}: customer "${cust.name}" has no shipping ZIP/state — using manual tax`
+        );
+      }
+      if (taxjarConfigured() && (!ctx.fromZip || !ctx.fromState)) {
+        console.warn(
+          `[taxjar] invoice ${input.number ?? "(auto)"}: organization has no ship-from address configured — using manual tax`
+        );
+      }
+      return await this.createInvoice(input);
+    }
+
+    // Same per-line rounding as createInvoice so the taxable base matches exactly.
+    // Per-line integer cents — identical formula to createInvoice, so the
+    // TaxJar base always matches what gets stored on the invoice.
+    const amountCents = input.lines
+      .map((l) => Math.round(l.quantity * l.rate * 100))
+      .reduce((a, b) => a + b, 0);
+
+    let calc: CalculateSalesTaxResult;
+    try {
+      calc = await calculateSalesTax({
+        fromZip: ctx.fromZip!,
+        fromState: ctx.fromState!,
+        fromCity: ctx.fromCity,
+        toZip: cust!.shippingZip!,
+        toState: cust!.shippingState!,
+        toCity: cust!.shippingCity ?? undefined,
+        amount: amountCents,
+        nexusStates: ctx.nexusStates,
+        fallback: ctx.fallback,
+      });
+    } catch (e: any) {
+      // calculateSalesTax only throws on invalid input (bad state code etc.) —
+      // API failures already fall back internally. Still: never block the invoice.
+      console.warn(`[taxjar] invoice ${input.number ?? "(auto)"}: calculation error (${e?.message}); using manual tax`);
+      return await this.createInvoice(input);
+    }
+
+    const breakdownJson = JSON.stringify({
+      source: calc.source,
+      taxRate: calc.taxRate,
+      taxAmountCents: calc.taxAmount,
+      breakdownCents: calc.breakdown,
+      warning: calc.warning,
+      raw: calc.raw ?? null, // verbatim TaxJar response for audit
+      calculatedAt: new Date().toISOString(),
+      toAddress: { zip: cust!.shippingZip, state: cust!.shippingState, city: cust!.shippingCity },
+    });
+
+    return await this.createInvoice(input, {
+      taxOverride: {
+        taxCents: calc.taxAmount, // already integer cents from calculateSalesTax
+        ratePercent: calc.taxRate,
+        breakdownJson,
+      },
+    });
   }
 
-  const run = db.transaction((): number => {
-    const res = db
-      .prepare(
-        `INSERT INTO invoices (org_id, customer_id, number, date, due_date, status, subtotal, tax, total, amount_paid,
-                               currency, fx_rate, foreign_subtotal, foreign_tax, foreign_total, foreign_amount_paid)
-         VALUES (?,?,?,?,?,'open',?,?,?,0,?,?,?,?,?,0)`,
+  async taxLiabilityReport(asOfDate?: string) {
+    const codes = await this.listTaxCodes();
+    const taxSums = async (accountId: number): Promise<{ cr: number; dr: number }> => {
+      const q = `SELECT COALESCE(SUM(jl.credit),0) as cr, COALESCE(SUM(jl.debit),0) as dr
+           FROM journal_lines jl
+           JOIN journal_entries je ON je.id = jl.entry_id
+           WHERE jl.account_id = $1 ${asOfDate ? "AND je.date <= $2" : ""}`;
+      const { rows } = await pool.query(q, asOfDate ? [accountId, asOfDate] : [accountId]);
+      return rows[0];
+    };
+    const result: Array<{ taxCodeId: number; name: string; rate: number; agency: string | null; collected: number }> = [];
+    for (const c of codes) {
+      const sums = await taxSums(c.liabilityAccountId);
+      const collected = (sums.cr - sums.dr); // credit-normal
+      result.push({
+        taxCodeId: c.id,
+        name: c.name,
+        rate: c.rate,
+        agency: c.agency,
+        collected,
+      });
+    }
+    // Reconcile to the GL: tax posted with an ad-hoc rate (no tax code) credits
+    // the default Sales Tax Payable account (2100) but belongs to no code — the
+    // report must still show it, or it silently understates what is owed.
+    const coveredAccountIds = new Set(codes.map((c) => c.liabilityAccountId));
+    const defaultTaxAcct = await db
+      .select()
+      .from(accounts)
+      .where(and(eq(accounts.code, "2100"), eq(accounts.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (defaultTaxAcct && !coveredAccountIds.has(defaultTaxAcct.id)) {
+      const sums = await taxSums(defaultTaxAcct.id);
+      const collected = (sums.cr - sums.dr);
+      if (collected !== 0) {
+        result.push({
+          taxCodeId: 0,
+          name: "Uncategorized sales tax (ad-hoc rates → 2100)",
+          rate: 0,
+          agency: null as any,
+          collected,
+        });
+      }
+    }
+    return { asOfDate: asOfDate ?? new Date().toISOString().slice(0, 10), rows: result };
+  }
+
+  // ============================================================================
+  // SPRINT C: GLOBAL SEARCH
+  // ============================================================================
+  async globalSearch(q: string, limit = 30) {
+    const term = `%${q.toLowerCase()}%`;
+    const out: Array<{
+      kind: string;
+      id: number;
+      title: string;
+      subtitle?: string;
+      amount?: number;
+      date?: string;
+      url: string;
+    }> = [];
+
+    if (q.trim().length < 1) return out;
+    const orgId = currentOrgId();
+
+    // Customers
+    const cust = (await pool.query(`SELECT id, name, email FROM customers WHERE org_id = $1 AND (LOWER(name) LIKE $2 OR LOWER(COALESCE(email,'')) LIKE $3) LIMIT $4`, [orgId, term, term, limit])).rows as any[];
+    for (const c of cust) out.push({ kind: "customer", id: c.id, title: c.name, subtitle: c.email || "Customer", url: `/customers` });
+
+    // Vendors
+    const ven = (await pool.query(`SELECT id, name, email FROM vendors WHERE org_id = $1 AND (LOWER(name) LIKE $2 OR LOWER(COALESCE(email,'')) LIKE $3) LIMIT $4`, [orgId, term, term, limit])).rows as any[];
+    for (const v of ven) out.push({ kind: "vendor", id: v.id, title: v.name, subtitle: v.email || "Vendor", url: `/vendors` });
+
+    // Accounts
+    const accs = (await pool.query(`SELECT id, code, name, type FROM accounts WHERE org_id = $1 AND (LOWER(name) LIKE $2 OR code LIKE $3) LIMIT $4`, [orgId, term, term, limit])).rows as any[];
+    for (const a of accs)
+      out.push({
+        kind: "account",
+        id: a.id,
+        title: `${a.code} · ${a.name}`,
+        subtitle: a.type,
+        url: `/accounts`,
+      });
+
+    // Invoices (by number, customer name, memo, amount)
+    const invs = (await pool.query(`SELECT i.id, i.number, i.date, i.total, i.status, c.name as customer
+         FROM invoices i JOIN customers c ON c.id = i.customer_id
+         WHERE i.org_id = $1 AND (LOWER(i.number) LIKE $2 OR LOWER(c.name) LIKE $3 OR LOWER(COALESCE(i.notes,'')) LIKE $4
+            OR CAST(i.total AS TEXT) LIKE $5)
+         ORDER BY i.date DESC LIMIT $6`, [orgId, term, term, term, term, limit])).rows as any[];
+    for (const i of invs)
+      out.push({
+        kind: "invoice",
+        id: i.id,
+        title: `${i.number} · ${i.customer}`,
+        subtitle: `${i.status.toUpperCase()} · ${i.date}`,
+        amount: i.total,
+        date: i.date,
+        url: `/invoices`,
+      });
+
+    // Bills
+    const bils = (await pool.query(`SELECT b.id, b.number, b.date, b.total, b.status, v.name as vendor
+         FROM bills b JOIN vendors v ON v.id = b.vendor_id
+         WHERE b.org_id = $1 AND (LOWER(b.number) LIKE $2 OR LOWER(v.name) LIKE $3 OR LOWER(COALESCE(b.notes,'')) LIKE $4
+            OR CAST(b.total AS TEXT) LIKE $5)
+         ORDER BY b.date DESC LIMIT $6`, [orgId, term, term, term, term, limit])).rows as any[];
+    for (const b of bils)
+      out.push({
+        kind: "bill",
+        id: b.id,
+        title: `${b.number} · ${b.vendor}`,
+        subtitle: `${b.status.toUpperCase()} · ${b.date}`,
+        amount: b.total,
+        date: b.date,
+        url: `/bills`,
+      });
+
+    // Journal entries
+    const jes = (await pool.query(`SELECT id, date, memo, reference FROM journal_entries
+         WHERE org_id = $1 AND (LOWER(COALESCE(memo,'')) LIKE $2 OR LOWER(COALESCE(reference,'')) LIKE $3)
+         ORDER BY date DESC, id DESC LIMIT $4`, [orgId, term, term, limit])).rows as any[];
+    for (const j of jes)
+      out.push({
+        kind: "journal",
+        id: j.id,
+        title: j.memo || `JE #${j.id}`,
+        subtitle: `Journal · ${j.date}${j.reference ? " · " + j.reference : ""}`,
+        date: j.date,
+        url: `/journal`,
+      });
+
+    // Bank transactions
+    const bts = (await pool.query(`SELECT id, date, description, amount, status FROM bank_transactions
+         WHERE org_id = $1 AND (LOWER(description) LIKE $2 OR CAST(amount AS TEXT) LIKE $3)
+         ORDER BY date DESC LIMIT $4`, [orgId, term, term, limit])).rows as any[];
+    for (const t of bts)
+      out.push({
+        kind: "bank",
+        id: t.id,
+        title: t.description,
+        subtitle: `${t.status.toUpperCase()} · ${t.date}`,
+        amount: t.amount,
+        date: t.date,
+        url: `/banking`,
+      });
+
+    return out.slice(0, limit * 2);
+  }
+
+  // ============================================================================
+  // SPRINT C: INVOICE SHARES
+  // ============================================================================
+  async listSharesForInvoice(invoiceId: number): Promise<InvoiceShare[]> {
+    return await db.select().from(invoiceShares).where(eq(invoiceShares.invoiceId, invoiceId)).orderBy(desc(invoiceShares.id));
+  }
+  // Default expiry: 90 days. Tokens are public-internet URLs, so an indefinite lifetime
+  // is a security smell. Callers can override with `expiresInDays`.
+  async createInvoiceShare(invoiceId: number, recipientEmail?: string, expiresInDays = 90): Promise<InvoiceShare> {
+    const inv = await db
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.id, invoiceId), eq(invoices.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!inv) throw new Error("Invoice not found");
+    if (expiresInDays < 1 || expiresInDays > 3650) {
+      throw new Error("expiresInDays must be between 1 and 3650");
+    }
+    const token = crypto.randomBytes(24).toString("base64url");
+    const exp = new Date();
+    exp.setUTCDate(exp.getUTCDate() + expiresInDays);
+    const row = await db
+      .insert(invoiceShares)
+      .values({
+          orgId: currentOrgId(),
+        invoiceId,
+        token,
+        recipientEmail: recipientEmail ?? null,
+        expiresAt: exp.toISOString(),
+        createdAt: nowIso(),
+      })
+      .returning().then((r) => r[0]);
+    await this.audit("share", "invoice", invoiceId, `Share token created (expires ${exp.toISOString().slice(0, 10)})`);
+    return row;
+  }
+
+  // Look up by token. Returns undefined if not found, expired, or revoked.
+  async getShareByToken(token: string): Promise<(InvoiceShare & { invoice?: any; customer?: any; lines?: any[] }) | undefined> {
+    const share = await db.select().from(invoiceShares).where(eq(invoiceShares.token, token)).then((r: any[]) => r[0]);
+    if (!share) return undefined;
+    if (share.revokedAt) return undefined;
+    if (share.expiresAt && new Date(share.expiresAt).getTime() < Date.now()) return undefined;
+    // Public share pages run outside any session — resolve the invoice inside
+    // the share row's own org context (the token itself is the authorization).
+    const inv = await withOrg({ orgId: share.orgId, userId: 0 }, () => this.getInvoice(share.invoiceId));
+    return { ...share, invoice: inv, customer: inv?.customer, lines: inv?.lines };
+  }
+
+  async revokeInvoiceShare(id: number): Promise<InvoiceShare> {
+    const share = await db
+      .select()
+      .from(invoiceShares)
+      .where(and(eq(invoiceShares.id, id), eq(invoiceShares.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!share) throw new Error("Share not found");
+    if (share.revokedAt) return share; // idempotent
+    const updated = await db
+      .update(invoiceShares)
+      .set({ revokedAt: nowIso() })
+      .where(eq(invoiceShares.id, id))
+      .returning().then((r) => r[0]);
+    await this.audit("revoke", "invoice_share", id, `Revoked share token for invoice ${share.invoiceId}`);
+    return updated;
+  }
+  async recordShareView(token: string) {
+    const share = await db.select().from(invoiceShares).where(eq(invoiceShares.token, token)).then((r: any[]) => r[0]);
+    if (!share) return;
+    await db.update(invoiceShares)
+      .set({
+        viewedAt: new Date().toISOString(),
+        viewCount: share.viewCount + 1,
+      })
+      .where(eq(invoiceShares.id, share.id))
+      ;
+  }
+  async markShareSent(id: number, status: "sent" | "failed", error?: string) {
+    await db.update(invoiceShares)
+      .set({
+        sentAt: new Date().toISOString(),
+        emailStatus: status,
+        emailError: error ?? null,
+      })
+      .where(eq(invoiceShares.id, id))
+      ;
+  }
+
+  // ---------- Accounts ----------
+  async listAccounts(): Promise<Account[]> {
+    return await db.select().from(accounts).where(eq(accounts.orgId, currentOrgId())).orderBy(accounts.code);
+  }
+  async getAccount(id: number): Promise<Account | undefined> {
+    return await db.select().from(accounts).where(and(eq(accounts.id, id), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+  async createAccount(data: InsertAccount): Promise<Account> {
+    // Code uniqueness is enforced at the DB level (UNIQUE index), but surface a nicer error.
+    const byCode = await db
+      .select()
+      .from(accounts)
+      .where(and(eq(accounts.code, data.code), eq(accounts.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (byCode) throw new Error(`An account with code "${data.code}" already exists ("${byCode.name}").`);
+    // Name uniqueness is a soft constraint — confusing duplicates harm UX. Block at the API.
+    const byName = await db
+      .select()
+      .from(accounts)
+      .where(and(eq(accounts.name, data.name), eq(accounts.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (byName) throw new Error(`An account named "${data.name}" already exists (code ${byName.code}).`);
+    return await db.insert(accounts).values({ ...data, orgId: currentOrgId() }).returning().then((r) => r[0]);
+  }
+  async updateAccount(id: number, data: Partial<InsertAccount>): Promise<Account | undefined> {
+    // Once an account has been used in journal entries, do NOT allow changing its
+    // type, code, or subtype — that would silently corrupt every report retroactively.
+    // (Subtype drives cash flow classification: e.g. flipping 'fixed_asset' → 'current_asset'
+    // moves the account from the Investing section to Operating without any audit trail.)
+    const existing = await this.getAccount(id);
+    if (!existing) return undefined;
+    const used = (await pool.query(`SELECT COUNT(*) AS c FROM journal_lines WHERE account_id = $1`, [id])).rows[0] as { c: number };
+    if (used.c > 0) {
+      if (data.type !== undefined && data.type !== existing.type) {
+        throw new Error(
+          `Cannot change type of "${existing.name}" — it has ${used.c} journal line(s). Create a new account and reclassify instead.`
+        );
+      }
+      if (data.code !== undefined && data.code !== existing.code) {
+        throw new Error(
+          `Cannot change code of "${existing.name}" — it has ${used.c} journal line(s). Code is referenced by tooling and reports.`
+        );
+      }
+      if (data.subtype !== undefined && data.subtype !== existing.subtype) {
+        throw new Error(
+          `Cannot change subtype of "${existing.name}" — it has ${used.c} journal line(s). Subtype affects cash-flow classification; use Reclassify to move lines to a new account instead.`
+        );
+      }
+    }
+    return db
+      .update(accounts)
+      .set(data)
+      .where(and(eq(accounts.id, id), eq(accounts.orgId, currentOrgId())))
+      .returning().then((r) => r[0]);
+  }
+
+  // ---------- Customers ----------
+  async listCustomers(limit = 50, offset = 0): Promise<Paginated<Customer>> {
+    const where = eq(customers.orgId, currentOrgId());
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(customers).where(where);
+    const rows = await db.select().from(customers).where(where).orderBy(customers.name).limit(limit).offset(offset);
+    return { rows, total, limit, offset };
+  }
+  async createCustomer(data: InsertCustomer): Promise<Customer> {
+    return await db.insert(customers).values({ ...data, orgId: currentOrgId() }).returning().then((r) => r[0]);
+  }
+  async getCustomer(id: number): Promise<Customer | undefined> {
+    return await db.select().from(customers).where(and(eq(customers.id, id), eq(customers.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+  async deleteCustomer(id: number) {
+    const existing = await this.getCustomer(id);
+    if (!existing) throw new Error("Customer not found");
+    // Block deletion if any invoices reference this customer — would orphan ledger history.
+    const refCount = (await pool.query(`SELECT COUNT(*) AS c FROM invoices WHERE customer_id = $1`, [id])).rows[0] as { c: number };
+    if (refCount.c > 0) {
+      throw new Error(
+        `Cannot delete: customer is referenced by ${refCount.c} invoice(s). Void/delete those first or mark the customer inactive instead.`
+      );
+    }
+    return await db.delete(customers).where(and(eq(customers.id, id), eq(customers.orgId, currentOrgId())));
+  }
+  async updateCustomer(id: number, data: Partial<InsertCustomer>): Promise<Customer | undefined> {
+    const existing = await this.getCustomer(id);
+    if (!existing) return undefined;
+    return db
+      .update(customers)
+      .set(data)
+      .where(and(eq(customers.id, id), eq(customers.orgId, currentOrgId())))
+      .returning().then((r) => r[0]);
+  }
+
+  // ---------- Vendors ----------
+  async listVendors(limit = 50, offset = 0): Promise<Paginated<Vendor>> {
+    const where = eq(vendors.orgId, currentOrgId());
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(vendors).where(where);
+    const rows = await db.select().from(vendors).where(where).orderBy(vendors.name).limit(limit).offset(offset);
+    return { rows, total, limit, offset };
+  }
+  async createVendor(data: InsertVendor): Promise<Vendor> {
+    return await db.insert(vendors).values({ ...data, orgId: currentOrgId() }).returning().then((r) => r[0]);
+  }
+  async getVendor(id: number): Promise<Vendor | undefined> {
+    return await db.select().from(vendors).where(and(eq(vendors.id, id), eq(vendors.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+  async deleteVendor(id: number) {
+    const existing = await this.getVendor(id);
+    if (!existing) throw new Error("Vendor not found");
+    const refCount = (await pool.query(`SELECT COUNT(*) AS c FROM bills WHERE vendor_id = $1`, [id])).rows[0] as { c: number };
+    if (refCount.c > 0) {
+      throw new Error(
+        `Cannot delete: vendor is referenced by ${refCount.c} bill(s). Void/delete those first or mark the vendor inactive instead.`
+      );
+    }
+    return await db.delete(vendors).where(and(eq(vendors.id, id), eq(vendors.orgId, currentOrgId())));
+  }
+  async updateVendor(id: number, data: Partial<InsertVendor>): Promise<Vendor | undefined> {
+    const existing = await this.getVendor(id);
+    if (!existing) return undefined;
+    return db
+      .update(vendors)
+      .set(data)
+      .where(and(eq(vendors.id, id), eq(vendors.orgId, currentOrgId())))
+      .returning().then((r) => r[0]);
+  }
+
+  // ---------- Journal Entries ----------
+  // Sprint C: opts.bypassLock allows the year-end close itself to post on the lock date.
+  // opts._tx: optional external drizzle transaction — pass when calling from within an
+  // existing db.transaction() so all writes land in ONE atomic unit (no nested savepoint).
+  async postJournalEntry(input: PostJournalEntry, opts: { bypassLock?: boolean; _tx?: any } = {}): Promise<{ entry: JournalEntry; lines: JournalLine[] }> {
+    // FIX #10: Compute lockDate FIRST — both the condition and the error message need it.
+    // The old code interpolated `this.effectiveLockDate()` (un-awaited) into the string,
+    // producing "[object Promise]" in the error message and never actually comparing correctly.
+    const lockDate = await this.effectiveLockDate();
+    if (!opts.bypassLock && lockDate !== null && input.date <= lockDate) {
+      throw new Error(
+        `Cannot post on ${input.date}: that period is closed (locked through ${lockDate}). Reopen it or pick a later date.`
+      );
+    }
+    // ---- Defense in depth: validate the entry is balanced and well-formed ----
+    // This guard runs for ALL internal callers (createInvoice, payInvoice, etc.),
+    // not only the /api/journal route's Zod schema. A bug in any caller that tries
+    // to post unbalanced lines will throw here BEFORE any DB write.
+    if (!Array.isArray(input.lines) || input.lines.length < 2) {
+      throw new Error("Journal entry must have at least 2 lines (one DR + one CR).");
+    }
+    let totalDr = 0;
+    let totalCr = 0;
+    for (const l of input.lines) {
+      const dr = +(l.debit || 0);
+      const cr = +(l.credit || 0);
+      if (dr < 0 || cr < 0) {
+        throw new Error("Journal line debit/credit cannot be negative.");
+      }
+      if (dr > 0 && cr > 0) {
+        throw new Error("A journal line cannot have both a debit and a credit.");
+      }
+      totalDr += dr;
+      totalCr += cr;
+    }
+    if (totalDr <= 0) {
+      throw new Error("Journal entry total must be greater than zero.");
+    }
+    if (totalDr !== totalCr) { // EXACT integer equality — cents never drift
+      throw new Error(
+        `Unbalanced journal entry: debits ${formatMoney(totalDr)} \u2260 credits ${formatMoney(totalCr)}.`
+      );
+    }
+
+    // FIX #15: All inserts inside the transaction callback must use `txOrDb`, not `db`.
+    // When _tx is supplied by a caller already inside a transaction, we skip the outer
+    // db.transaction() wrapper so all writes belong to the same transaction / connection.
+    const doInserts = async (txOrDb: typeof db | any): Promise<{ entry: JournalEntry; lines: JournalLine[] }> => {
+      const entry = await txOrDb
+        .insert(journalEntries)
+        .values({
+          orgId: currentOrgId(),
+          date: input.date,
+          memo: input.memo,
+          reference: input.reference,
+          source: input.source ?? "manual",
+          sourceId: input.sourceId,
+        })
+        .returning().then((r: any[]) => r[0]);
+      const insertedLines: JournalLine[] = [];
+      for (const l of input.lines) {
+        const line = await txOrDb
+          .insert(journalLines)
+          .values({
+            orgId: currentOrgId(),
+            entryId: entry.id,
+            accountId: l.accountId,
+            debit: l.debit || 0,
+            credit: l.credit || 0,
+            description: l.description,
+          })
+          .returning().then((r: any[]) => r[0]);
+        insertedLines.push(line);
+      }
+      return { entry, lines: insertedLines };
+    };
+
+    if (opts._tx) {
+      return doInserts(opts._tx);
+    }
+    return db.transaction(doInserts);
+  }
+
+  async listJournalEntries(
+    limit = 50,
+    offset = 0
+  ): Promise<Paginated<JournalEntry & { lines: (JournalLine & { account?: Account })[] }>> {
+    const where = eq(journalEntries.orgId, currentOrgId());
+    // total from the SAME WHERE clause as the page query.
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(journalEntries).where(where);
+    const entries = await db
+      .select()
+      .from(journalEntries)
+      .where(where)
+      .orderBy(desc(journalEntries.date), desc(journalEntries.id))
+      .limit(limit)
+      .offset(offset)
+      ;
+    // N+1 fix (Task 8a): ONE lines query for the whole page via inArray, grouped
+    // in JS by entryId — 3 queries total (entries, lines, accounts) regardless of
+    // page size, instead of 1 + N.
+    const entryIds = entries.map((e) => e.id);
+    const allLines = entryIds.length > 0
+      ? await db.select().from(journalLines).where(inArray(journalLines.entryId, entryIds))
+      : [];
+    const linesByEntry = new Map<number, JournalLine[]>();
+    for (const l of allLines) {
+      const bucket = linesByEntry.get(l.entryId);
+      if (bucket) bucket.push(l);
+      else linesByEntry.set(l.entryId, [l]);
+    }
+    const allAccounts = await this.listAccounts();
+    const acctMap = new Map(allAccounts.map((a) => [a.id, a]));
+    const rows = entries.map((e) => ({
+      ...e,
+      lines: (linesByEntry.get(e.id) ?? []).map((l) => ({ ...l, account: acctMap.get(l.accountId) })),
+    }));
+    return { rows, total, limit, offset };
+  }
+
+  async getJournalLinesForAccount(accountId: number, fromDate?: string, toDate?: string) {
+    // Org-scoped: accountId is caller-supplied and ids are a global sequence,
+    // so filtering on the joined entry's orgId is required (caught by the
+    // org-scope guard test — same class as the fixed generalLedger leak).
+    let q = await db
+      .select({
+        line: journalLines,
+        entry: journalEntries,
+      })
+      .from(journalLines)
+      .innerJoin(journalEntries, eq(journalLines.entryId, journalEntries.id))
+      .where(and(eq(journalLines.accountId, accountId), eq(journalEntries.orgId, currentOrgId())));
+    const rows = q;
+    return rows.filter((r) => {
+      if (fromDate && r.entry.date < fromDate) return false;
+      if (toDate && r.entry.date > toDate) return false;
+      return true;
+    });
+  }
+
+  // ---------- Invoices ----------
+  async createInvoice(
+    input: CreateInvoiceInput,
+    opts: { taxOverride?: { taxCents: number; ratePercent: number; breakdownJson: string } } = {}
+  ): Promise<Invoice> {
+    // Auto-numbering: when the caller omits `number`, allocate the next per-org
+    // value atomically. Manual override remains legal; duplicates are caught by
+    // UNIQUE(org_id, number) and translated to a friendly 400 below.
+    const invNumber: string = input.number ?? await this.nextNumber("invoice");
+    const ar = await db
+      .select()
+      .from(accounts)
+      .where(and(eq(accounts.code, "1100"), eq(accounts.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!ar) throw new Error("Accounts Receivable account (1100) missing");
+
+    let effectiveRate = input.taxRate;
+    let taxLiabAccountId: number | undefined;
+    if (input.taxCodeId) {
+      const code = await this.getTaxCode(input.taxCodeId);
+      if (!code) throw new Error("Tax code not found");
+      effectiveRate = code.rate;
+      taxLiabAccountId = code.liabilityAccountId;
+    } else {
+      const taxLiab = await db
+        .select()
+        .from(accounts)
+        .where(and(eq(accounts.code, "2100"), eq(accounts.orgId, currentOrgId())))
+        .then((r: any[]) => r[0]);
+      taxLiabAccountId = taxLiab?.id;
+    }
+
+    // ---- Bug fix: per-line rounding + tax computed from rounded subtotal ----
+    // Old code stored a raw (unrounded) subtotal, then computed tax from it, which produced
+    // 1-cent JE imbalances on inputs like quantity=3 × rate=33.333 because the per-line
+    // amounts (used for the income credit) were rounded but the subtotal-derived debit was not.
+    // Now: round every line, then sum, then compute tax — guaranteeing Dr A/R = Cr Income + Cr Tax exactly.
+    // Integer cents per line: rate is a dollar unit-price input; Math.round
+    // converts to exact cents once, here, and never again downstream.
+    // FX resolution: null for base-currency docs. For FX docs the line math
+    // below runs in FOREIGN cents; base cents = round(foreignCents * rate)
+    // PER LINE, then summed — the same per-line rounding discipline as the
+    // base-currency path, so the JE (posted in base) always balances exactly.
+    const fx = await this.resolveDocumentFx(input.currency, input.fxRate);
+
+    const lineAmountsRaw: number[] = input.lines.map((l) => Math.round(l.quantity * l.rate * 100));
+    let lineAmounts: number[];        // BASE cents per line (drives the GL + income split)
+    let foreignSubtotal = 0, foreignTax = 0, foreignTotal = 0;
+    let subtotal: number, tax: number, total: number;
+    if (fx) {
+      const foreignLines = lineAmountsRaw;              // rates were entered in the document currency
+      foreignSubtotal = foreignLines.reduce((s, a) => s + a, 0);
+      foreignTax = opts.taxOverride ? opts.taxOverride.taxCents : Math.round((foreignSubtotal * effectiveRate) / 100);
+      foreignTotal = foreignSubtotal + foreignTax;
+      lineAmounts = foreignLines.map((a) => Math.round(a * fx.fxRate)); // base cents per line
+      subtotal = lineAmounts.reduce((s, a) => s + a, 0);
+      tax = Math.round(foreignTax * fx.fxRate);
+      total = subtotal + tax;
+    } else {
+      lineAmounts = lineAmountsRaw;
+      subtotal = lineAmounts.reduce((s, a) => s + a, 0); // exact integer sum
+      // TaxJar path: the exact amount was computed (in cents) before entering the
+      // sync transaction; use it verbatim so the ledger matches the audit record.
+      tax = opts.taxOverride
+        ? opts.taxOverride.taxCents // TaxJar already computes exact cents
+        : Math.round((subtotal * effectiveRate) / 100); // integer cents
+      total = subtotal + tax; // exact integer cents
+    }
+
+    return await db.transaction(async (tx) => {
+      const inv = await tx
+        .insert(invoices)
+        .values({
+          orgId: currentOrgId(),
+          number: invNumber,
+          currency: fx?.currency ?? "",
+          fxRate: fx?.fxRate ?? 1,
+          foreignSubtotal,
+          foreignTax,
+          foreignTotal,
+          foreignAmountPaid: 0,
+          customerId: input.customerId,
+          date: input.date,
+          dueDate: input.dueDate,
+          status: "open",
+          subtotal,
+          tax,
+          total,
+          amountPaid: 0,
+          taxBreakdown: opts.taxOverride?.breakdownJson ?? null,
+          notes: input.notes,
+        })
+        .returning().then((r) => r[0]);
+      for (let idx = 0; idx < input.lines.length; idx++) {
+        const l = input.lines[idx];
+        await tx.insert(invoiceLines)
+          .values({
+            orgId: currentOrgId(),
+            invoiceId: inv.id,
+            description: l.description,
+            quantity: l.quantity,
+            rate: l.rate,
+            // FX docs: line detail lives in the DOCUMENT currency (qty × rate
+            // are foreign); the GL/base view lives on the header columns.
+            amount: fx ? lineAmountsRaw[idx] : lineAmounts[idx],
+            incomeAccountId: l.incomeAccountId,
+          });
+      }
+      // Post journal entry: Dr A/R, Cr each Income account, Cr Sales Tax Payable
+      const lines: any[] = [{ accountId: ar.id, debit: total, credit: 0, description: `Invoice ${invNumber}` }];
+      // Group by income account using the per-line rounded amounts
+      const incomeMap = new Map<number, number>();
+      input.lines.forEach((l, idx) => {
+        incomeMap.set(l.incomeAccountId, ((incomeMap.get(l.incomeAccountId) || 0) + lineAmounts[idx]));
+      });
+      for (const [acctId, amt] of incomeMap.entries()) {
+        lines.push({ accountId: acctId, debit: 0, credit: amt, description: `Invoice ${invNumber}` });
+      }
+      if (tax > 0 && taxLiabAccountId) {
+        lines.push({ accountId: taxLiabAccountId, debit: 0, credit: tax, description: `Sales tax on ${invNumber}` });
+      }
+      await this.postJournalEntry({
+        date: input.date,
+        memo: `Invoice ${invNumber}`,
+        reference: invNumber,
+        source: "invoice",
+        sourceId: inv.id,
+        lines,
+      }, { _tx: tx });
+      await this.audit("create", "invoice", inv.id, `Created invoice ${invNumber} (${formatMoney(total)})`);
+      return inv;
+    }).then(async (inv) => {
+      // Webhooks fire AFTER commit — a rolled-back invoice must never notify.
+      await emitWebhookEvent("invoice.created", { id: inv.id, number: inv.number, total: inv.total, currency: inv.currency || null });
+      return inv;
+    }).catch((err: any) => {
+      // Postgres unique-violation on UNIQUE(org_id, number) → clean business
+      // error instead of a raw 500. Drizzle may wrap the pg error, so check
+      // both err.code and err.cause.code. "already" maps to HTTP 400 via
+      // routes.ts USER_ERROR_PATTERNS.
+      if (err?.code === "23505" || err?.cause?.code === "23505") {
+        throw new Error(`Invoice number "${invNumber}" already exists in this organization.`);
+      }
+      throw err;
+    });
+  }
+
+  async listInvoices(limit = 50, offset = 0): Promise<Paginated<Invoice & { customerName?: string }>> {
+    const where = eq(invoices.orgId, currentOrgId());
+    // total from the SAME WHERE. The join is an INNER JOIN on customer_id — count
+    // through the same join so total always equals the number of listable rows.
+    const [{ total }] = await db
+      .select({ total: sql<number>`COUNT(*)::int` })
+      .from(invoices)
+      .innerJoin(customers, eq(invoices.customerId, customers.id))
+      .where(where);
+    const rows = await db
+      .select({ inv: invoices, customer: customers })
+      .from(invoices)
+      .innerJoin(customers, eq(invoices.customerId, customers.id))
+      .where(where)
+      .orderBy(desc(invoices.date), desc(invoices.id))
+      .limit(limit)
+      .offset(offset)
+      ;
+    return { rows: rows.map((r) => ({ ...r.inv, customerName: r.customer.name })), total, limit, offset };
+  }
+
+  async getInvoice(id: number): Promise<(Invoice & { lines: InvoiceLine[]; customer?: Customer }) | undefined> {
+    const inv = await db.select().from(invoices).where(and(eq(invoices.id, id), eq(invoices.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!inv) return undefined;
+    const lines = await db.select().from(invoiceLines).where(eq(invoiceLines.invoiceId, id));
+    const customer = await db.select().from(customers).where(and(eq(customers.id, inv.customerId), eq(customers.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    return { ...inv, lines, customer };
+  }
+
+  async payInvoice(input: PayInvoiceInput): Promise<Invoice> {
+    const ar = await db.select().from(accounts).where(and(eq(accounts.code, "1100"), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!ar) throw new Error("A/R account missing");
+    const inv = await db.select().from(invoices).where(and(eq(invoices.id, input.invoiceId), eq(invoices.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!inv) throw new Error("Invoice not found");
+    if (inv.status === "void") throw new Error(`Invoice ${inv.number} is voided.`);
+    if (await this.isDateLocked(input.date)) {
+      throw new Error(`Cannot record payment on ${input.date}: that period is closed.`);
+    }
+    // Validate the receiving account is a bank-type asset
+    const bankAcct = await db.select().from(accounts).where(and(eq(accounts.id, input.bankAccountId), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!bankAcct) throw new Error("Bank account not found");
+    if (bankAcct.type !== "asset" || bankAcct.subtype !== "bank") {
+      throw new Error(`Receiving account "${bankAcct.name}" must be a bank-subtype asset (got ${bankAcct.type}/${bankAcct.subtype || "no subtype"}).`);
+    }
+    // ------------------------------------------------------------------------
+    // FX vs base payment paths.
+    //
+    // BASE documents (inv.currency === ""): unchanged — Dr Bank / Cr A/R for
+    // the tendered base cents.
+    //
+    // FX documents: caller supplies foreignAmount (document currency) + the
+    // PAYMENT-date fxRate. Realized gain/loss = difference between what A/R
+    // carries the money at (DOCUMENT rate) and what the bank actually got
+    // (PAYMENT rate). WORKED EXAMPLE — €100 invoice booked @ 1.10:
+    //     A/R carries ................. $110.00  (foreignTotal 10000¢ × 1.10)
+    //   Customer pays €100 when the rate is 1.08:
+    //     Bank receives ............... $108.00  (10000¢ × 1.08)
+    //     A/R must be relieved IN FULL   $110.00  (the receivable is gone)
+    //     JE:  DR Bank 10800
+    //          DR FX Loss (6950) 200      ← plugs the difference
+    //              CR A/R 11000
+    //   If instead the rate had risen to 1.12:
+    //     JE:  DR Bank 11200
+    //              CR A/R 11000
+    //              CR FX Gain (4950) 200
+    // Partial payments relieve A/R proportionally at the DOCUMENT rate:
+    // relieved = round(foreignApplied × inv.fxRate).
+    // ------------------------------------------------------------------------
+    const isFxDoc = !!inv.currency;
+    let amountCents: number;          // base cents hitting the bank
+    let arRelievedCents: number;      // base cents credited to A/R
+    let foreignCents = 0;             // foreign cents applied to the document
+    let fxDiff = 0;                   // arRelieved - received; >0 = loss, <0 = gain
+
+    if (isFxDoc) {
+      if (!input.foreignAmount || !(input.foreignAmount > 0) || !input.fxRate || !(input.fxRate > 0)) {
+        throw new Error(`Invoice ${inv.number} is in ${inv.currency}: provide foreignAmount and the payment-date fxRate (both > 0).`);
+      }
+      foreignCents = toCents(input.foreignAmount);
+      const foreignRemaining = inv.foreignTotal - inv.foreignAmountPaid;
+      if (foreignCents > foreignRemaining) {
+        throw new Error(`Payment of ${formatMoney(foreignCents, inv.currency)} exceeds invoice balance of ${formatMoney(foreignRemaining, inv.currency)}.`);
+      }
+      amountCents = Math.round(foreignCents * input.fxRate);      // PAYMENT rate → bank
+      arRelievedCents = Math.round(foreignCents * inv.fxRate);    // DOCUMENT rate → A/R relief
+      fxDiff = arRelievedCents - amountCents;
+    } else {
+      // API input is user dollars — convert ONCE at the boundary; all math below
+      // is exact integer cents.
+      amountCents = toCents(input.amount);
+      // Prevent overpayment (exact integer comparison — no epsilon needed)
+      const remaining = inv.total - inv.amountPaid;
+      if (amountCents > remaining) {
+        throw new Error(`Payment of ${formatMoney(amountCents)} exceeds invoice balance of ${formatMoney(remaining)}.`);
+      }
+      arRelievedCents = amountCents;
+    }
+    const fxAccts = isFxDoc && fxDiff !== 0 ? await this.ensureFxAccounts() : null;
+
+    return await db.transaction(async (tx) => {
+      const newPaid = inv.amountPaid + arRelievedCents;           // base carrying amount relieved
+      const newForeignPaid = inv.foreignAmountPaid + foreignCents;
+      const newStatus = isFxDoc
+        ? (newForeignPaid >= inv.foreignTotal ? "paid" : "open")  // FX docs settle in the document currency
+        : (newPaid >= inv.total ? "paid" : "open");
+      const updated = await tx
+        .update(invoices)
+        .set({ amountPaid: newPaid, status: newStatus, foreignAmountPaid: newForeignPaid })
+        .where(eq(invoices.id, inv.id))
+        .returning().then((r) => r[0]);
+      // DR Bank (payment rate), DR FX Loss / CR FX Gain (plug), CR A/R (document rate)
+      const jeLines: Array<{ accountId: number; debit: number; credit: number; description?: string }> = [
+        { accountId: input.bankAccountId, debit: amountCents, credit: 0 },
+      ];
+      if (fxAccts && fxDiff > 0) jeLines.push({ accountId: fxAccts.loss.id, debit: fxDiff, credit: 0, description: `Realized FX loss on ${inv.number}` });
+      if (fxAccts && fxDiff < 0) jeLines.push({ accountId: fxAccts.gain.id, debit: 0, credit: -fxDiff, description: `Realized FX gain on ${inv.number}` });
+      jeLines.push({ accountId: ar.id, debit: 0, credit: arRelievedCents });
+      await this.postJournalEntry({
+        date: input.date,
+        memo: input.memo || `Payment for ${inv.number}`,
+        reference: inv.number,
+        source: "payment",
+        sourceId: inv.id,
+        lines: jeLines,
+      }, { _tx: tx });
+      await this.audit("pay", "invoice", inv.id,
+        isFxDoc
+          ? `Payment ${formatMoney(foreignCents, inv.currency)} @ ${input.fxRate} (${formatMoney(amountCents)}) on invoice ${inv.number}${fxDiff !== 0 ? `; FX ${fxDiff > 0 ? "loss" : "gain"} ${formatMoney(Math.abs(fxDiff))}` : ""}`
+          : `Payment ${formatMoney(amountCents)} on invoice ${inv.number}`);
+      return updated;
+    }).then(async (updated) => {
+      await emitWebhookEvent("invoice.paid", { id: updated.id, number: updated.number, amountPaid: updated.amountPaid, status: updated.status });
+      return updated;
+    });
+  }
+
+  async voidInvoice(id: number, voidDate?: string): Promise<Invoice | undefined> {
+    // Bug-fix (Bug #7 — Voiding/Reversal): a void must POST A BALANCED REVERSAL
+    // journal entry, not just flip a status flag. The original entry is
+    // preserved (immutable audit trail) and an offsetting entry brings A/R,
+    // revenue, and any tax-payable balance back to zero.
+    const inv = await db.select().from(invoices).where(and(eq(invoices.id, id), eq(invoices.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!inv) return undefined;
+    if (inv.status === "void") return inv; // idempotent
+    if ((inv.amountPaid || 0) > 0) {
+      throw new Error(
+        `Cannot void ${inv.number}: ${formatMoney(inv.amountPaid)} has been paid. Refund/unapply payments first.`
+      );
+    }
+
+    const today = voidDate || new Date().toISOString().slice(0, 10);
+    if (await this.isDateLocked(today)) {
+      throw new Error(`Cannot void on ${today}: that period is closed.`);
+    }
+
+    return await db.transaction(async (tx) => {
+      // Find the original "invoice" journal entry for this invoice
+      const original = await tx
+        .select()
+        .from(journalEntries)
+        .where(
+          and(
+            eq(journalEntries.source, "invoice"),
+            eq(journalEntries.sourceId, inv.id),
+            // Defense-in-depth: inv is already org-scoped; the explicit filter
+            // guarantees source+sourceId can never resolve across tenants.
+            eq(journalEntries.orgId, currentOrgId())
+          )
+        )
+        .then((r: any[]) => r[0]);
+
+      if (original) {
+        const origLines = await tx
+          .select()
+          .from(journalLines)
+          .where(eq(journalLines.entryId, original.id))
+          ;
+
+        // Flip DR↔CR on every line to produce a balanced reversal
+        const reversalLines = origLines.map((l) => ({
+          accountId: l.accountId,
+          debit: l.credit || 0,
+          credit: l.debit || 0,
+          description: `Reversal of ${inv.number}`,
+        }));
+
+        if (reversalLines.length >= 2) {
+          await this.postJournalEntry({
+            date: today,
+            memo: `Void invoice ${inv.number}`,
+            reference: `VOID-${inv.number}`,
+            source: "invoice_void",
+            sourceId: inv.id,
+            lines: reversalLines,
+          }, { _tx: tx });
+        }
+      }
+
+      const row = await tx
+        .update(invoices)
+        .set({ status: "void" })
+        .where(eq(invoices.id, id))
+        .returning().then((r) => r[0]);
+      await this.audit("void", "invoice", id, `Voided invoice ${row.number} (reversal posted)`);
+      return row;
+    }).then(async (row) => {
+      await emitWebhookEvent("invoice.voided", { id: row.id, number: row.number });
+      return row;
+    });
+  }
+
+  // ---------- Bills ----------
+  async createBill(input: CreateBillInput): Promise<Bill> {
+    // Auto-numbering: same contract as createInvoice (see comment there).
+    const billNumber: string = input.number ?? await this.nextNumber("bill");
+    const ap = await db.select().from(accounts).where(and(eq(accounts.code, "2000"), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!ap) throw new Error("Accounts Payable account (2000) missing");
+
+    // Resolve tax rate and a dedicated tax account.
+    // For purchases we use Sales Tax Receivable (asset, code 1150) when available
+    // — this represents recoverable VAT/GST. If 1150 is missing (older datasets),
+    // we fall back to expensing the tax to the first expense account on the bill.
+    let effectiveRate = input.taxRate;
+    if (input.taxCodeId) {
+      const code = await this.getTaxCode(input.taxCodeId);
+      if (!code) throw new Error("Tax code not found");
+      effectiveRate = code.rate;
+    }
+    const taxAsset = await db.select().from(accounts).where(and(eq(accounts.code, "1150"), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+
+    // Per-line rounding then sum (same fix as createInvoice — guarantees JE balances).
+    // Integer cents per line: rate is a dollar unit-price input; Math.round
+    // converts to exact cents once, here, and never again downstream.
+    // FX: same per-line rounding discipline as createInvoice — see the worked
+    // comment there. Foreign cents from line math; base = round(line * rate).
+    const fx = await this.resolveDocumentFx(input.currency, input.fxRate);
+    const lineAmountsRaw: number[] = input.lines.map((l) => Math.round(l.quantity * l.rate * 100));
+    let lineAmounts: number[];
+    let foreignSubtotal = 0, foreignTax = 0, foreignTotal = 0;
+    let subtotal: number, tax: number, total: number;
+    if (fx) {
+      foreignSubtotal = lineAmountsRaw.reduce((s, a) => s + a, 0);
+      foreignTax = Math.round((foreignSubtotal * effectiveRate) / 100);
+      foreignTotal = foreignSubtotal + foreignTax;
+      lineAmounts = lineAmountsRaw.map((a) => Math.round(a * fx.fxRate));
+      subtotal = lineAmounts.reduce((s, a) => s + a, 0);
+      tax = Math.round(foreignTax * fx.fxRate);
+      total = subtotal + tax;
+    } else {
+      lineAmounts = lineAmountsRaw;
+      subtotal = lineAmounts.reduce((s, a) => s + a, 0); // exact integer sum
+      tax = Math.round((subtotal * effectiveRate) / 100); // integer cents
+      total = subtotal + tax; // exact integer cents
+    }
+
+    return await db.transaction(async (tx) => {
+      const b = await tx
+        .insert(bills)
+        .values({
+          orgId: currentOrgId(),
+          number: billNumber,
+          currency: fx?.currency ?? "",
+          fxRate: fx?.fxRate ?? 1,
+          foreignSubtotal,
+          foreignTax,
+          foreignTotal,
+          foreignAmountPaid: 0,
+          vendorId: input.vendorId,
+          date: input.date,
+          dueDate: input.dueDate,
+          status: "open",
+          subtotal,
+          tax,
+          total,
+          amountPaid: 0,
+          notes: input.notes,
+        })
+        .returning().then((r) => r[0]);
+      for (let idx = 0; idx < input.lines.length; idx++) {
+        const l = input.lines[idx];
+        await tx.insert(billLines)
+          .values({
+            orgId: currentOrgId(),
+            billId: b.id,
+            description: l.description,
+            quantity: l.quantity,
+            rate: l.rate,
+            amount: fx ? lineAmountsRaw[idx] : lineAmounts[idx], // document-currency detail for FX
+            expenseAccountId: l.expenseAccountId,
+          });
+      }
+      // Dr each Expense (rounded line amounts), Dr Sales Tax Receivable (or first expense acct as fallback), Cr A/P
+      const lines: any[] = [];
+      const expMap = new Map<number, number>();
+      input.lines.forEach((l, idx) => {
+        expMap.set(l.expenseAccountId, ((expMap.get(l.expenseAccountId) || 0) + lineAmounts[idx]));
+      });
+      for (const [acctId, amt] of expMap.entries()) {
+        lines.push({ accountId: acctId, debit: amt, credit: 0, description: `Bill ${billNumber}` });
+      }
+      if (tax > 0) {
+        const taxAcctId = taxAsset?.id ?? [...expMap.keys()][0];
+        const taxLabel = taxAsset ? "Sales tax receivable" : "Sales tax (expensed — no 1150 account)";
+        lines.push({ accountId: taxAcctId, debit: tax, credit: 0, description: `${taxLabel} on ${billNumber}` });
+      }
+      lines.push({ accountId: ap.id, debit: 0, credit: total, description: `Bill ${billNumber}` });
+      await this.postJournalEntry({
+        date: input.date,
+        memo: `Bill ${billNumber}`,
+        reference: billNumber,
+        source: "bill",
+        sourceId: b.id,
+        lines,
+      }, { _tx: tx });
+      await this.audit("create", "bill", b.id, `Created bill ${billNumber} (${formatMoney(total)})`);
+      return b;
+    }).then(async (b) => {
+      await emitWebhookEvent("bill.created", { id: b.id, number: b.number, total: b.total, currency: b.currency || null });
+      return b;
+    }).catch((err: any) => {
+      // Postgres unique-violation on UNIQUE(org_id, number) → clean business
+      // error instead of a raw 500 (drizzle may wrap the pg error).
+      if (err?.code === "23505" || err?.cause?.code === "23505") {
+        throw new Error(`Bill number "${billNumber}" already exists in this organization.`);
+      }
+      throw err;
+    });
+  }
+
+  async listBills(limit = 50, offset = 0): Promise<Paginated<Bill & { vendorName?: string }>> {
+    const where = eq(bills.orgId, currentOrgId());
+    const [{ total }] = await db
+      .select({ total: sql<number>`COUNT(*)::int` })
+      .from(bills)
+      .innerJoin(vendors, eq(bills.vendorId, vendors.id))
+      .where(where);
+    const rows = await db
+      .select({ bill: bills, vendor: vendors })
+      .from(bills)
+      .innerJoin(vendors, eq(bills.vendorId, vendors.id))
+      .where(where)
+      .orderBy(desc(bills.date), desc(bills.id))
+      .limit(limit)
+      .offset(offset)
+      ;
+    return { rows: rows.map((r) => ({ ...r.bill, vendorName: r.vendor.name })), total, limit, offset };
+  }
+
+  async getBill(id: number): Promise<(Bill & { lines: BillLine[]; vendor?: Vendor }) | undefined> {
+    const b = await db.select().from(bills).where(and(eq(bills.id, id), eq(bills.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!b) return undefined;
+    const lines = await db.select().from(billLines).where(eq(billLines.billId, id));
+    const vendor = await db.select().from(vendors).where(and(eq(vendors.id, b.vendorId), eq(vendors.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    return { ...b, lines, vendor };
+  }
+
+  async payBill(input: PayBillInput): Promise<Bill> {
+    const ap = await db.select().from(accounts).where(and(eq(accounts.code, "2000"), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!ap) throw new Error("A/P account missing");
+    const bill = await db.select().from(bills).where(and(eq(bills.id, input.billId), eq(bills.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!bill) throw new Error("Bill not found");
+    if (bill.status === "void") throw new Error(`Bill ${bill.number} is voided.`);
+    if (await this.isDateLocked(input.date)) {
+      throw new Error(`Cannot record payment on ${input.date}: that period is closed.`);
+    }
+    // Validate paying account is a bank- or credit-card-subtype asset/liability
+    const payAcct = await db.select().from(accounts).where(and(eq(accounts.id, input.bankAccountId), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!payAcct) throw new Error("Paying account not found");
+    const isBank = payAcct.type === "asset" && payAcct.subtype === "bank";
+    const isCard = payAcct.type === "liability" && payAcct.subtype === "credit_card";
+    if (!isBank && !isCard) {
+      throw new Error(`Paying account "${payAcct.name}" must be a bank-subtype asset or credit-card liability.`);
+    }
+    // ------------------------------------------------------------------------
+    // FX vs base payment — MIRROR of payInvoice, signs flipped for payables.
+    // WORKED EXAMPLE — €100 bill booked @ 1.10 → A/P carries $110.00.
+    //   We pay €100 when the rate is 1.08 → bank pays out only $108.00:
+    //     JE:  DR A/P 11000                (liability relieved at DOCUMENT rate)
+    //              CR Bank 10800           (cash out at PAYMENT rate)
+    //              CR FX Gain (4950) 200   (we settled a $110 debt with $108)
+    //   Rate 1.12 instead → bank pays $112.00:
+    //     JE:  DR A/P 11000
+    //          DR FX Loss (6950) 200
+    //              CR Bank 11200
+    // ------------------------------------------------------------------------
+    const isFxDoc = !!bill.currency;
+    let amountCents: number;       // base cents leaving the bank
+    let apRelievedCents: number;   // base cents debited to A/P
+    let foreignCents = 0;
+    let fxDiff = 0;                // apRelieved - paid; >0 = gain, <0 = loss (payable side)
+
+    if (isFxDoc) {
+      if (!input.foreignAmount || !(input.foreignAmount > 0) || !input.fxRate || !(input.fxRate > 0)) {
+        throw new Error(`Bill ${bill.number} is in ${bill.currency}: provide foreignAmount and the payment-date fxRate (both > 0).`);
+      }
+      foreignCents = toCents(input.foreignAmount);
+      const foreignRemaining = bill.foreignTotal - bill.foreignAmountPaid;
+      if (foreignCents > foreignRemaining) {
+        throw new Error(`Payment of ${formatMoney(foreignCents, bill.currency)} exceeds bill balance of ${formatMoney(foreignRemaining, bill.currency)}.`);
+      }
+      amountCents = Math.round(foreignCents * input.fxRate);
+      apRelievedCents = Math.round(foreignCents * bill.fxRate);
+      fxDiff = apRelievedCents - amountCents;
+    } else {
+      // API input is user dollars — convert ONCE at the boundary.
+      amountCents = toCents(input.amount);
+      const remaining = bill.total - bill.amountPaid;
+      if (amountCents > remaining) {
+        throw new Error(`Payment of ${formatMoney(amountCents)} exceeds bill balance of ${formatMoney(remaining)}.`);
+      }
+      apRelievedCents = amountCents;
+    }
+    const fxAccts = isFxDoc && fxDiff !== 0 ? await this.ensureFxAccounts() : null;
+
+    return await db.transaction(async (tx) => {
+      const newPaid = bill.amountPaid + apRelievedCents;
+      const newForeignPaid = bill.foreignAmountPaid + foreignCents;
+      const newStatus = isFxDoc
+        ? (newForeignPaid >= bill.foreignTotal ? "paid" : "open")
+        : (newPaid >= bill.total ? "paid" : "open");
+      const updated = await tx
+        .update(bills)
+        .set({ amountPaid: newPaid, status: newStatus, foreignAmountPaid: newForeignPaid })
+        .where(eq(bills.id, bill.id))
+        .returning().then((r) => r[0]);
+      // DR A/P (document rate), CR Bank (payment rate), plug to FX Gain/Loss.
+      // (Cr Bank also covers credit-card liability — credit still increases it.)
+      const jeLines: Array<{ accountId: number; debit: number; credit: number; description?: string }> = [
+        { accountId: ap.id, debit: apRelievedCents, credit: 0 },
+      ];
+      if (fxAccts && fxDiff < 0) jeLines.push({ accountId: fxAccts.loss.id, debit: -fxDiff, credit: 0, description: `Realized FX loss on ${bill.number}` });
+      jeLines.push({ accountId: input.bankAccountId, debit: 0, credit: amountCents });
+      if (fxAccts && fxDiff > 0) jeLines.push({ accountId: fxAccts.gain.id, debit: 0, credit: fxDiff, description: `Realized FX gain on ${bill.number}` });
+      await this.postJournalEntry({
+        date: input.date,
+        memo: input.memo || `Payment for ${bill.number}`,
+        reference: bill.number,
+        source: "payment",
+        sourceId: bill.id,
+        lines: jeLines,
+      }, { _tx: tx });
+      await this.audit("pay", "bill", bill.id,
+        isFxDoc
+          ? `Payment ${formatMoney(foreignCents, bill.currency)} @ ${input.fxRate} (${formatMoney(amountCents)}) on bill ${bill.number}${fxDiff !== 0 ? `; FX ${fxDiff > 0 ? "gain" : "loss"} ${formatMoney(Math.abs(fxDiff))}` : ""}`
+          : `Payment ${formatMoney(amountCents)} on bill ${bill.number}`);
+      return updated;
+    }).then(async (updated) => {
+      await emitWebhookEvent("bill.paid", { id: updated.id, number: updated.number, amountPaid: updated.amountPaid, status: updated.status });
+      return updated;
+    });
+  }
+
+  async voidBill(id: number, voidDate?: string): Promise<Bill | undefined> {
+    // Mirror of voidInvoice: post a balanced reversal JE and flag the bill void.
+    // Original JE is preserved for audit trail.
+    const bill = await db.select().from(bills).where(and(eq(bills.id, id), eq(bills.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!bill) return undefined;
+    if (bill.status === "void") return bill; // idempotent
+    if ((bill.amountPaid || 0) > 0) {
+      throw new Error(
+        `Cannot void ${bill.number}: ${formatMoney(bill.amountPaid)} has been paid. Reverse the payment first.`
+      );
+    }
+
+    const today = voidDate || new Date().toISOString().slice(0, 10);
+    if (await this.isDateLocked(today)) {
+      throw new Error(`Cannot void on ${today}: that period is closed.`);
+    }
+
+    return await db.transaction(async (tx) => {
+      const original = await tx
+        .select()
+        .from(journalEntries)
+        // orgId is defense-in-depth: bill is already org-scoped (see voidInvoice).
+        .where(and(eq(journalEntries.source, "bill"), eq(journalEntries.sourceId, bill.id), eq(journalEntries.orgId, currentOrgId())))
+        .then((r: any[]) => r[0]);
+
+      if (original) {
+        const origLines = await tx
+          .select()
+          .from(journalLines)
+          .where(eq(journalLines.entryId, original.id))
+          ;
+
+        const reversalLines = origLines.map((l) => ({
+          accountId: l.accountId,
+          debit: l.credit || 0,
+          credit: l.debit || 0,
+          description: `Reversal of ${bill.number}`,
+        }));
+
+        if (reversalLines.length >= 2) {
+          await this.postJournalEntry({
+            date: today,
+            memo: `Void bill ${bill.number}`,
+            reference: `VOID-${bill.number}`,
+            source: "bill_void",
+            sourceId: bill.id,
+            lines: reversalLines,
+          }, { _tx: tx });
+        }
+      }
+
+      const row = await tx
+        .update(bills)
+        .set({ status: "void" })
+        .where(eq(bills.id, id))
+        .returning().then((r) => r[0]);
+      await this.audit("void", "bill", id, `Voided bill ${row.number} (reversal posted)`);
+      return row;
+    });
+  }
+
+  // ---------- Bank Transactions ----------
+  async listBankTransactions(
+    bankAccountId?: number,
+    status?: string,
+    limit = 50,
+    offset = 0
+  ): Promise<Paginated<BankTransaction>> {
+    // Filters moved from post-load JS into the SQL WHERE clause (Task 1) —
+    // previously every row for the org was loaded and filtered in memory.
+    const conditions: any[] = [eq(bankTransactions.orgId, currentOrgId())];
+    if (bankAccountId !== undefined) conditions.push(eq(bankTransactions.bankAccountId, bankAccountId));
+    if (status) conditions.push(eq(bankTransactions.status, status));
+    const where = and(...conditions);
+    const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(bankTransactions).where(where);
+    const rows = await db
+      .select()
+      .from(bankTransactions)
+      .where(where)
+      .orderBy(desc(bankTransactions.date), desc(bankTransactions.id))
+      .limit(limit)
+      .offset(offset)
+      ;
+    return { rows, total, limit, offset };
+  }
+
+  async getBankTransaction(id: number): Promise<BankTransaction | undefined> {
+    return await db.select().from(bankTransactions).where(and(eq(bankTransactions.id, id), eq(bankTransactions.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+
+  // Manual posting: create both the bank_transactions row AND a journal entry in one shot.
+  // - deposit:    Dr bank, Cr categoryAccount (typically income, or owner's equity for capital)
+  // - withdrawal: Dr categoryAccount (expense), Cr bank
+  // - transfer:   Dr destinationBank, Cr sourceBank (use transferAccountId as the OTHER side)
+  async postManualBankTransaction(input: PostBankTransactionInput): Promise<BankTransaction> {
+    const bank = await db.select().from(accounts).where(and(eq(accounts.id, input.bankAccountId), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!bank) throw new Error("Bank account not found");
+    if (bank.subtype !== "bank" && bank.subtype !== "credit_card") {
+      throw new Error("Selected account is not a bank or credit card account");
+    }
+
+    // User input is signed dollars — convert ONCE to integer cents.
+    const amountCents = toCents(input.amount);
+    const absAmount = Math.abs(amountCents);
+    if (absAmount === 0) throw new Error("Amount must be non-zero");
+
+    return await db.transaction(async (tx) => {
+      let lines: any[] = [];
+      let memo = input.description;
+
+      if (input.kind === "deposit") {
+        if (!input.categoryAccountId) throw new Error("categoryAccountId required for deposit");
+        if (input.amount <= 0) throw new Error("Deposit amount must be positive");
+        lines = [
+          { accountId: input.bankAccountId, debit: absAmount, credit: 0, description: input.description },
+          { accountId: input.categoryAccountId, debit: 0, credit: absAmount, description: input.description },
+        ];
+      } else if (input.kind === "withdrawal") {
+        if (!input.categoryAccountId) throw new Error("categoryAccountId required for withdrawal");
+        if (input.amount >= 0) throw new Error("Withdrawal amount must be negative");
+        lines = [
+          { accountId: input.categoryAccountId, debit: absAmount, credit: 0, description: input.description },
+          { accountId: input.bankAccountId, debit: 0, credit: absAmount, description: input.description },
+        ];
+      } else if (input.kind === "transfer") {
+        if (!input.transferAccountId) throw new Error("transferAccountId required for transfer");
+        if (input.transferAccountId === input.bankAccountId) {
+          throw new Error("Cannot transfer to the same account");
+        }
+        // If amount is positive, money INTO bankAccountId from transferAccountId (i.e. bankAccountId is destination)
+        // If amount is negative, money OUT of bankAccountId to transferAccountId
+        if (input.amount > 0) {
+          lines = [
+            { accountId: input.bankAccountId, debit: absAmount, credit: 0, description: input.description },
+            { accountId: input.transferAccountId, debit: 0, credit: absAmount, description: input.description },
+          ];
+        } else {
+          lines = [
+            { accountId: input.transferAccountId, debit: absAmount, credit: 0, description: input.description },
+            { accountId: input.bankAccountId, debit: 0, credit: absAmount, description: input.description },
+          ];
+        }
+        memo = `Transfer: ${input.description}`;
+      }
+
+      const { entry } = await this.postJournalEntry({
+        date: input.date,
+        memo,
+        source: "deposit",
+        lines,
+      }, { _tx: tx });
+
+      const bt = await tx
+        .insert(bankTransactions)
+        .values({
+          orgId: currentOrgId(),
+          bankAccountId: input.bankAccountId,
+          date: input.date,
+          description: input.description,
+          amount: amountCents, // signed integer cents
+          status: "matched",
+          entryId: entry.id,
+          source: "manual",
+        })
+        .returning().then((r) => r[0]);
+      return bt;
+    });
+  }
+
+  // Bulk import: insert all rows as 'unmatched'. Skips duplicates by (bankAccountId, externalId).
+  // For rows without externalId (typical CSV imports), falls back to a soft dedup match on
+  // (bankAccountId, date, amount, description) — not 100% accurate but prevents the most
+  // common case of re-importing the same CSV creating duplicate transactions.
+  // After import, auto-applies any matching active bank rules with autoPost=true.
+  async importBankTransactions(input: ImportBankTransactionsInput): Promise<{ inserted: number; skipped: number; autoMatched: number; ruleFailures: number; ruleErrors: string[] }> {
+    let inserted = 0;
+    let skipped = 0;
+    await db.transaction(async (tx) => {
+      for (const raw of input.transactions) {
+        // Imported amounts are signed dollars (CSV/Plaid) — convert once.
+        const t = { ...raw, amount: toCents(raw.amount) };
+        if (t.externalId) {
+          const existing = (await pool.query(`SELECT id FROM bank_transactions WHERE bank_account_id = $1 AND external_id = $2`, [input.bankAccountId, t.externalId])).rows[0];
+          if (existing) {
+            skipped++;
+            continue;
+          }
+        } else {
+          // Soft dedup for CSV-style imports without a stable ID
+          const existing = (await pool.query(`SELECT id FROM bank_transactions
+               WHERE bank_account_id = $1 AND date = $2 AND amount = $3 AND description = $4
+               LIMIT 1`, [input.bankAccountId, t.date, t.amount, t.description])).rows[0];
+          if (existing) {
+            skipped++;
+            continue;
+          }
+        }
+        await tx.insert(bankTransactions)
+          .values({
+          orgId: currentOrgId(),
+            bankAccountId: input.bankAccountId,
+            date: t.date,
+            description: t.description,
+            amount: t.amount,
+            status: "unmatched",
+            externalId: t.externalId,
+            source: input.source,
+          })
+          ;
+        inserted++;
+      }
+    });
+    // Run rules outside the import tx (matchBankTransaction has its own tx)
+    const ruleResult = inserted > 0
+      ? await this.applyRulesToUnmatched(input.bankAccountId)
+      : { matched: 0, failed: 0, errors: [] };
+    return {
+      inserted,
+      skipped,
+      autoMatched: ruleResult.matched,
+      ruleFailures: ruleResult.failed,
+      ruleErrors: ruleResult.errors,
+    };
+  }
+
+  // Suggest matches: open invoices/bills within ±$0.01 amount, ±5 days date
+  async suggestMatches(bankTransactionId: number) {
+    const bt = await this.getBankTransaction(bankTransactionId);
+    if (!bt) throw new Error("Bank transaction not found");
+
+    const absAmt = Math.abs(bt.amount);
+    const btDate = new Date(bt.date);
+    const minDate = new Date(btDate.getTime() - 5 * 86400000).toISOString().slice(0, 10);
+    const maxDate = new Date(btDate.getTime() + 5 * 86400000).toISOString().slice(0, 10);
+
+    type Suggestion = {
+      kind: "invoice" | "bill";
+      id: number;
+      number: string;
+      date: string;
+      partyName: string;
+      total: number;
+      balance: number;
+      score: number;
+    };
+    const suggestions: Suggestion[] = [];
+
+    if (bt.amount > 0) {
+      // Money in -> match to open invoices.
+      // Task 8b: targeted SQL — candidates only where the outstanding balance
+      // equals the tx amount OR the date is within the ±5-day window, capped at
+      // 200 rows. Scoring below is unchanged.
+      const candidates = (await pool.query(
+        `SELECT i.id, i.number, i.date, i.total, i.amount_paid AS "amountPaid", c.name AS "customerName"
+           FROM invoices i
+           JOIN customers c ON c.id = i.customer_id
+          WHERE i.org_id = $1
+            AND i.status = 'open'
+            AND (i.total - i.amount_paid) > 0
+            AND ((i.total - i.amount_paid) = $2 OR (i.date >= $3 AND i.date <= $4))
+          ORDER BY ((i.total - i.amount_paid) = $2) DESC, i.date DESC, i.id DESC
+          LIMIT 200`,
+        [currentOrgId(), absAmt, minDate, maxDate]
+      )).rows as Array<{ id: number; number: string; date: string; total: number; amountPaid: number; customerName: string }>;
+      for (const inv of candidates) {
+        const balance = inv.total - inv.amountPaid; // exact integer cents
+        if (balance <= 0) continue;
+        const amountClose = balance === absAmt; // exact — integers never drift
+        const dateClose = inv.date >= minDate && inv.date <= maxDate;
+        if (amountClose || dateClose) {
+          let score = 0;
+          if (amountClose) score += 50;
+          if (dateClose) score += 20;
+          // Soft text match (customer name appears in description)
+          if (inv.customerName && bt.description.toLowerCase().includes(inv.customerName.toLowerCase())) {
+            score += 30;
+          }
+          if (score > 0) {
+            suggestions.push({
+              kind: "invoice",
+              id: inv.id,
+              number: inv.number,
+              date: inv.date,
+              partyName: inv.customerName || "",
+              total: inv.total,
+              balance,
+              score,
+            });
+          }
+        }
+      }
+    } else {
+      // Money out -> match to open bills (same targeted-SQL pattern).
+      const candidates = (await pool.query(
+        `SELECT b.id, b.number, b.date, b.total, b.amount_paid AS "amountPaid", v.name AS "vendorName"
+           FROM bills b
+           JOIN vendors v ON v.id = b.vendor_id
+          WHERE b.org_id = $1
+            AND b.status = 'open'
+            AND (b.total - b.amount_paid) > 0
+            AND ((b.total - b.amount_paid) = $2 OR (b.date >= $3 AND b.date <= $4))
+          ORDER BY ((b.total - b.amount_paid) = $2) DESC, b.date DESC, b.id DESC
+          LIMIT 200`,
+        [currentOrgId(), absAmt, minDate, maxDate]
+      )).rows as Array<{ id: number; number: string; date: string; total: number; amountPaid: number; vendorName: string }>;
+      for (const bill of candidates) {
+        const balance = bill.total - bill.amountPaid; // exact integer cents
+        if (balance <= 0) continue;
+        const amountClose = balance === absAmt; // exact — integers never drift
+        const dateClose = bill.date >= minDate && bill.date <= maxDate;
+        if (amountClose || dateClose) {
+          let score = 0;
+          if (amountClose) score += 50;
+          if (dateClose) score += 20;
+          if (bill.vendorName && bt.description.toLowerCase().includes(bill.vendorName.toLowerCase())) {
+            score += 30;
+          }
+          if (score > 0) {
+            suggestions.push({
+              kind: "bill",
+              id: bill.id,
+              number: bill.number,
+              date: bill.date,
+              partyName: bill.vendorName || "",
+              total: bill.total,
+              balance,
+              score,
+            });
+          }
+        }
+      }
+    }
+    suggestions.sort((a, b) => b.score - a.score);
+    return suggestions.slice(0, 10);
+  }
+
+  async matchBankTransaction(input: MatchBankTransactionInput): Promise<BankTransaction> {
+    const bt = await this.getBankTransaction(input.bankTransactionId);
+    if (!bt) throw new Error("Bank transaction not found");
+    if (bt.status === "matched") throw new Error("Already matched");
+
+    // Date-lock check (was missing — categorize/transfer paths could bypass period locks)
+    if (input.matchType !== "ignore" && await this.isDateLocked(bt.date)) {
+      throw new Error(`Cannot match transaction dated ${bt.date}: that period is closed.`);
+    }
+
+    const absAmt = Math.abs(bt.amount);
+
+    return await db.transaction(async (tx) => {
+      let entryId: number | undefined;
+
+      if (input.matchType === "ignore") {
+        return tx
+          .update(bankTransactions)
+          .set({ status: "ignored" })
+          .where(eq(bankTransactions.id, bt.id))
+          .returning().then((r) => r[0]);
+      }
+
+      if (input.matchType === "invoice_payment") {
+        if (!input.invoiceId) throw new Error("invoiceId required");
+        if (bt.amount <= 0) throw new Error("Invoice payment requires positive (deposit) amount");
+        const inv = await this.payInvoice({
+          invoiceId: input.invoiceId,
+          date: bt.date,
+          amount: absAmt / 100, // payInvoice's boundary expects dollars; ×100 round-trips exactly
+          bankAccountId: bt.bankAccountId,
+          memo: bt.description,
+        });
+        const recent = await tx
+          .select()
+          .from(journalEntries)
+          // orgId filter is defense-in-depth: inv is already org-scoped, but
+          // source+sourceId alone could collide across tenants if invariants
+          // are ever violated — scoping costs nothing and closes the class.
+          .where(and(eq(journalEntries.source, "payment"), eq(journalEntries.sourceId, inv.id), eq(journalEntries.orgId, currentOrgId())))
+          .orderBy(desc(journalEntries.id))
+          .limit(1)
+          ;
+        entryId = recent[0]?.id;
+      } else if (input.matchType === "bill_payment") {
+        if (!input.billId) throw new Error("billId required");
+        if (bt.amount >= 0) throw new Error("Bill payment requires negative (withdrawal) amount");
+        const bill = await this.payBill({
+          billId: input.billId,
+          date: bt.date,
+          amount: absAmt / 100, // payBill's boundary expects dollars; ×100 round-trips exactly
+          bankAccountId: bt.bankAccountId,
+          memo: bt.description,
+        });
+        const recent = await tx
+          .select()
+          .from(journalEntries)
+          // orgId filter is defense-in-depth (see invoice_payment branch above).
+          .where(and(eq(journalEntries.source, "payment"), eq(journalEntries.sourceId, bill.id), eq(journalEntries.orgId, currentOrgId())))
+          .orderBy(desc(journalEntries.id))
+          .limit(1)
+          ;
+        entryId = recent[0]?.id;
+      } else if (input.matchType === "categorize") {
+        if (!input.categoryAccountId) throw new Error("categoryAccountId required");
+        // Validate the category account exists and is not the bank account itself
+        const catAcct = await tx.select().from(accounts).where(and(eq(accounts.id, input.categoryAccountId), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+        if (!catAcct) throw new Error("Category account not found");
+        if (catAcct.id === bt.bankAccountId) throw new Error("Category account cannot be the same as the bank account");
+        const lines =
+          bt.amount > 0
+            ? [
+                { accountId: bt.bankAccountId, debit: absAmt, credit: 0, description: bt.description },
+                { accountId: input.categoryAccountId, debit: 0, credit: absAmt, description: bt.description },
+              ]
+            : [
+                { accountId: input.categoryAccountId, debit: absAmt, credit: 0, description: bt.description },
+                { accountId: bt.bankAccountId, debit: 0, credit: absAmt, description: bt.description },
+              ];
+        const { entry } = await this.postJournalEntry({
+          date: bt.date,
+          memo: bt.description,
+          source: "deposit",
+          lines,
+        }, { _tx: tx });
+        entryId = entry.id;
+      } else if (input.matchType === "transfer") {
+        if (!input.transferAccountId) throw new Error("transferAccountId required");
+        if (input.transferAccountId === bt.bankAccountId) {
+          throw new Error("Cannot transfer to the same account");
+        }
+        // Validate both ends are bank accounts (transfers should not hit non-cash accounts)
+        const dst = await tx.select().from(accounts).where(and(eq(accounts.id, input.transferAccountId), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+        if (!dst) throw new Error("Transfer destination account not found");
+        if (dst.subtype !== "bank") {
+          throw new Error(`Transfer destination "${dst.name}" must be a bank-subtype account. Use "Categorize" for non-bank movements.`);
+        }
+        const lines =
+          bt.amount > 0
+            ? [
+                { accountId: bt.bankAccountId, debit: absAmt, credit: 0, description: bt.description },
+                { accountId: input.transferAccountId, debit: 0, credit: absAmt, description: bt.description },
+              ]
+            : [
+                { accountId: input.transferAccountId, debit: absAmt, credit: 0, description: bt.description },
+                { accountId: bt.bankAccountId, debit: 0, credit: absAmt, description: bt.description },
+              ];
+        const { entry } = await this.postJournalEntry({
+          date: bt.date,
+          memo: `Transfer: ${bt.description}`,
+          source: "deposit",
+          lines,
+        }, { _tx: tx });
+        entryId = entry.id;
+      }
+
+      return tx
+        .update(bankTransactions)
+        .set({ status: "matched", entryId })
+        .where(eq(bankTransactions.id, bt.id))
+        .returning().then((r) => r[0]);
+    });
+  }
+
+  // Undo a match or an ignore. Mirrors QBO's "Undo" in the banking tab: the
+  // journal entry created by the match is DELETED (not reversed) because it is
+  // the unwind of an erroneous match, not a historical business transaction —
+  // a reversal pair would leave noise in the GL for something that should never
+  // have been posted. The original bank feed row is preserved and returns to
+  // "unmatched" so it can be matched correctly.
+  async unmatchBankTransaction(id: number): Promise<BankTransaction> {
+    const bt = await this.getBankTransaction(id); // org-scoped lookup
+    if (!bt) throw new Error("Bank transaction not found");
+    if (bt.status !== "matched" && bt.status !== "ignored") {
+      throw new Error(`Cannot unmatch: transaction is "${bt.status}" (only matched or ignored transactions can be unmatched).`);
+    }
+
+    return await db.transaction(async (tx) => {
+      // Ignored rows never created a JE — just flip the status back.
+      if (bt.status === "ignored") {
+        const row = await tx
+          .update(bankTransactions)
+          .set({ status: "unmatched" })
+          .where(and(eq(bankTransactions.id, bt.id), eq(bankTransactions.orgId, currentOrgId())))
+          .returning().then((r) => r[0]);
+        await this.audit("unmatch", "bank_transaction", id, `Un-ignored bank transaction "${bt.description}" (${bt.date})`);
+        return row;
+      }
+
+      // Matched: unwind the journal entry (if one exists).
+      if (bt.entryId) {
+        const entry = await tx
+          .select()
+          .from(journalEntries)
+          .where(and(eq(journalEntries.id, bt.entryId), eq(journalEntries.orgId, currentOrgId())))
+          .then((r: any[]) => r[0]);
+
+        if (entry) {
+          // Period-lock check BEFORE any mutation — deleting a JE in a closed
+          // period would silently change closed-period balances.
+          if (await this.isDateLocked(entry.date)) {
+            throw new Error("Cannot unmatch: the matched entry falls in a closed period.");
+          }
+
+          const entryLines = await tx
+            .select()
+            .from(journalLines)
+            .where(eq(journalLines.entryId, entry.id));
+
+          // If the match paid an invoice/bill (source "payment"), reverse the
+          // payment on the document too — otherwise amountPaid/status would
+          // claim money that no longer exists in the GL.
+          if (entry.source === "payment" && entry.sourceId) {
+            // The payment amount is whatever hit the matched bank account's line:
+            // invoice payments DEBIT the bank line, bill payments CREDIT it.
+            const bankLine = entryLines.find((l) => l.accountId === bt.bankAccountId);
+            const paymentAmount = bankLine ? (bankLine.debit || bankLine.credit || 0) : 0;
+            if (paymentAmount <= 0) {
+              throw new Error("Cannot unmatch: could not determine the payment amount from the journal entry.");
+            }
+
+            if (bt.amount > 0) {
+              // Deposit → this was an invoice payment (invoice_payment match).
+              const inv = await tx
+                .select()
+                .from(invoices)
+                .where(and(eq(invoices.id, entry.sourceId), eq(invoices.orgId, currentOrgId())))
+                .then((r: any[]) => r[0]);
+              if (!inv) throw new Error("Cannot unmatch: the paid invoice no longer exists.");
+              const newPaid = inv.amountPaid - paymentAmount;
+              if (newPaid < 0) {
+                // amountPaid below zero means the books were edited outside this
+                // flow — refuse rather than corrupt further.
+                throw new Error(
+                  `Cannot unmatch: reversing ${formatMoney(paymentAmount)} would make invoice ${inv.number}'s paid amount negative (currently ${formatMoney(inv.amountPaid)}). The invoice has been modified since this match.`
+                );
+              }
+              await tx
+                .update(invoices)
+                .set({ amountPaid: newPaid, status: newPaid >= inv.total ? "paid" : "open" })
+                .where(eq(invoices.id, inv.id));
+            } else {
+              // Withdrawal → this was a bill payment (bill_payment match).
+              const bill = await tx
+                .select()
+                .from(bills)
+                .where(and(eq(bills.id, entry.sourceId), eq(bills.orgId, currentOrgId())))
+                .then((r: any[]) => r[0]);
+              if (!bill) throw new Error("Cannot unmatch: the paid bill no longer exists.");
+              const newPaid = bill.amountPaid - paymentAmount;
+              if (newPaid < 0) {
+                throw new Error(
+                  `Cannot unmatch: reversing ${formatMoney(paymentAmount)} would make bill ${bill.number}'s paid amount negative (currently ${formatMoney(bill.amountPaid)}). The bill has been modified since this match.`
+                );
+              }
+              await tx
+                .update(bills)
+                .set({ amountPaid: newPaid, status: newPaid >= bill.total ? "paid" : "open" })
+                .where(eq(bills.id, bill.id));
+            }
+          }
+
+          // Delete lines first (FK fk_journal_lines_entry would also cascade,
+          // but explicit ordering keeps this correct on databases where the FK
+          // migration hasn't run yet), then the entry.
+          await tx.delete(journalLines).where(eq(journalLines.entryId, entry.id));
+          await tx.delete(journalEntries).where(eq(journalEntries.id, entry.id));
+        }
+      }
+
+      const row = await tx
+        .update(bankTransactions)
+        .set({ status: "unmatched", entryId: null })
+        .where(and(eq(bankTransactions.id, bt.id), eq(bankTransactions.orgId, currentOrgId())))
+        .returning().then((r) => r[0]);
+      await this.audit(
+        "unmatch", "bank_transaction", id,
+        `Unmatched bank transaction "${bt.description}" (${bt.date}, ${formatMoney(bt.amount)}); matched journal entry removed`
+      );
+      return row;
+    });
+  }
+
+  // ============================================================================
+  // BANK RULES
+  // ============================================================================
+  async listBankRules(): Promise<BankRule[]> {
+    return await db.select().from(bankRules).where(eq(bankRules.orgId, currentOrgId())).orderBy(bankRules.priority, bankRules.id);
+  }
+  async getBankRule(id: number): Promise<BankRule | undefined> {
+    return await db.select().from(bankRules).where(and(eq(bankRules.id, id), eq(bankRules.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+  async createBankRule(input: BankRuleInput): Promise<BankRule> {
+    await this.validateBankRuleAccounts(input);
+    return db
+      .insert(bankRules)
+      .values({
+          orgId: currentOrgId(),
+        name: input.name,
+        priority: input.priority ?? 100,
+        isActive: input.isActive ?? true,
+        bankAccountId: input.bankAccountId ?? null,
+        descriptionContains: input.descriptionContains ?? null,
+        amountComparator: input.amountComparator ?? null,
+        // Rule thresholds are money — stored as integer cents like everything else
+        amountMin: input.amountMin != null ? toCents(input.amountMin) : null,
+        amountMax: input.amountMax != null ? toCents(input.amountMax) : null,
+        direction: input.direction ?? null,
+        actionType: input.actionType,
+        categoryAccountId: input.categoryAccountId ?? null,
+        transferAccountId: input.transferAccountId ?? null,
+        autoPost: input.autoPost ?? true,
+      })
+      .returning().then((r) => r[0]);
+  }
+  async updateBankRule(id: number, data: Partial<BankRuleInput>): Promise<BankRule> {
+    const existing = await this.getBankRule(id);
+    if (!existing) throw new Error("Rule not found");
+    await this.validateBankRuleAccounts(data);
+    // Re-check the cross-field invariants against the merged record so a PATCH
+    // can never leave a rule in an unusable state (e.g. actionType flipped to
+    // "categorize" without a category account).
+    const merged = { ...existing, ...data };
+    if (merged.actionType === "categorize" && !merged.categoryAccountId) {
+      throw new Error("categoryAccountId is required when actionType is 'categorize'");
+    }
+    if (merged.actionType === "transfer" && !merged.transferAccountId) {
+      throw new Error("transferAccountId is required when actionType is 'transfer'");
+    }
+    const patch: any = { ...data };
+    if (patch.amountMin != null) patch.amountMin = toCents(patch.amountMin);
+    if (patch.amountMax != null) patch.amountMax = toCents(patch.amountMax);
+    await db.update(bankRules).set(patch).where(and(eq(bankRules.id, id), eq(bankRules.orgId, currentOrgId())));
+    const r = await this.getBankRule(id);
+    if (!r) throw new Error("Rule not found");
+    return r;
+  }
+  async deleteBankRule(id: number) {
+    const existing = await this.getBankRule(id);
+    if (!existing) throw new Error("Rule not found");
+    return await db.delete(bankRules).where(and(eq(bankRules.id, id), eq(bankRules.orgId, currentOrgId())));
+  }
+  // Referenced accounts must belong to the active org.
+  // Async because getAccount() is async — the old sync version checked truthiness of
+  // a Promise (always truthy) and never actually validated anything.
+  private async validateBankRuleAccounts(input: Partial<BankRuleInput>): Promise<void> {
+    for (const key of ["bankAccountId", "categoryAccountId", "transferAccountId"] as const) {
+      const v = input[key];
+      if (v !== undefined && v !== null) {
+        const acct = await this.getAccount(v);
+        if (!acct) throw new Error(`Account ${v} (${key}) not found`);
+      }
+    }
+  }
+
+  // Returns the first matching active rule for a bank tx, by ascending priority.
+  async findMatchingRule(bt: BankTransaction): Promise<BankRule | null> {
+    const rules = await db
+      .select()
+      .from(bankRules)
+      .where(and(eq(bankRules.isActive, true), eq(bankRules.orgId, currentOrgId())))
+      .orderBy(bankRules.priority, bankRules.id)
+      ;
+    for (const r of rules) {
+      if (r.bankAccountId !== null && r.bankAccountId !== bt.bankAccountId) continue;
+      if (r.descriptionContains) {
+        if (!bt.description.toLowerCase().includes(r.descriptionContains.toLowerCase())) continue;
+      }
+      if (r.direction === "in" && bt.amount <= 0) continue;
+      if (r.direction === "out" && bt.amount >= 0) continue;
+      if (r.amountComparator) {
+        const a = Math.abs(bt.amount);
+        const min = r.amountMin ?? 0;
+        const max = r.amountMax ?? 0;
+        let ok = false;
+        switch (r.amountComparator) {
+          case "eq": ok = a === min; break; // exact integer cents
+          case "gt": ok = a > min; break;
+          case "lt": ok = a < min; break;
+          case "gte": ok = a >= min; break;
+          case "lte": ok = a <= min; break;
+          case "between": ok = a >= min && a <= max; break;
+        }
+        if (!ok) continue;
+      }
+      return r;
+    }
+    return null;
+  }
+
+  // Apply a rule to an unmatched bank tx. Returns updated bt or null if rule action=ignore handled.
+  async applyRuleToTx(rule: BankRule, bt: BankTransaction): Promise<BankTransaction | null> {
+    if (bt.status !== "unmatched") return bt;
+    if (rule.actionType === "ignore") {
+      const updated = await db
+        .update(bankTransactions)
+        .set({ status: "ignored" })
+        .where(and(eq(bankTransactions.id, bt.id), eq(bankTransactions.orgId, currentOrgId())))
+        .returning().then((r) => r[0]);
+      await db.update(bankRules).set({ hits: rule.hits + 1 }).where(eq(bankRules.id, rule.id));
+      return updated;
+    }
+    if (rule.actionType === "categorize") {
+      if (!rule.categoryAccountId) return bt;
+      const updated = await this.matchBankTransaction({
+        bankTransactionId: bt.id,
+        matchType: "categorize",
+        categoryAccountId: rule.categoryAccountId,
+      });
+      await db.update(bankRules).set({ hits: rule.hits + 1 }).where(eq(bankRules.id, rule.id));
+      return updated;
+    }
+    if (rule.actionType === "transfer") {
+      if (!rule.transferAccountId) return bt;
+      const updated = await this.matchBankTransaction({
+        bankTransactionId: bt.id,
+        matchType: "transfer",
+        transferAccountId: rule.transferAccountId,
+      });
+      await db.update(bankRules).set({ hits: rule.hits + 1 }).where(eq(bankRules.id, rule.id));
+      return updated;
+    }
+    return bt;
+  }
+
+  // Run rules against all unmatched bank txs. Returns count auto-applied.
+  async applyRulesToUnmatched(bankAccountId?: number): Promise<{ matched: number; failed: number; errors: string[] }> {
+    const txs = bankAccountId
+      ? await db.select().from(bankTransactions).where(and(eq(bankTransactions.status, "unmatched"), eq(bankTransactions.bankAccountId, bankAccountId), eq(bankTransactions.orgId, currentOrgId())))
+      : await db.select().from(bankTransactions).where(and(eq(bankTransactions.status, "unmatched"), eq(bankTransactions.orgId, currentOrgId())));
+    let matched = 0;
+    let failed = 0;
+    const errors: string[] = [];
+    for (const bt of txs) {
+      const rule = await this.findMatchingRule(bt);
+      if (rule && rule.autoPost) {
+        try {
+          await this.applyRuleToTx(rule, bt);
+          matched++;
+        } catch (e: any) {
+          failed++;
+          // Keep only the first 10 to avoid an unbounded error array on a broken rule
+          if (errors.length < 10) {
+            errors.push(`Rule "${rule.name}" failed on tx "${bt.description}" (${bt.date}): ${e?.message || e}`);
+          }
+        }
+      }
+    }
+    return { matched, failed, errors };
+  }
+
+  // ============================================================================
+  // PLAID ITEMS — persistent bank connections + sync cursors
+  // ============================================================================
+  // ============================================================================
+  // MULTI-CURRENCY (single-rate model)
+  // ============================================================================
+  // The GL is 100% base currency. FX documents store foreign cents alongside
+  // base cents converted at the DOCUMENT rate; on payment, the difference
+  // between base relieved (document rate) and base received (payment rate)
+  // posts to 4950 FX Gain / 6950 FX Loss. rate = base units per 1 foreign unit.
+
+  async orgBaseCurrency(): Promise<string> {
+    const r = (await pool.query(`SELECT base_currency FROM organizations WHERE id = $1`, [currentOrgId()])).rows[0];
+    return (r?.base_currency as string) || "USD";
+  }
+
+  // Idempotent per-org seeds for the realized-FX accounts. Called lazily from
+  // the FX payment paths so orgs created before this migration self-heal.
+  async ensureFxAccounts(): Promise<{ gain: Account; loss: Account }> {
+    const orgId = currentOrgId();
+    const find = async (code: string) =>
+      db.select().from(accounts).where(and(eq(accounts.code, code), eq(accounts.orgId, orgId))).then((r: any[]) => r[0]);
+    let gain = await find("4950");
+    if (!gain) {
+      gain = await db.insert(accounts)
+        .values({ orgId, code: "4950", name: "FX Gain", type: "income", subtype: "other_income", description: "Realized foreign-exchange gains", isActive: true })
+        .returning().then((r) => r[0]);
+    }
+    let loss = await find("6950");
+    if (!loss) {
+      loss = await db.insert(accounts)
+        .values({ orgId, code: "6950", name: "FX Loss", type: "expense", subtype: "other_expense", description: "Realized foreign-exchange losses", isActive: true })
+        .returning().then((r) => r[0]);
+    }
+    return { gain, loss };
+  }
+
+  async listFxRates(): Promise<Array<{ date: string; fromCode: string; toCode: string; rate: number; source: string | null }>> {
+    const rows = (await pool.query(
+      `SELECT date, from_code AS "fromCode", to_code AS "toCode", rate, source
+         FROM fx_rates WHERE org_id = $1 ORDER BY date DESC, from_code, to_code LIMIT 500`,
+      [currentOrgId()]
+    )).rows;
+    return rows as any[];
+  }
+
+  async upsertFxRate(input: { date: string; fromCode: string; toCode: string; rate: number; source?: string }): Promise<void> {
+    await pool.query(
+      `INSERT INTO fx_rates (org_id, date, from_code, to_code, rate, source)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (org_id, date, from_code, to_code) DO UPDATE SET rate = EXCLUDED.rate, source = EXCLUDED.source`,
+      [currentOrgId(), input.date, input.fromCode, input.toCode, input.rate, input.source ?? "manual"]
+    );
+    await this.audit("upsert", "fx_rate", null, `FX rate ${input.fromCode}→${input.toCode} @ ${input.rate} for ${input.date}`);
+  }
+
+  // Resolves currency/fxRate for a new document. Returns null for base-currency
+  // documents; throws when a foreign currency is given without a valid rate.
+  private async resolveDocumentFx(currency?: string, fxRate?: number): Promise<{ currency: string; fxRate: number } | null> {
+    const base = await this.orgBaseCurrency();
+    if (!currency || currency === base) return null;
+    if (!fxRate || !(fxRate > 0)) {
+      throw new Error(`fxRate is required (and must be > 0) for ${currency} documents — the org base currency is ${base}.`);
+    }
+    return { currency, fxRate };
+  }
+
+  // ============================================================================
+  // NUMBER SEQUENCES — per-org auto-numbering (invoice/bill/credit_note/debit_note)
+  // ============================================================================
+  // RACE SAFETY: allocation is ONE atomic statement. INSERT..ON CONFLICT DO
+  // UPDATE takes a row-level lock on the (org_id, kind) row, so two concurrent
+  // allocators serialize on that lock and each RETURNING sees a distinct
+  // next_value — no read-modify-write window, no duplicates, no app-level
+  // locking needed. Numbers allocated for a create that later fails are simply
+  // burned; numbering gaps are acceptable for these document types.
+  private static readonly SEQUENCE_DEFAULTS: Record<string, { prefix: string; padding: number }> = {
+    invoice: { prefix: "INV-", padding: 4 },
+    bill: { prefix: "BILL-", padding: 4 },
+    credit_note: { prefix: "CN-", padding: 4 },
+    debit_note: { prefix: "DN-", padding: 4 },
+  };
+
+  async nextNumber(kind: "invoice" | "bill" | "credit_note" | "debit_note"): Promise<string> {
+    const def = DatabaseStorage.SEQUENCE_DEFAULTS[kind];
+    if (!def) throw new Error(`Unknown sequence kind "${kind}"`);
+    // Insert path: this call allocates 1, so the stored next_value becomes 2.
+    // Update path: bump next_value by 1. Either way the allocated number is
+    // (returned next_value - 1).
+    const row = (await pool.query(
+      `INSERT INTO number_sequences (org_id, kind, prefix, next_value, padding)
+       VALUES ($1, $2, $3, 2, $4)
+       ON CONFLICT (org_id, kind) DO UPDATE
+         SET next_value = number_sequences.next_value + 1
+       RETURNING prefix, next_value, padding`,
+      [currentOrgId(), kind, def.prefix, def.padding]
+    )).rows[0] as { prefix: string; next_value: number; padding: number };
+    const allocated = Number(row.next_value) - 1;
+    return `${row.prefix}${String(allocated).padStart(Number(row.padding), "0")}`;
+  }
+
+  // Read-only PREVIEW of the upcoming number — does NOT increment. The UI uses
+  // this to prefill the form; the authoritative allocation happens at create.
+  async previewNextNumber(kind: "invoice" | "bill" | "credit_note" | "debit_note"): Promise<{ kind: string; next: string }> {
+    const def = DatabaseStorage.SEQUENCE_DEFAULTS[kind];
+    if (!def) throw new Error(`Unknown sequence kind "${kind}"`);
+    const row = (await pool.query(
+      `SELECT prefix, next_value, padding FROM number_sequences WHERE org_id = $1 AND kind = $2`,
+      [currentOrgId(), kind]
+    )).rows[0] as { prefix: string; next_value: number; padding: number } | undefined;
+    const prefix = row?.prefix ?? def.prefix;
+    const padding = Number(row?.padding ?? def.padding);
+    const upcoming = Number(row?.next_value ?? 1);
+    return { kind, next: `${prefix}${String(upcoming).padStart(padding, "0")}` };
+  }
+
+  async savePlaidItem(input: {
+    bankAccountId: number;
+    accessToken: string;
+    itemId: string;
+    institutionName?: string;
+  }): Promise<{ id: number }> {
+    const orgId = currentOrgId();
+    // Encrypt at rest (Task: AES-256-GCM vault). Plaintext never touches the DB
+    // when a key is configured; production refuses to boot without one.
+    const storedToken = encryptSecret(input.accessToken);
+    // Idempotent on item_id: if Plaid returned the same item, just update the token.
+    const existing = (await pool.query(`SELECT id FROM plaid_items WHERE item_id = $1 AND org_id = $2`, [input.itemId, orgId])).rows[0] as { id: number } | undefined;
+    if (existing) {
+      await pool.query(`UPDATE plaid_items SET access_token = $1, bank_account_id = $2, institution_name = COALESCE($3, institution_name) WHERE id = $4 AND org_id = $5`, [storedToken, input.bankAccountId, input.institutionName ?? null, existing.id, orgId]);
+      return { id: existing.id };
+    }
+    const r = await pool.query(`INSERT INTO plaid_items (org_id, bank_account_id, item_id, access_token, institution_name) VALUES ($1, $2, $3, $4, $5) RETURNING id`, [orgId, input.bankAccountId, input.itemId, storedToken, input.institutionName ?? null]);
+    return { id: Number(r.rows[0].id) };
+  }
+
+  async listPlaidItems(): Promise<Array<{
+    id: number;
+    bankAccountId: number;
+    itemId: string;
+    institutionName?: string;
+    cursor?: string;
+    lastSyncAt?: string;
+    lastSyncError?: string;
+  }>> {
+    const rows = (await pool.query(`SELECT id, bank_account_id AS "bankAccountId", item_id AS "itemId",
+                institution_name AS "institutionName", cursor,
+                last_sync_at AS "lastSyncAt", last_sync_error AS "lastSyncError"
+         FROM plaid_items WHERE org_id = $1
+         ORDER BY id`, [currentOrgId()])).rows;
+    return rows as any;
+  }
+
+  async getPlaidItemAccessToken(id: number): Promise<{ accessToken: string; cursor: string | null; bankAccountId: number } | undefined> {
+    const r = (await pool.query(`SELECT access_token AS "accessToken", cursor, bank_account_id AS "bankAccountId" FROM plaid_items WHERE id = $1 AND org_id = $2`, [id, currentOrgId()])).rows[0] as any;
+    if (!r) return undefined;
+    // LAZY MIGRATION (self-healing, no bulk script): rows written before the
+    // encryption vault shipped hold plaintext tokens (no "v1:" prefix). On the
+    // first read of such a row we immediately re-write it encrypted, so the
+    // fleet converges to encrypted-at-rest through normal usage. If encryption
+    // is unavailable (non-production without a key), we leave the row as-is.
+    if (isLegacyPlaintext(r.accessToken) && encryptionAvailable()) {
+      const encrypted = encryptSecret(r.accessToken);
+      await pool.query(`UPDATE plaid_items SET access_token = $1 WHERE id = $2 AND org_id = $3`, [encrypted, id, currentOrgId()]);
+      // r.accessToken is already the plaintext — return it directly below.
+      return { ...r, accessToken: r.accessToken };
+    }
+    return { ...r, accessToken: decryptSecret(r.accessToken) };
+  }
+
+  async updatePlaidItemCursor(id: number, cursor: string, error?: string): Promise<void> {
+    await pool.query(`UPDATE plaid_items SET cursor = $1, last_sync_at = now(), last_sync_error = $2 WHERE id = $3 AND org_id = $4`, [cursor, error ?? null, id, currentOrgId()]);
+  }
+
+  async deletePlaidItem(id: number): Promise<void> {
+    const r = await pool.query(`DELETE FROM plaid_items WHERE id = $1 AND org_id = $2`, [id, currentOrgId()]);
+    if ((r.rowCount ?? 0) === 0) throw new Error("Plaid item not found");
+  }
+
+  // ============================================================================
+  // RECONCILIATION
+  // ============================================================================
+  async listReconciliations(bankAccountId?: number): Promise<Reconciliation[]> {
+    if (bankAccountId) {
+      return db
+        .select()
+        .from(reconciliations)
+        .where(and(eq(reconciliations.bankAccountId, bankAccountId), eq(reconciliations.orgId, currentOrgId())))
+        .orderBy(desc(reconciliations.statementDate))
+        ;
+    }
+    return await db
+      .select()
+      .from(reconciliations)
+      .where(eq(reconciliations.orgId, currentOrgId()))
+      .orderBy(desc(reconciliations.statementDate));
+  }
+
+  async getReconciliation(id: number) {
+    // Org-scoped lookup: reconciliation IDs are a GLOBAL sequence, so an id
+    // alone is guessable across tenants — without this filter a user in Org A
+    // could read Org B's reconciliation (and its bank transactions) via
+    // GET /api/reconciliations/:id. completeReconciliation() calls this method,
+    // so the fix covers that route too. (Matches deleteReconciliation.)
+    const recon = await db
+      .select()
+      .from(reconciliations)
+      .where(and(eq(reconciliations.id, id), eq(reconciliations.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!recon) return null;
+    const items = await db.select().from(reconciliationItems).where(eq(reconciliationItems.reconciliationId, id));
+    const clearedMap = new Map<number, boolean>();
+    for (const i of items) clearedMap.set(i.bankTransactionId, i.cleared);
+
+    // Get all bank txs for this account up to statement date (regardless of cleared status)
+    const allTxs = await db
+      .select()
+      .from(bankTransactions)
+      .where(
+        and(
+          eq(bankTransactions.bankAccountId, recon.bankAccountId),
+          eq(bankTransactions.orgId, currentOrgId()),
+          lte(bankTransactions.date, recon.statementDate)
+        )
       )
-      .run(
-        orgId, input.customerId, number, input.date, input.dueDate,
-        baseSubtotal, baseTax, baseTotal,
-        fx.currency, fx.fxRate,
-        fx.isForeign ? foreignSubtotal : 0, fx.isForeign ? foreignTax : 0, fx.isForeign ? foreignTotal : 0,
-      );
-    const invoiceId = Number(res.lastInsertRowid);
-    const insLine = db.prepare(
-      `INSERT INTO invoice_lines (org_id, invoice_id, description, quantity, rate, tax_rate, amount, account_id)
-       VALUES (?,?,?,?,?,?,?,?)`,
-    );
-    // The GL posts BASE cents only: DR A/R total; CR income per line; CR tax.
-    const jl: JournalLineInput[] = [{ accountId: ar.id, debit: baseTotal, credit: 0 }];
-    for (const l of computed) {
-      insLine.run(orgId, invoiceId, l.description, l.quantity, l.rate, l.taxRate, l.foreignAmount, l.accountId);
-      jl.push({ accountId: l.accountId, debit: 0, credit: l.baseAmount });
-    }
-    if (baseTax > 0) jl.push({ accountId: taxAcct.id, debit: 0, credit: baseTax });
-    const jeId = postJournalEntry(orgId, input.date, `Invoice ${number} — ${customer.name}`, "invoice", invoiceId, jl);
-    db.prepare("UPDATE invoices SET journal_entry_id = ? WHERE id = ? AND org_id = ?").run(jeId, invoiceId, orgId);
-    audit(orgId, userId, "create", "invoice", invoiceId, `Invoice ${number} for ${customer.name}${fx.isForeign ? ` (${fx.currency} @ ${fx.fxRate})` : ""}`);
-    return invoiceId;
-  });
-  const id = run();
-  return getInvoice(orgId, id);
-}
+      .orderBy(bankTransactions.date, bankTransactions.id)
+      ;
 
-export function getInvoice(orgId: number, id: number): InvoiceRow {
-  const row = db.prepare("SELECT * FROM invoices WHERE org_id = ? AND id = ?").get(orgId, id) as InvoiceRow | undefined;
-  if (!row) throw new HttpError(404, "invoice not found");
-  return row;
-}
-
-export function listInvoices(orgId: number, page: number, pageSize: number, status?: string): { rows: unknown[]; total: number } {
-  const where = status ? "i.org_id = ? AND i.status = ?" : "i.org_id = ?";
-  const params: unknown[] = status ? [orgId, status] : [orgId];
-  const total = (db.prepare(`SELECT COUNT(*) AS n FROM invoices i WHERE ${where}`).get(...params) as { n: number }).n;
-  const rows = db
-    .prepare(
-      `SELECT i.*, c.name AS customer_name FROM invoices i
-       JOIN customers c ON c.id = i.customer_id AND c.org_id = i.org_id
-       WHERE ${where}
-       ORDER BY i.date DESC, i.id DESC LIMIT ? OFFSET ?`,
-    )
-    .all(...params, pageSize, (page - 1) * pageSize);
-  return { rows, total };
-}
-
-export function invoiceLines(orgId: number, invoiceId: number): unknown[] {
-  return db.prepare("SELECT * FROM invoice_lines WHERE org_id = ? AND invoice_id = ?").all(orgId, invoiceId);
-}
-
-/**
- * TASK 1 — payInvoice with realized FX gain/loss.
- *
- * Worked example (the acceptance case):
- *   EUR invoice, foreign_total €100.00 (10000¢), document rate 1.10
- *     → invoice booked: DR A/R $110.00 / CR Sales $110.00
- *   Payment of €100.00 at payment rate 1.08:
- *     baseRelieved = round(10000 × 1.10) = 11000¢  (A/R relieved at DOCUMENT rate)
- *     baseReceived = round(10000 × 1.08) = 10800¢  (cash at PAYMENT rate)
- *     JE:  DR Bank    10800
- *          DR FX Loss   200   (we received less base value than A/R carried)
- *          CR A/R     11000
- *   Had the rate risen to 1.12: baseReceived 11200 → CR FX Gain 200 instead.
- */
-export function payInvoice(orgId: number, userId: number, invoiceId: number, raw: unknown): InvoiceRow {
-  const input: PaymentInput = paymentSchema.parse(raw);
-  const invoice = getInvoice(orgId, invoiceId);
-  if (invoice.status === "void") throw new HttpError(409, "cannot pay a voided invoice");
-  if (invoice.status === "paid") throw new HttpError(409, "invoice already paid");
-  assertPeriodOpen(orgId, input.date);
-
-  const bank = accountById(orgId, input.bankAccountId);
-  if (!bank || bank.subtype !== "bank") throw new HttpError(400, "bankAccountId must be a bank account in this org");
-  const ar = accountByCode(orgId, "1100");
-  const isForeign = invoice.currency !== "";
-
-  let baseRelieved: number;
-  let baseReceived: number;
-  let foreignApplied = 0;
-
-  if (isForeign) {
-    if (input.foreignAmount === undefined || input.fxRate === undefined) {
-      throw new HttpError(400, "foreignAmount and fxRate are required to pay a foreign-currency invoice", "FX_PAYMENT_FIELDS_REQUIRED");
-    }
-    foreignApplied = input.foreignAmount;
-    const outstandingForeign = invoice.foreign_total - invoice.foreign_amount_paid;
-    if (foreignApplied <= 0 || foreignApplied > outstandingForeign) {
-      throw new HttpError(400, `foreignAmount must be 1..${outstandingForeign} (${invoice.currency} cents outstanding)`);
-    }
-    // A/R is relieved proportionally at the DOCUMENT rate; cash lands at the
-    // PAYMENT rate; the difference is realized FX gain/loss.
-    baseRelieved = convertCents(foreignApplied, invoice.fx_rate);
-    // Final payment: relieve the exact remaining base balance so per-payment
-    // rounding can never strand a 1¢ A/R residue.
-    if (foreignApplied === outstandingForeign) baseRelieved = invoice.total - invoice.amount_paid;
-    baseReceived = convertCents(foreignApplied, input.fxRate);
-  } else {
-    if (input.amount === undefined) throw new HttpError(400, "amount (base cents) is required");
-    const outstanding = invoice.total - invoice.amount_paid;
-    if (input.amount <= 0 || input.amount > outstanding) {
-      throw new HttpError(400, `amount must be 1..${outstanding} cents outstanding`);
-    }
-    baseRelieved = input.amount;
-    baseReceived = input.amount;
+    const txs = allTxs.map((t) => ({
+      ...t,
+      cleared: clearedMap.get(t.id) ?? false,
+    }));
+    const totals = await this.computeReconTotals(recon, txs);
+    return { reconciliation: recon, transactions: txs, totals };
   }
 
-  const fxDiff = baseRelieved - baseReceived; // >0 = loss, <0 = gain
-  const fxLoss = fxDiff > 0 ? accountByCode(orgId, "6950") : null;
-  const fxGain = fxDiff < 0 ? accountByCode(orgId, "4950") : null;
-
-  const run = db.transaction(() => {
-    const jl: JournalLineInput[] = [
-      { accountId: bank.id, debit: baseReceived, credit: 0 },
-      { accountId: ar.id, debit: 0, credit: baseRelieved },
-    ];
-    if (fxLoss) jl.push({ accountId: fxLoss.id, debit: fxDiff, credit: 0 });
-    if (fxGain) jl.push({ accountId: fxGain.id, debit: 0, credit: -fxDiff });
-    postJournalEntry(orgId, input.date, `Payment for invoice ${invoice.number}`, "invoice_payment", invoice.id, jl);
-
-    const newPaid = invoice.amount_paid + baseRelieved;
-    const newForeignPaid = invoice.foreign_amount_paid + foreignApplied;
-    const settled = isForeign ? newForeignPaid >= invoice.foreign_total : newPaid >= invoice.total;
-    db.prepare(
-      "UPDATE invoices SET amount_paid = ?, foreign_amount_paid = ?, status = ? WHERE id = ? AND org_id = ?",
-    ).run(newPaid, newForeignPaid, settled ? "paid" : "partial", invoice.id, orgId);
-    audit(
-      orgId, userId, "pay", "invoice", invoice.id,
-      isForeign
-        ? `Payment ${invoice.currency} ${(foreignApplied / 100).toFixed(2)} @ ${input.fxRate} on ${invoice.number} (fx ${fxDiff > 0 ? "loss" : fxDiff < 0 ? "gain" : "none"} ${Math.abs(fxDiff)}¢)`
-        : `Payment ${(baseReceived / 100).toFixed(2)} on ${invoice.number}`,
-    );
-  });
-  run();
-  return getInvoice(orgId, invoiceId);
-}
-
-export function voidInvoice(orgId: number, userId: number, invoiceId: number): InvoiceRow {
-  const invoice = getInvoice(orgId, invoiceId);
-  if (invoice.status === "void") throw new HttpError(409, "already void");
-  if (invoice.amount_paid > 0 || invoice.foreign_amount_paid > 0) {
-    throw new HttpError(409, "cannot void an invoice with payments applied");
+  private computeReconTotals(
+    recon: Reconciliation,
+    txs: Array<BankTransaction & { cleared: boolean }>
+  ) {
+    const clearedDeposits = txs.filter((t) => t.cleared && t.amount > 0).reduce((s, t) => s + t.amount, 0);
+    const clearedWithdrawals = txs.filter((t) => t.cleared && t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0);
+    const bookBalance = recon.beginningBalance + clearedDeposits - clearedWithdrawals;
+    const difference = bookBalance - recon.endingBalance; // exact integer cents
+    return {
+      beginningBalance: recon.beginningBalance,
+      endingBalance: recon.endingBalance,
+      clearedDeposits: clearedDeposits,
+      clearedWithdrawals: clearedWithdrawals,
+      bookBalance: bookBalance,
+      difference,
+    };
   }
-  const today = new Date().toISOString().slice(0, 10);
-  assertPeriodOpen(orgId, today);
-  const run = db.transaction(() => {
-    // Reversing entry: mirror every line of the original JE.
-    if (invoice.journal_entry_id) {
-      const lines = db
-        .prepare("SELECT account_id, debit, credit FROM journal_lines WHERE org_id = ? AND entry_id = ?")
-        .all(orgId, invoice.journal_entry_id) as Array<{ account_id: number; debit: number; credit: number }>;
-      postJournalEntry(
-        orgId, today, `Void invoice ${invoice.number}`, "invoice_void", invoice.id,
-        lines.map((l) => ({ accountId: l.account_id, debit: l.credit, credit: l.debit })),
+
+  async startReconciliation(input: StartReconciliationInput): Promise<Reconciliation> {
+    // Validate the account exists and is a bank account
+    const acct = await db.select().from(accounts).where(and(eq(accounts.id, input.bankAccountId), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!acct) throw new Error("Bank account not found");
+    if (acct.type !== "asset" || acct.subtype !== "bank") {
+      throw new Error(`Reconciliation only valid for bank-subtype accounts (got ${acct.type}/${acct.subtype || "no subtype"}).`);
+    }
+    // Prevent two open reconciliations for the same bank account at once.
+    // orgId is defense-in-depth: bankAccountId was validated org-scoped above.
+    const existingOpen = await db
+      .select()
+      .from(reconciliations)
+      .where(and(eq(reconciliations.bankAccountId, input.bankAccountId), eq(reconciliations.status, "in_progress"), eq(reconciliations.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (existingOpen) {
+      throw new Error(
+        `Reconciliation already in progress for this account (started ${existingOpen.statementDate}). Complete or delete it first.`
       );
     }
-    db.prepare("UPDATE invoices SET status = 'void' WHERE id = ? AND org_id = ?").run(invoice.id, orgId);
-    audit(orgId, userId, "void", "invoice", invoice.id, `Voided invoice ${invoice.number}`);
-  });
-  run();
-  return getInvoice(orgId, invoiceId);
-}
-
-/* ------------------------------------------------------------------ */
-/* Bills — mirrors invoices                                            */
-/* ------------------------------------------------------------------ */
-
-export function createBill(orgId: number, userId: number, raw: unknown): BillRow {
-  const input = insertBillSchema.parse(raw);
-  assertPeriodOpen(orgId, input.date);
-  const vendor = db
-    .prepare("SELECT * FROM vendors WHERE org_id = ? AND id = ?")
-    .get(orgId, input.vendorId) as { id: number; name: string; currency: string | null; is_active: number } | undefined;
-  if (!vendor) throw new HttpError(404, "vendor not found");
-  if (!vendor.is_active) throw new HttpError(409, "vendor is deactivated — reactivate before billing", "PARTY_INACTIVE");
-
-  const wanted = input.currency ?? vendor.currency ?? undefined;
-  const fx = resolveDocCurrency(orgId, { currency: wanted, fxRate: input.fxRate, date: input.date });
-
-  for (const l of input.lines) {
-    if (!accountById(orgId, l.accountId)) throw new HttpError(400, `line account ${l.accountId} not found in org`);
+    return db
+      .insert(reconciliations)
+      .values({
+          orgId: currentOrgId(),
+        bankAccountId: input.bankAccountId,
+        statementDate: input.statementDate,
+        beginningBalance: toCents(input.beginningBalance), // user dollars → integer cents
+        endingBalance: toCents(input.endingBalance),
+        status: "in_progress",
+      })
+      .returning().then((r) => r[0]);
   }
 
-  const computed = computeLines(input.lines, fx);
-  const foreignSubtotal = computed.reduce((s, l) => s + l.foreignAmount, 0);
-  const foreignTax = computed.reduce((s, l) => s + l.foreignTax, 0);
-  const foreignTotal = foreignSubtotal + foreignTax;
-  const baseSubtotal = computed.reduce((s, l) => s + l.baseAmount, 0);
-  const baseTax = computed.reduce((s, l) => s + l.baseTax, 0);
-  const baseTotal = baseSubtotal + baseTax;
+  async toggleReconItem(reconId: number, bankTransactionId: number, cleared: boolean): Promise<ReconciliationItem> {
+    // Org-scoped lookup: without this filter a user could toggle clearing
+    // status on ANOTHER tenant's reconciliation (a cross-tenant WRITE) via
+    // POST /api/reconciliations/:id/toggle, since ids are a global sequence.
+    const recon = await db
+      .select()
+      .from(reconciliations)
+      .where(and(eq(reconciliations.id, reconId), eq(reconciliations.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!recon) throw new Error("Reconciliation not found");
+    if (recon.status === "completed") throw new Error("Reconciliation already completed");
 
-  if (baseTotal <= 0) {
-    throw new HttpError(400, "bill total must be greater than zero", "ZERO_DOCUMENT");
-  }
-  const ap = accountByCode(orgId, "2000");
-  const taxAcct = accountByCode(orgId, "2100");
-  const number = input.number ?? nextDocNumber(orgId, "bills", "BILL");
-  if (input.number && db.prepare("SELECT 1 FROM bills WHERE org_id = ? AND number = ?").get(orgId, input.number)) {
-    throw new HttpError(409, `bill number ${input.number} already exists`, "DUPLICATE_NUMBER");
-  }
-
-  const run = db.transaction((): number => {
-    const res = db
-      .prepare(
-        `INSERT INTO bills (org_id, vendor_id, number, date, due_date, status, subtotal, tax, total, amount_paid,
-                            currency, fx_rate, foreign_subtotal, foreign_tax, foreign_total, foreign_amount_paid)
-         VALUES (?,?,?,?,?,'open',?,?,?,0,?,?,?,?,?,0)`,
+    const existing = await db
+      .select()
+      .from(reconciliationItems)
+      .where(
+        and(
+          eq(reconciliationItems.reconciliationId, reconId),
+          eq(reconciliationItems.bankTransactionId, bankTransactionId)
+        )
       )
-      .run(
-        orgId, input.vendorId, number, input.date, input.dueDate,
-        baseSubtotal, baseTax, baseTotal,
-        fx.currency, fx.fxRate,
-        fx.isForeign ? foreignSubtotal : 0, fx.isForeign ? foreignTax : 0, fx.isForeign ? foreignTotal : 0,
-      );
-    const billId = Number(res.lastInsertRowid);
-    const insLine = db.prepare(
-      `INSERT INTO bill_lines (org_id, bill_id, description, quantity, rate, tax_rate, amount, account_id)
-       VALUES (?,?,?,?,?,?,?,?)`,
+      .then((r: any[]) => r[0]);
+    if (existing) {
+      return db
+        .update(reconciliationItems)
+        .set({ cleared })
+        .where(eq(reconciliationItems.id, existing.id))
+        .returning().then((r) => r[0]);
+    }
+    // orgId set EXPLICITLY: the column's old DB default of 1 silently tagged
+    // every tenant's items as org 1. Migration 0003 backfills legacy rows and
+    // drops that default so a missing orgId now fails loudly instead.
+    return db
+      .insert(reconciliationItems)
+      .values({ orgId: currentOrgId(), reconciliationId: reconId, bankTransactionId, cleared })
+      .returning().then((r) => r[0]);
+  }
+
+  async completeReconciliation(id: number): Promise<Reconciliation> {
+    const result = await this.getReconciliation(id);
+    if (!result) throw new Error("Reconciliation not found");
+    if (result.reconciliation.status === "completed") {
+      throw new Error("Already completed");
+    }
+    if (result.totals.difference !== 0) { // EXACT — integers make this a hard equality
+      throw new Error(`Cannot complete: difference is ${formatMoney(result.totals.difference)}, must be $0.00`);
+    }
+    return db
+      .update(reconciliations)
+      .set({ status: "completed", completedAt: new Date().toISOString() })
+      .where(eq(reconciliations.id, id))
+      .returning().then((r) => r[0]);
+  }
+
+  // Abandon an in-progress reconciliation. Completed reconciliations are
+  // immutable history — they document that the books matched the bank
+  // statement at a point in time — so they can never be deleted.
+  async deleteReconciliation(id: number): Promise<{ ok: true }> {
+    const recon = await db
+      .select()
+      .from(reconciliations)
+      .where(and(eq(reconciliations.id, id), eq(reconciliations.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!recon) throw new Error("Reconciliation not found");
+    if (recon.status !== "in_progress") {
+      throw new Error("Completed reconciliations cannot be deleted");
+    }
+    await db.transaction(async (tx) => {
+      await tx.delete(reconciliationItems).where(eq(reconciliationItems.reconciliationId, id));
+      await tx.delete(reconciliations).where(eq(reconciliations.id, id));
+    });
+    await this.audit(
+      "delete", "reconciliation", id,
+      `Abandoned in-progress reconciliation (statement ${recon.statementDate}, account #${recon.bankAccountId})`
     );
-    // GL (base cents): DR expense per line (+ DR tax), CR A/P total.
-    const jl: JournalLineInput[] = [{ accountId: ap.id, debit: 0, credit: baseTotal }];
-    for (const l of computed) {
-      insLine.run(orgId, billId, l.description, l.quantity, l.rate, l.taxRate, l.foreignAmount, l.accountId);
-      jl.push({ accountId: l.accountId, debit: l.baseAmount, credit: 0 });
+    return { ok: true };
+  }
+
+  // ============================================================================
+  // RECURRING TRANSACTIONS
+  // ============================================================================
+  private advanceDate(dateStr: string, freq: string, n: number): string {
+    const d = new Date(dateStr + "T00:00:00Z");
+    if (freq === "daily") {
+      d.setUTCDate(d.getUTCDate() + n);
+    } else if (freq === "weekly") {
+      d.setUTCDate(d.getUTCDate() + n * 7);
+    } else if (freq === "monthly") {
+      const targetDay = d.getUTCDate();
+      d.setUTCDate(1);
+      d.setUTCMonth(d.getUTCMonth() + n);
+      // Clamp to last day of new month
+      const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+      d.setUTCDate(Math.min(targetDay, lastDay));
+    } else if (freq === "yearly") {
+      d.setUTCFullYear(d.getUTCFullYear() + n);
     }
-    if (baseTax > 0) jl.push({ accountId: taxAcct.id, debit: baseTax, credit: 0 });
-    const jeId = postJournalEntry(orgId, input.date, `Bill ${number} — ${vendor.name}`, "bill", billId, jl);
-    db.prepare("UPDATE bills SET journal_entry_id = ? WHERE id = ? AND org_id = ?").run(jeId, billId, orgId);
-    audit(orgId, userId, "create", "bill", billId, `Bill ${number} from ${vendor.name}${fx.isForeign ? ` (${fx.currency} @ ${fx.fxRate})` : ""}`);
-    return billId;
-  });
-  const id = run();
-  return getBill(orgId, id);
-}
+    return d.toISOString().slice(0, 10);
+  }
 
-export function getBill(orgId: number, id: number): BillRow {
-  const row = db.prepare("SELECT * FROM bills WHERE org_id = ? AND id = ?").get(orgId, id) as BillRow | undefined;
-  if (!row) throw new HttpError(404, "bill not found");
-  return row;
-}
-
-export function listBills(orgId: number, page: number, pageSize: number, status?: string): { rows: unknown[]; total: number } {
-  const where = status ? "b.org_id = ? AND b.status = ?" : "b.org_id = ?";
-  const params: unknown[] = status ? [orgId, status] : [orgId];
-  const total = (db.prepare(`SELECT COUNT(*) AS n FROM bills b WHERE ${where}`).get(...params) as { n: number }).n;
-  const rows = db
-    .prepare(
-      `SELECT b.*, v.name AS vendor_name FROM bills b
-       JOIN vendors v ON v.id = b.vendor_id AND v.org_id = b.org_id
-       WHERE ${where} ORDER BY b.date DESC, b.id DESC LIMIT ? OFFSET ?`,
-    )
-    .all(...params, pageSize, (page - 1) * pageSize);
-  return { rows, total };
-}
-
-export function billLines(orgId: number, billId: number): unknown[] {
-  return db.prepare("SELECT * FROM bill_lines WHERE org_id = ? AND bill_id = ?").all(orgId, billId);
-}
-
-/**
- * TASK 1 — payBill, mirror of payInvoice.
- *
- * Worked example: EUR bill €100 @ 1.10 → A/P carries $110.00.
- *   Pay €100 @ 1.08: baseRelieved = 11000¢, basePaid = 10800¢
- *     DR A/P    11000
- *     CR Bank   10800
- *     CR FX Gain  200   (liability settled for less base cash → gain)
- *   Rate 1.12 instead: basePaid 11200 → DR FX Loss 200.
- */
-export function payBill(orgId: number, userId: number, billId: number, raw: unknown): BillRow {
-  const input: PaymentInput = paymentSchema.parse(raw);
-  const bill = getBill(orgId, billId);
-  if (bill.status === "void") throw new HttpError(409, "cannot pay a voided bill");
-  if (bill.status === "paid") throw new HttpError(409, "bill already paid");
-  assertPeriodOpen(orgId, input.date);
-
-  const bank = accountById(orgId, input.bankAccountId);
-  if (!bank || bank.subtype !== "bank") throw new HttpError(400, "bankAccountId must be a bank account in this org");
-  const ap = accountByCode(orgId, "2000");
-  const isForeign = bill.currency !== "";
-
-  let baseRelieved: number;
-  let basePaid: number;
-  let foreignApplied = 0;
-
-  if (isForeign) {
-    if (input.foreignAmount === undefined || input.fxRate === undefined) {
-      throw new HttpError(400, "foreignAmount and fxRate are required to pay a foreign-currency bill", "FX_PAYMENT_FIELDS_REQUIRED");
+  async listRecurring(): Promise<RecurringTemplate[]> {
+    return await db
+      .select()
+      .from(recurringTemplates)
+      .where(eq(recurringTemplates.orgId, currentOrgId()))
+      .orderBy(recurringTemplates.nextRunDate);
+  }
+  async getRecurring(id: number): Promise<RecurringTemplate | undefined> {
+    return await db.select().from(recurringTemplates).where(and(eq(recurringTemplates.id, id), eq(recurringTemplates.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+  async createRecurring(input: CreateRecurringInput): Promise<RecurringTemplate> {
+    await this.validateRecurringPayload(input.kind, input.payload);
+    return db
+      .insert(recurringTemplates)
+      .values({
+          orgId: currentOrgId(),
+        name: input.name,
+        kind: input.kind,
+        frequency: input.frequency,
+        intervalCount: input.intervalCount ?? 1,
+        startDate: input.startDate,
+        endDate: input.endDate ?? null,
+        maxOccurrences: input.maxOccurrences ?? null,
+        nextRunDate: input.startDate,
+        isActive: input.isActive ?? true,
+        payload: JSON.stringify(input.payload),
+      })
+      .returning().then((r) => r[0]);
+  }
+  async updateRecurring(id: number, data: Partial<CreateRecurringInput>): Promise<RecurringTemplate> {
+    const existing = await this.getRecurring(id);
+    if (!existing) throw new Error("Template not found");
+    const updates: any = { ...data };
+    if (data.payload !== undefined) {
+      const kind = data.kind ?? existing.kind;
+      await this.validateRecurringPayload(kind, data.payload);
+      updates.payload = JSON.stringify(data.payload);
     }
-    foreignApplied = input.foreignAmount;
-    const outstandingForeign = bill.foreign_total - bill.foreign_amount_paid;
-    if (foreignApplied <= 0 || foreignApplied > outstandingForeign) {
-      throw new HttpError(400, `foreignAmount must be 1..${outstandingForeign} (${bill.currency} cents outstanding)`);
+    // Validate the merged date window
+    const start = data.startDate ?? existing.startDate;
+    const end = data.endDate !== undefined ? data.endDate : existing.endDate;
+    if (end && start && end < start) throw new Error("End date must be on or after start date");
+    await db.update(recurringTemplates).set(updates).where(and(eq(recurringTemplates.id, id), eq(recurringTemplates.orgId, currentOrgId())));
+    const r = await this.getRecurring(id);
+    if (!r) throw new Error("Template not found");
+    return r;
+  }
+  async deleteRecurring(id: number) {
+    const existing = await this.getRecurring(id);
+    if (!existing) throw new Error("Template not found");
+    return await db.delete(recurringTemplates).where(and(eq(recurringTemplates.id, id), eq(recurringTemplates.orgId, currentOrgId())));
+  }
+
+  // Per-kind payload validation — runs at create AND update time so a malformed
+  // payload is caught immediately, not on the next scheduler run when it would
+  // throw mid-postRecurringOccurrence and break the whole catch-up batch.
+  private async validateRecurringPayload(kind: string, payload: any) {
+    if (!payload || typeof payload !== "object") throw new Error("payload is required");
+    if (kind === "invoice") {
+      if (!payload.customerId || typeof payload.customerId !== "number")
+        throw new Error("Invoice template requires numeric customerId");
+      const cust = await db.select().from(customers).where(and(eq(customers.id, payload.customerId), eq(customers.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+      if (!cust) throw new Error(`Invoice template references missing customer #${payload.customerId}`);
+      if (!Array.isArray(payload.lines) || payload.lines.length === 0)
+        throw new Error("Invoice template requires at least one line");
+      for (const [i, l] of payload.lines.entries()) {
+        const acctId = l.incomeAccountId ?? l.accountId;
+        if (!acctId) throw new Error(`Line ${i + 1}: incomeAccountId is required`);
+        const a = await db.select().from(accounts).where(and(eq(accounts.id, acctId), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+        if (!a) throw new Error(`Line ${i + 1}: account #${acctId} not found`);
+        if (a.type !== "income") throw new Error(`Line ${i + 1}: "${a.name}" is ${a.type}, expected income`);
+        const qty = l.quantity ?? 1;
+        const rate = l.rate ?? l.amount ?? 0;
+        if (typeof qty !== "number" || qty <= 0) throw new Error(`Line ${i + 1}: quantity must be > 0`);
+        if (typeof rate !== "number" || rate < 0) throw new Error(`Line ${i + 1}: rate must be >= 0`);
+      }
+    } else if (kind === "bill") {
+      if (!payload.vendorId || typeof payload.vendorId !== "number")
+        throw new Error("Bill template requires numeric vendorId");
+      const ven = await db.select().from(vendors).where(and(eq(vendors.id, payload.vendorId), eq(vendors.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+      if (!ven) throw new Error(`Bill template references missing vendor #${payload.vendorId}`);
+      if (!Array.isArray(payload.lines) || payload.lines.length === 0)
+        throw new Error("Bill template requires at least one line");
+      for (const [i, l] of payload.lines.entries()) {
+        const acctId = l.expenseAccountId ?? l.accountId;
+        if (!acctId) throw new Error(`Line ${i + 1}: expenseAccountId is required`);
+        const a = await db.select().from(accounts).where(and(eq(accounts.id, acctId), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+        if (!a) throw new Error(`Line ${i + 1}: account #${acctId} not found`);
+        if (a.type !== "expense") throw new Error(`Line ${i + 1}: "${a.name}" is ${a.type}, expected expense`);
+      }
+    } else if (kind === "journal") {
+      if (!Array.isArray(payload.lines) || payload.lines.length < 2)
+        throw new Error("Journal template requires at least 2 lines");
+      let totDr = 0, totCr = 0;
+      for (const [i, l] of payload.lines.entries()) {
+        if (!l.accountId) throw new Error(`Line ${i + 1}: accountId is required`);
+        const a = await db.select().from(accounts).where(and(eq(accounts.id, l.accountId), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+        if (!a) throw new Error(`Line ${i + 1}: account #${l.accountId} not found`);
+        const dr = +(l.debit || 0);
+        const cr = +(l.credit || 0);
+        if (dr > 0 && cr > 0) throw new Error(`Line ${i + 1}: cannot have both debit and credit`);
+        if (dr === 0 && cr === 0) throw new Error(`Line ${i + 1}: must have a debit or credit > 0`);
+        totDr += dr;
+        totCr += cr;
+      }
+      if (totDr !== totCr) { // exact integer equality
+        throw new Error(`Journal template debits (${formatMoney(totDr)}) ≠ credits (${formatMoney(totCr)})`);
+      }
+    } else {
+      throw new Error(`Unknown recurring kind: ${kind}`);
     }
-    baseRelieved = convertCents(foreignApplied, bill.fx_rate);
-    if (foreignApplied === outstandingForeign) baseRelieved = bill.total - bill.amount_paid;
-    basePaid = convertCents(foreignApplied, input.fxRate);
-  } else {
-    if (input.amount === undefined) throw new HttpError(400, "amount (base cents) is required");
-    const outstanding = bill.total - bill.amount_paid;
-    if (input.amount <= 0 || input.amount > outstanding) throw new HttpError(400, `amount must be 1..${outstanding} cents outstanding`);
-    baseRelieved = input.amount;
-    basePaid = input.amount;
   }
 
-  const fxDiff = baseRelieved - basePaid; // >0 = gain (paid less), <0 = loss
-  const fxGain = fxDiff > 0 ? accountByCode(orgId, "4950") : null;
-  const fxLoss = fxDiff < 0 ? accountByCode(orgId, "6950") : null;
-
-  const run = db.transaction(() => {
-    const jl: JournalLineInput[] = [
-      { accountId: ap.id, debit: baseRelieved, credit: 0 },
-      { accountId: bank.id, debit: 0, credit: basePaid },
-    ];
-    if (fxGain) jl.push({ accountId: fxGain.id, debit: 0, credit: fxDiff });
-    if (fxLoss) jl.push({ accountId: fxLoss.id, debit: -fxDiff, credit: 0 });
-    postJournalEntry(orgId, input.date, `Payment for bill ${bill.number}`, "bill_payment", bill.id, jl);
-
-    const newPaid = bill.amount_paid + baseRelieved;
-    const newForeignPaid = bill.foreign_amount_paid + foreignApplied;
-    const settled = isForeign ? newForeignPaid >= bill.foreign_total : newPaid >= bill.total;
-    db.prepare("UPDATE bills SET amount_paid = ?, foreign_amount_paid = ?, status = ? WHERE id = ? AND org_id = ?")
-      .run(newPaid, newForeignPaid, settled ? "paid" : "partial", bill.id, orgId);
-    audit(
-      orgId, userId, "pay", "bill", bill.id,
-      isForeign
-        ? `Payment ${bill.currency} ${(foreignApplied / 100).toFixed(2)} @ ${input.fxRate} on ${bill.number} (fx ${fxDiff > 0 ? "gain" : fxDiff < 0 ? "loss" : "none"} ${Math.abs(fxDiff)}¢)`
-        : `Payment ${(basePaid / 100).toFixed(2)} on ${bill.number}`,
-    );
-  });
-  run();
-  return getBill(orgId, billId);
-}
-
-/* ------------------------------------------------------------------ */
-/* Credit notes (base currency only in this phase)                     */
-/* ------------------------------------------------------------------ */
-
-export function createCreditNote(orgId: number, userId: number, raw: unknown): { id: number; number: string; total: number } {
-  const input: CreditNoteInput = insertCreditNoteSchema.parse(raw);
-  assertPeriodOpen(orgId, input.date);
-  const customer = db.prepare("SELECT id, name FROM customers WHERE org_id = ? AND id = ?").get(orgId, input.customerId) as
-    | { id: number; name: string }
-    | undefined;
-  if (!customer) throw new HttpError(404, "customer not found");
-  if (input.invoiceId) getInvoice(orgId, input.invoiceId); // org check
-  for (const l of input.lines) {
-    if (!accountById(orgId, l.accountId)) throw new HttpError(400, `line account ${l.accountId} not found in org`);
-  }
-  const computed = computeLines(input.lines, { currency: "", fxRate: 1, isForeign: false });
-  const total = computed.reduce((s, l) => s + l.baseAmount + l.baseTax, 0);
-  const taxTotal = computed.reduce((s, l) => s + l.baseTax, 0);
-  const ar = accountByCode(orgId, "1100");
-  const taxAcct = accountByCode(orgId, "2100");
-  const number = nextDocNumber(orgId, "credit_notes", "CN");
-
-  const run = db.transaction((): number => {
-    const res = db
-      .prepare("INSERT INTO credit_notes (org_id, customer_id, invoice_id, number, date, total) VALUES (?,?,?,?,?,?)")
-      .run(orgId, input.customerId, input.invoiceId ?? null, number, input.date, total);
-    const cnId = Number(res.lastInsertRowid);
-    const jl: JournalLineInput[] = [{ accountId: ar.id, debit: 0, credit: total }];
-    for (const l of computed) jl.push({ accountId: l.accountId, debit: l.baseAmount, credit: 0 });
-    if (taxTotal > 0) jl.push({ accountId: taxAcct.id, debit: taxTotal, credit: 0 });
-    const jeId = postJournalEntry(orgId, input.date, `Credit note ${number} — ${customer.name}`, "credit_note", cnId, jl);
-    db.prepare("UPDATE credit_notes SET journal_entry_id = ? WHERE id = ? AND org_id = ?").run(jeId, cnId, orgId);
-    audit(orgId, userId, "create", "credit_note", cnId, `Credit note ${number} for ${customer.name}`);
-    return cnId;
-  });
-  const id = run();
-  return { id, number, total };
-}
-
-/* ------------------------------------------------------------------ */
-/* Reports — TASK 4                                                    */
-/* ------------------------------------------------------------------ */
-
-export function trialBalance(orgId: number, asOf?: string): Array<{ code: string; name: string; type: string; debit: number; credit: number }> {
-  // The as-of cutoff lives in the SUM, not the WHERE: filtering in WHERE
-  // would drop accounts whose only postings are after the cutoff, instead of
-  // listing them at zero like every other account.
-  const rows = db
-    .prepare(
-      `SELECT a.code, a.name, a.type,
-              COALESCE(SUM(CASE WHEN ? IS NULL OR je.date <= ? THEN jl.debit ELSE 0 END), 0) AS dr,
-              COALESCE(SUM(CASE WHEN ? IS NULL OR je.date <= ? THEN jl.credit ELSE 0 END), 0) AS cr
-       FROM accounts a
-       LEFT JOIN journal_lines jl ON jl.account_id = a.id AND jl.org_id = a.org_id
-       LEFT JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = a.org_id
-       WHERE a.org_id = ?
-       GROUP BY a.id ORDER BY a.code`,
-    )
-    .all(asOf ?? null, asOf ?? null, asOf ?? null, asOf ?? null, orgId) as Array<{ code: string; name: string; type: string; dr: number; cr: number }>;
-  return rows.map((r) => {
-    const net = r.dr - r.cr;
-    return { code: r.code, name: r.name, type: r.type, debit: net > 0 ? net : 0, credit: net < 0 ? -net : 0 };
-  });
-}
-
-export interface SalesByCustomerRow {
-  customerId: number;
-  customer: string;
-  invoiced: number;
-  credited: number;
-  net: number;
-  paid: number;
-  balance: number;
-}
-
-/** TASK 4a — base-currency cents throughout (GL discipline). */
-export function salesByCustomer(orgId: number, from?: string, to?: string): SalesByCustomerRow[] {
-  const lo = from ?? "0000-01-01";
-  const hi = to ?? "9999-12-31";
-  return db
-    .prepare(
-      `SELECT c.id AS customerId, c.name AS customer,
-              COALESCE(inv.invoiced, 0) AS invoiced,
-              COALESCE(cn.credited, 0) AS credited,
-              COALESCE(inv.invoiced, 0) - COALESCE(cn.credited, 0) AS net,
-              COALESCE(inv.paid, 0) AS paid,
-              COALESCE(inv.invoiced, 0) - COALESCE(cn.credited, 0) - COALESCE(inv.paid, 0) AS balance
-       FROM customers c
-       LEFT JOIN (SELECT customer_id, SUM(total) AS invoiced, SUM(amount_paid) AS paid
-                  FROM invoices WHERE org_id = ? AND status != 'void' AND date BETWEEN ? AND ?
-                  GROUP BY customer_id) inv ON inv.customer_id = c.id
-       LEFT JOIN (SELECT customer_id, SUM(total) AS credited
-                  FROM credit_notes WHERE org_id = ? AND date BETWEEN ? AND ?
-                  GROUP BY customer_id) cn ON cn.customer_id = c.id
-       WHERE c.org_id = ? AND (inv.invoiced IS NOT NULL OR cn.credited IS NOT NULL)
-       ORDER BY net DESC`,
-    )
-    .all(orgId, lo, hi, orgId, lo, hi, orgId) as SalesByCustomerRow[];
-}
-
-export interface ExpensesByVendorRow {
-  vendorId: number;
-  vendor: string;
-  billed: number;
-  paid: number;
-  balance: number;
-}
-
-/** TASK 4b */
-export function expensesByVendor(orgId: number, from?: string, to?: string): ExpensesByVendorRow[] {
-  const lo = from ?? "0000-01-01";
-  const hi = to ?? "9999-12-31";
-  return db
-    .prepare(
-      `SELECT v.id AS vendorId, v.name AS vendor,
-              COALESCE(b.billed, 0) AS billed, COALESCE(b.paid, 0) AS paid,
-              COALESCE(b.billed, 0) - COALESCE(b.paid, 0) AS balance
-       FROM vendors v
-       JOIN (SELECT vendor_id, SUM(total) AS billed, SUM(amount_paid) AS paid
-             FROM bills WHERE org_id = ? AND status != 'void' AND date BETWEEN ? AND ?
-             GROUP BY vendor_id) b ON b.vendor_id = v.id
-       WHERE v.org_id = ? ORDER BY billed DESC`,
-    )
-    .all(orgId, lo, hi, orgId) as ExpensesByVendorRow[];
-}
-
-export interface PlMonthlyResult {
-  months: string[]; // "YYYY-MM"
-  rows: Array<{ code: string; name: string; type: string; amounts: Record<string, number> }>;
-}
-
-/**
- * TASK 4c — P&L by month. journal_entries.date is TEXT "YYYY-MM-DD", so
- * substr(date, 1, 7) is an EXACT calendar-month bucket (no timezone math),
- * equivalent to date_trunc('month', ...) on a timestamp column.
- */
-export function profitLossMonthly(orgId: number, from?: string, to?: string): PlMonthlyResult {
-  const lo = from ?? "0000-01-01";
-  const hi = to ?? "9999-12-31";
-  const raw = db
-    .prepare(
-      `SELECT a.code, a.name, a.type, substr(je.date, 1, 7) AS month,
-              SUM(CASE WHEN a.type = 'income' THEN jl.credit - jl.debit ELSE jl.debit - jl.credit END) AS amount
-       FROM journal_lines jl
-       JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = jl.org_id
-       JOIN accounts a ON a.id = jl.account_id AND a.org_id = jl.org_id
-       WHERE jl.org_id = ? AND a.type IN ('income','expense') AND je.date BETWEEN ? AND ?
-       GROUP BY a.id, month ORDER BY a.code, month`,
-    )
-    .all(orgId, lo, hi) as Array<{ code: string; name: string; type: string; month: string; amount: number }>;
-
-  const months = [...new Set(raw.map((r) => r.month))].sort();
-  const byAccount = new Map<string, { code: string; name: string; type: string; amounts: Record<string, number> }>();
-  for (const r of raw) {
-    let acct = byAccount.get(r.code);
-    if (!acct) {
-      acct = { code: r.code, name: r.name, type: r.type, amounts: {} };
-      byAccount.set(r.code, acct);
+  private async postRecurringOccurrence(t: RecurringTemplate): Promise<{ kind: string; id: number }> {
+    const payload = JSON.parse(t.payload);
+    const today = t.nextRunDate;
+    if (t.kind === "invoice") {
+      const due = await this.advanceDate(today, "daily", payload.dueDateOffsetDays ?? 30);
+      const num = `REC-INV-${t.id}-${t.occurrencesPosted + 1}`;
+      // Map simplified lines {accountId, description, amount} to invoice line shape
+      const lines = (payload.lines || []).map((l: any) => ({
+        description: l.description ?? "",
+        quantity: l.quantity ?? 1,
+        rate: l.rate ?? l.amount ?? 0,
+        incomeAccountId: l.incomeAccountId ?? l.accountId,
+      }));
+      const inv = await this.createInvoice({
+        number: num,
+        customerId: payload.customerId,
+        date: today,
+        dueDate: due,
+        taxRate: payload.taxRate ?? 0,
+        notes: payload.notes,
+        lines,
+      });
+      return { kind: "invoice", id: inv.id };
     }
-    acct.amounts[r.month] = r.amount;
-  }
-  return { months, rows: [...byAccount.values()] };
-}
-
-export interface BudgetVsActualRow {
-  code: string;
-  name: string;
-  type: string;
-  budget: number;
-  actual: number;
-  variance: number;
-  variancePct: number | null;
-}
-
-/** TASK 4d — actual comes from the same aggregation as the P&L, so it ties. */
-export function budgetVsActual(orgId: number, budgetId: number, from?: string, to?: string): BudgetVsActualRow[] {
-  const budget = db.prepare("SELECT * FROM budgets WHERE org_id = ? AND id = ?").get(orgId, budgetId) as
-    | { id: number; fiscal_year: number }
-    | undefined;
-  if (!budget) throw new HttpError(404, "budget not found");
-  const lo = from ?? `${budget.fiscal_year}-01-01`;
-  const hi = to ?? `${budget.fiscal_year}-12-31`;
-
-  // Budget cents for the months of the fiscal year overlapping [lo, hi].
-  const monthKey = (m: number) => `${budget.fiscal_year}-${String(m).padStart(2, "0")}`;
-  const monthsInRange = Array.from({ length: 12 }, (_, i) => i + 1).filter((m) => {
-    const key = monthKey(m);
-    return key >= lo.slice(0, 7) && key <= hi.slice(0, 7);
-  });
-
-  const budgetRows = db
-    .prepare(
-      `SELECT bl.account_id, a.code, a.name, a.type, SUM(bl.amount) AS budget
-       FROM budget_lines bl JOIN accounts a ON a.id = bl.account_id AND a.org_id = bl.org_id
-       WHERE bl.org_id = ? AND bl.budget_id = ? AND bl.month IN (${monthsInRange.map(() => "?").join(",") || "NULL"})
-       GROUP BY bl.account_id`,
-    )
-    .all(orgId, budgetId, ...monthsInRange) as Array<{ account_id: number; code: string; name: string; type: string; budget: number }>;
-
-  const actualRows = db
-    .prepare(
-      `SELECT a.id AS account_id, a.code, a.name, a.type,
-              SUM(CASE WHEN a.type = 'income' THEN jl.credit - jl.debit ELSE jl.debit - jl.credit END) AS actual
-       FROM journal_lines jl
-       JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = jl.org_id
-       JOIN accounts a ON a.id = jl.account_id AND a.org_id = jl.org_id
-       WHERE jl.org_id = ? AND a.type IN ('income','expense') AND je.date BETWEEN ? AND ?
-       GROUP BY a.id`,
-    )
-    .all(orgId, lo, hi) as Array<{ account_id: number; code: string; name: string; type: string; actual: number }>;
-
-  const merged = new Map<number, BudgetVsActualRow & { accountId: number }>();
-  for (const b of budgetRows) {
-    merged.set(b.account_id, { accountId: b.account_id, code: b.code, name: b.name, type: b.type, budget: b.budget, actual: 0, variance: 0, variancePct: null });
-  }
-  for (const a of actualRows) {
-    const row = merged.get(a.account_id) ?? { accountId: a.account_id, code: a.code, name: a.name, type: a.type, budget: 0, actual: 0, variance: 0, variancePct: null };
-    row.actual = a.actual;
-    merged.set(a.account_id, row);
-  }
-  return [...merged.values()]
-    .map((r) => {
-      // Favorable = income above budget / expense below budget.
-      const variance = r.type === "income" ? r.actual - r.budget : r.budget - r.actual;
-      return { code: r.code, name: r.name, type: r.type, budget: r.budget, actual: r.actual, variance, variancePct: r.budget !== 0 ? Math.round((variance / Math.abs(r.budget)) * 10000) / 100 : null };
-    })
-    .sort((a, b) => a.code.localeCompare(b.code));
-}
-
-/* ------------------------------------------------------------------ */
-/* Audit log query — TASK 7                                            */
-/* ------------------------------------------------------------------ */
-
-export interface AuditFilters {
-  entityType?: string;
-  entityId?: number;
-  userId?: number;
-  action?: string;
-  q?: string;
-  from?: string;
-  to?: string;
-  page: number;
-  pageSize: number;
-}
-
-export function queryAuditLog(orgId: number, f: AuditFilters): { rows: unknown[]; total: number } {
-  const where: string[] = ["al.org_id = ?"];
-  const params: unknown[] = [orgId];
-  if (f.entityType) { where.push("al.entity_type = ?"); params.push(f.entityType); }
-  if (f.entityId !== undefined) { where.push("al.entity_id = ?"); params.push(f.entityId); }
-  if (f.userId !== undefined) { where.push("al.user_id = ?"); params.push(f.userId); }
-  if (f.action) { where.push("al.action = ?"); params.push(f.action); }
-  if (f.q) {
-    // Free-text against summary; escape LIKE wildcards so "%"/"_" match literally.
-    const escaped = f.q.replace(/([\\%_])/g, "\\$1");
-    where.push("al.summary LIKE ? ESCAPE '\\'");
-    params.push(`%${escaped}%`);
-  }
-  if (f.from) { where.push("al.created_at >= ?"); params.push(`${f.from} 00:00:00`); }
-  if (f.to) { where.push("al.created_at <= ?"); params.push(`${f.to} 23:59:59`); }
-  const whereSql = where.join(" AND ");
-  const total = (db.prepare(`SELECT COUNT(*) AS n FROM audit_log al WHERE ${whereSql}`).get(...params) as { n: number }).n;
-  const rows = db
-    .prepare(
-      `SELECT al.*, u.email AS user_email FROM audit_log al
-       LEFT JOIN users u ON u.id = al.user_id
-       WHERE ${whereSql} ORDER BY al.id DESC LIMIT ? OFFSET ?`,
-    )
-    .all(...params, f.pageSize, (f.page - 1) * f.pageSize);
-  return { rows, total };
-}
-
-/* ------------------------------------------------------------------ */
-/* Manual journal entries — Phase 3                                    */
-/* ------------------------------------------------------------------ */
-
-export interface ManualJeInput {
-  date: string;
-  memo: string;
-  lines: Array<{ accountId: number; debit: number; credit: number }>;
-}
-
-export function createManualJournalEntry(orgId: number, userId: number, input: ManualJeInput): number {
-  assertPeriodOpen(orgId, input.date);
-  if (input.lines.length < 2) throw new HttpError(400, "a journal entry needs at least 2 lines");
-  for (const l of input.lines) {
-    if (!accountById(orgId, l.accountId)) throw new HttpError(400, `account ${l.accountId} not in org`);
-    if (l.debit < 0 || l.credit < 0) throw new HttpError(400, "debit/credit must be >= 0");
-    if (l.debit > 0 && l.credit > 0) throw new HttpError(400, "a line is either a debit or a credit, not both");
-  }
-  const dr = input.lines.reduce((s, l) => s + l.debit, 0);
-  const cr = input.lines.reduce((s, l) => s + l.credit, 0);
-  if (dr !== cr) {
-    throw new HttpError(400, `entry does not balance: debits ${(dr / 100).toFixed(2)} != credits ${(cr / 100).toFixed(2)}`);
-  }
-  if (dr === 0) throw new HttpError(400, "journal entry amount must be greater than zero", "ZERO_JOURNAL");
-  const run = db.transaction((): number => {
-    const id = postJournalEntry(orgId, input.date, input.memo, "manual", null, input.lines);
-    audit(orgId, userId, "create", "journal_entry", id, `Manual JE ${(dr / 100).toFixed(2)}: ${input.memo}`);
-    return id;
-  });
-  return run();
-}
-
-/** Posts a mirror-image entry; the original stays immutable (audit trail). */
-export function reverseJournalEntry(orgId: number, userId: number, entryId: number, date: string): number {
-  assertPeriodOpen(orgId, date);
-  const entry = db.prepare("SELECT * FROM journal_entries WHERE org_id = ? AND id = ?").get(orgId, entryId) as
-    | { id: number; memo: string; source: string }
-    | undefined;
-  if (!entry) throw new HttpError(404, "journal entry not found");
-  const already = db
-    .prepare("SELECT 1 FROM journal_entries WHERE org_id = ? AND source = 'reversal' AND source_id = ?")
-    .get(orgId, entryId);
-  if (already) throw new HttpError(409, "entry has already been reversed");
-  const lines = db
-    .prepare("SELECT account_id, debit, credit FROM journal_lines WHERE org_id = ? AND entry_id = ?")
-    .all(orgId, entryId) as Array<{ account_id: number; debit: number; credit: number }>;
-  const run = db.transaction((): number => {
-    const id = postJournalEntry(
-      orgId, date, `Reversal of JE #${entryId}: ${entry.memo}`, "reversal", entryId,
-      lines.map((l) => ({ accountId: l.account_id, debit: l.credit, credit: l.debit })),
-    );
-    audit(orgId, userId, "reverse", "journal_entry", entryId, `Reversed by JE #${id}`);
-    return id;
-  });
-  return run();
-}
-
-export function listJournalEntries(orgId: number, page: number, pageSize: number): { rows: unknown[]; total: number } {
-  const total = (db.prepare("SELECT COUNT(*) AS n FROM journal_entries WHERE org_id = ?").get(orgId) as { n: number }).n;
-  const rows = db
-    .prepare(
-      `SELECT je.*, (SELECT SUM(debit) FROM journal_lines jl WHERE jl.entry_id = je.id AND jl.org_id = je.org_id) AS amount
-       FROM journal_entries je WHERE je.org_id = ? ORDER BY je.date DESC, je.id DESC LIMIT ? OFFSET ?`,
-    )
-    .all(orgId, pageSize, (page - 1) * pageSize);
-  return { rows, total };
-}
-
-/* ------------------------------------------------------------------ */
-/* Bill void — Phase 3 (mirror of voidInvoice)                         */
-/* ------------------------------------------------------------------ */
-
-export function voidBill(orgId: number, userId: number, billId: number): BillRow {
-  const bill = getBill(orgId, billId);
-  if (bill.status === "void") throw new HttpError(409, "already void");
-  if (bill.amount_paid > 0 || bill.foreign_amount_paid > 0) {
-    throw new HttpError(409, "cannot void a bill with payments applied");
-  }
-  const today = new Date().toISOString().slice(0, 10);
-  assertPeriodOpen(orgId, today);
-  const run = db.transaction(() => {
-    if (bill.journal_entry_id) {
-      const lines = db
-        .prepare("SELECT account_id, debit, credit FROM journal_lines WHERE org_id = ? AND entry_id = ?")
-        .all(orgId, bill.journal_entry_id) as Array<{ account_id: number; debit: number; credit: number }>;
-      postJournalEntry(
-        orgId, today, `Void bill ${bill.number}`, "bill_void", bill.id,
-        lines.map((l) => ({ accountId: l.account_id, debit: l.credit, credit: l.debit })),
-      );
+    if (t.kind === "bill") {
+      const due = await this.advanceDate(today, "daily", payload.dueDateOffsetDays ?? 30);
+      const num = `REC-BILL-${t.id}-${t.occurrencesPosted + 1}`;
+      const lines = (payload.lines || []).map((l: any) => ({
+        description: l.description ?? "",
+        quantity: l.quantity ?? 1,
+        rate: l.rate ?? l.amount ?? 0,
+        expenseAccountId: l.expenseAccountId ?? l.accountId,
+      }));
+      const bill = await this.createBill({
+        number: num,
+        vendorId: payload.vendorId,
+        date: today,
+        dueDate: due,
+        taxRate: payload.taxRate ?? 0,
+        notes: payload.notes,
+        lines,
+      });
+      return { kind: "bill", id: bill.id };
     }
-    db.prepare("UPDATE bills SET status = 'void' WHERE id = ? AND org_id = ?").run(bill.id, orgId);
-    audit(orgId, userId, "void", "bill", bill.id, `Voided bill ${bill.number}`);
-  });
-  run();
-  return getBill(orgId, billId);
-}
+    if (t.kind === "journal") {
+      // Journal lines use {accountId, debit, credit, description}. The payload
+      // stores the amounts as the user typed them (dollars) — convert to
+      // integer cents at posting time, the same boundary as the JE route.
+      const { entry } = await this.postJournalEntry({
+        date: today,
+        memo: payload.memo ?? t.name,
+        reference: `REC-JE-${t.id}-${t.occurrencesPosted + 1}`,
+        source: "recurring",
+        sourceId: t.id,
+        lines: (payload.lines || []).map((l: any) => ({
+          ...l,
+          debit: toCents(l.debit || 0),
+          credit: toCents(l.credit || 0),
+        })),
+      });
+      return { kind: "journal", id: entry.id };
+    }
+    throw new Error(`Unknown recurring kind: ${t.kind}`);
+  }
 
-/* ------------------------------------------------------------------ */
-/* Report pack II — Phase 3                                            */
-/* ------------------------------------------------------------------ */
+  async runCatchUp(asOfDate?: string): Promise<Array<{ templateId: number; templateName: string; posted: number; results: any[] }>> {
+    const today = asOfDate || new Date().toISOString().slice(0, 10);
+    const due = await db
+      .select()
+      .from(recurringTemplates)
+      .where(
+        and(eq(recurringTemplates.isActive, true), lte(recurringTemplates.nextRunDate, today))
+      )
+      ;
+    const out: Array<{ templateId: number; templateName: string; posted: number; results: any[] }> = [];
 
-export interface BalanceSheetSection {
-  rows: Array<{ code: string; name: string; amount: number }>;
-  total: number;
-}
-export interface BalanceSheet {
-  asOf: string;
-  assets: BalanceSheetSection;
-  liabilities: BalanceSheetSection;
-  equity: BalanceSheetSection; // includes a computed "Current earnings" row
-  balanced: boolean;
-}
+    for (const t of due) {
+      // Catch-up runs at server boot, outside any request/org context. Each
+      // template posts inside its OWN org's context so invoices/JEs land in
+      // the right tenant's books.
+      await withOrg({ orgId: t.orgId, userId: 0 }, async () => {
+      let template = t;
+      const results: any[] = [];
+      // Catch up: post all occurrences whose nextRunDate <= today
+      let safety = 0;
+      while (
+        template.isActive &&
+        template.nextRunDate <= today &&
+        (!template.endDate || template.nextRunDate <= template.endDate) &&
+        (!template.maxOccurrences || template.occurrencesPosted < template.maxOccurrences) &&
+        safety < 200
+      ) {
+        safety++;
+        try {
+          const posted = await this.postRecurringOccurrence(template);
+          results.push(posted);
+          const newOccurrences = template.occurrencesPosted + 1;
+          const newNext = await this.advanceDate(template.nextRunDate, template.frequency, template.intervalCount);
+          let stillActive = true;
+          if (template.endDate && newNext > template.endDate) stillActive = false;
+          if (template.maxOccurrences && newOccurrences >= template.maxOccurrences) stillActive = false;
+          await db.update(recurringTemplates)
+            .set({
+              occurrencesPosted: newOccurrences,
+              nextRunDate: newNext,
+              lastRunAt: new Date().toISOString(),
+              isActive: stillActive,
+            })
+            .where(eq(recurringTemplates.id, template.id))
+            ;
+          template = (await this.getRecurring(template.id))!;
+        } catch (e: any) {
+          console.error(`Recurring run failed for template ${template.id}:`, e.message);
+          break;
+        }
+      }
+      if (results.length > 0) {
+        out.push({ templateId: t.id, templateName: t.name, posted: results.length, results });
+      }
+      });
+    }
+    return out;
+  }
 
-/**
- * Balance sheet as of a date. Income/expense activity to date is rolled into
- * equity as "Current earnings", so Assets == Liabilities + Equity always ties
- * to the trial balance.
- */
-export function balanceSheet(orgId: number, asOf: string): BalanceSheet {
-  const tb = trialBalance(orgId, asOf);
-  const section = (type: string, sign: 1 | -1): BalanceSheetSection => {
-    const rows = tb
-      .filter((r) => r.type === type)
-      .map((r) => ({ code: r.code, name: r.name, amount: sign * (r.debit - r.credit) }))
+  // Run a single template once (regardless of nextRunDate)
+  async runRecurringOnce(id: number) {
+    const t = await this.getRecurring(id);
+    if (!t) throw new Error("Template not found");
+    if (!t.isActive) throw new Error("Template is not active");
+    const posted = await this.postRecurringOccurrence(t);
+    const newOccurrences = t.occurrencesPosted + 1;
+    const newNext = await this.advanceDate(t.nextRunDate, t.frequency, t.intervalCount);
+    let stillActive = true;
+    if (t.endDate && newNext > t.endDate) stillActive = false;
+    if (t.maxOccurrences && newOccurrences >= t.maxOccurrences) stillActive = false;
+    await db.update(recurringTemplates)
+      .set({
+        occurrencesPosted: newOccurrences,
+        nextRunDate: newNext,
+        lastRunAt: new Date().toISOString(),
+        isActive: stillActive,
+      })
+      .where(eq(recurringTemplates.id, id))
+      ;
+    return posted;
+  }
+
+  // ============================================================================
+  // BATCH RECLASSIFY
+  // ============================================================================
+  // Strategy: directly UPDATE journal_lines.account_id to the new account.
+  // Post a single audit journal_entries row (zero-line) noting the reclassification.
+  async reclassifyLines(input: ReclassifyInput): Promise<{ linesUpdated: number; entryId: number; lineIds: number[] }> {
+    return await db.transaction(async (tx) => {
+      // Resolve target line IDs
+      let targetIds: number[] = [];
+      if (input.lineIds && input.lineIds.length > 0) {
+        // Only accept line IDs whose parent entry belongs to the active org —
+        // otherwise a caller could reclassify another tenant's ledger.
+        const owned = await tx
+          .select({ id: journalLines.id })
+          .from(journalLines)
+          .innerJoin(journalEntries, eq(journalLines.entryId, journalEntries.id))
+          .where(and(inArray(journalLines.id, input.lineIds), eq(journalEntries.orgId, currentOrgId())));
+        targetIds = owned.map((r) => r.id);
+        if (targetIds.length !== input.lineIds.length) {
+          throw new Error("One or more journal lines were not found");
+        }
+      } else if (input.filter) {
+        const f = input.filter;
+        const rows = await tx
+          .select({ line: journalLines, entry: journalEntries })
+          .from(journalLines)
+          .innerJoin(journalEntries, eq(journalLines.entryId, journalEntries.id))
+          .where(and(eq(journalLines.accountId, f.fromAccountId), eq(journalEntries.orgId, currentOrgId())))
+          ;
+        targetIds = rows
+          .filter((r) => {
+            if (f.fromDate && r.entry.date < f.fromDate) return false;
+            if (f.toDate && r.entry.date > f.toDate) return false;
+            if (f.side === "debit" && r.line.debit <= 0) return false;
+            if (f.side === "credit" && r.line.credit <= 0) return false;
+            if (f.descriptionContains) {
+              const desc = (r.line.description || "") + " " + (r.entry.memo || "");
+              if (!desc.toLowerCase().includes(f.descriptionContains.toLowerCase())) return false;
+            }
+            return true;
+          })
+          .map((r) => r.line.id);
+      }
+      if (targetIds.length === 0) {
+        throw new Error("No lines matched");
+      }
+
+      // Verify target account exists in this org
+      const toAcct = await tx
+        .select()
+        .from(accounts)
+        .where(and(eq(accounts.id, input.toAccountId), eq(accounts.orgId, currentOrgId())))
+        .then((r: any[]) => r[0]);
+      if (!toAcct) throw new Error("Target account not found");
+
+      // Bulk update
+      const updated = await tx
+        .update(journalLines)
+        .set({ accountId: input.toAccountId })
+        .where(inArray(journalLines.id, targetIds))
+        .returning({ id: journalLines.id });
+      const linesUpdated = updated.length;
+
+      // Audit entry (zero-effect: not real journal lines, just a record)
+      const auditEntry = await tx
+        .insert(journalEntries)
+        .values({
+          orgId: currentOrgId(),
+          date: new Date().toISOString().slice(0, 10),
+          memo: input.memo || `Reclassified ${linesUpdated} line(s) to ${toAcct.code} ${toAcct.name}`,
+          reference: `RECLASS-${Date.now()}`,
+          source: "reclassify",
+        })
+        .returning().then((r) => r[0]);
+
+      return { linesUpdated, entryId: auditEntry.id, lineIds: targetIds };
+    });
+  }
+
+  // ---------- Reports ----------
+  // Compute account balances. Returns map accountId -> { debit, credit, balance(signed by normal side) }
+  async accountBalances(asOfDate?: string): Promise<Map<number, { debit: number; credit: number; balance: number }>> {
+    // Org-scope: filter by je.org_id. Note: even though this method is wrapped by listAccounts()
+    // (which is also org-scoped), filtering at the SQL level is faster AND defends against the
+    // case where journal_lines from other orgs accidentally reference our account IDs.
+    const orgId = currentOrgId();
+    const cond = asOfDate ? `WHERE je.org_id = $1 AND je.date <= $2` : `WHERE je.org_id = $1`;
+    const q = `
+      SELECT jl.account_id as "accountId",
+             COALESCE(SUM(jl.debit), 0) as debit,
+             COALESCE(SUM(jl.credit), 0) as credit
+      FROM journal_lines jl
+      INNER JOIN journal_entries je ON je.id = jl.entry_id
+      ${cond}
+      GROUP BY jl.account_id
+    `;
+    const rows = (await pool.query(q, asOfDate ? [orgId, asOfDate] : [orgId])).rows as Array<{
+      accountId: number;
+      debit: number;
+      credit: number;
+    }>;
+    const all = await this.listAccounts();
+    const acctMap = new Map(all.map((a) => [a.id, a]));
+    const result = new Map<number, { debit: number; credit: number; balance: number }>();
+    for (const a of all) {
+      result.set(a.id, { debit: 0, credit: 0, balance: 0 });
+    }
+    for (const r of rows) {
+      const a = acctMap.get(r.accountId);
+      if (!a) continue;
+      const isDebitNormal = a.type === "asset" || a.type === "expense";
+      const balance = isDebitNormal ? r.debit - r.credit : r.credit - r.debit;
+      result.set(r.accountId, { debit: r.debit, credit: r.credit, balance });
+    }
+    return result;
+  }
+
+  // Trial Balance
+  async trialBalance(asOfDate?: string) {
+    const balances = await this.accountBalances(asOfDate);
+    const all = await this.listAccounts();
+    let totalDebit = 0;
+    let totalCredit = 0;
+    const rows = all.map((a) => {
+      const b = balances.get(a.id) || { debit: 0, credit: 0, balance: 0 };
+      const isDebitNormal = a.type === "asset" || a.type === "expense";
+      const debitBal = isDebitNormal ? Math.max(b.balance, 0) : Math.max(-b.balance, 0);
+      const creditBal = isDebitNormal ? Math.max(-b.balance, 0) : Math.max(b.balance, 0);
+      totalDebit += debitBal;
+      totalCredit += creditBal;
+      return {
+        accountId: a.id,
+        code: a.code,
+        name: a.name,
+        type: a.type,
+        debit: debitBal,
+        credit: creditBal,
+      };
+    });
+    return {
+      asOfDate: asOfDate || new Date().toISOString().slice(0, 10),
+      rows: rows.filter((r) => r.debit !== 0 || r.credit !== 0),
+      totalDebit: totalDebit,
+      totalCredit: totalCredit,
+    };
+  }
+
+  // Profit & Loss for date range
+  async profitAndLoss(fromDate: string, toDate: string) {
+    const orgId = currentOrgId();
+    const q = `
+      SELECT a.id as "accountId", a.code, a.name, a.type, a.subtype,
+             COALESCE(SUM(jl.debit), 0) as debit,
+             COALESCE(SUM(jl.credit), 0) as credit
+      FROM accounts a
+      LEFT JOIN journal_lines jl ON jl.account_id = a.id
+      LEFT JOIN journal_entries je ON je.id = jl.entry_id
+      WHERE a.type IN ('income','expense') AND a.org_id = $1
+        AND (je.id IS NULL OR (je.org_id = $1 AND je.date BETWEEN $2 AND $3))
+      GROUP BY a.id
+      ORDER BY a.code
+    `;
+    const rows = (await pool.query(q, [orgId, fromDate, toDate])).rows as any[];
+    const income = rows
+      .filter((r) => r.type === "income")
+      .map((r) => ({ ...r, amount: (r.credit - r.debit) }))
       .filter((r) => r.amount !== 0);
-    return { rows, total: rows.reduce((s, r) => s + r.amount, 0) };
-  };
-  const assets = section("asset", 1);
-  const liabilities = section("liability", -1);
-  const equity = section("equity", -1);
-  const income = tb.filter((r) => r.type === "income").reduce((s, r) => s + (r.credit - r.debit), 0);
-  const expense = tb.filter((r) => r.type === "expense").reduce((s, r) => s + (r.debit - r.credit), 0);
-  const earnings = income - expense;
-  if (earnings !== 0) {
-    equity.rows.push({ code: "—", name: "Current earnings", amount: earnings });
-    equity.total += earnings;
+    const expenses = rows
+      .filter((r) => r.type === "expense")
+      .map((r) => ({ ...r, amount: (r.debit - r.credit) }))
+      .filter((r) => r.amount !== 0);
+    const totalIncome = income.reduce((s, r) => s + r.amount, 0);
+    const totalExpenses = expenses.reduce((s, r) => s + r.amount, 0);
+    const netIncome = (totalIncome - totalExpenses);
+    return { fromDate, toDate, income, expenses, totalIncome, totalExpenses, netIncome };
   }
-  return { asOf, assets, liabilities, equity, balanced: assets.total === liabilities.total + equity.total };
-}
 
-export interface GlLine {
-  date: string;
-  entryId: number;
-  memo: string;
-  source: string;
-  debit: number;
-  credit: number;
-  balance: number;
-}
-export interface GeneralLedger {
-  account: { id: number; code: string; name: string; type: string };
-  openingBalance: number;
-  lines: GlLine[];
-  closingBalance: number;
-}
+  // Balance Sheet as of date
+  async balanceSheet(asOfDate: string) {
+    const balances = await this.accountBalances(asOfDate);
+    const all = await this.listAccounts();
 
-/** General ledger for one account with running balance (debit-positive). */
-export function generalLedger(orgId: number, accountId: number, from?: string, to?: string): GeneralLedger {
-  const acct = accountById(orgId, accountId);
-  if (!acct) throw new HttpError(404, "account not found");
-  const lo = from ?? "0000-01-01";
-  const hi = to ?? "9999-12-31";
-  const opening = db
-    .prepare(
-      `SELECT COALESCE(SUM(jl.debit - jl.credit), 0) AS bal
-       FROM journal_lines jl JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = jl.org_id
-       WHERE jl.org_id = ? AND jl.account_id = ? AND je.date < ?`,
-    )
-    .get(orgId, accountId, lo) as { bal: number };
-  const raw = db
-    .prepare(
-      `SELECT je.date, je.id AS entryId, je.memo, je.source, jl.debit, jl.credit
-       FROM journal_lines jl JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = jl.org_id
-       WHERE jl.org_id = ? AND jl.account_id = ? AND je.date BETWEEN ? AND ?
-       ORDER BY je.date, je.id, jl.id`,
-    )
-    .all(orgId, accountId, lo, hi) as Array<Omit<GlLine, "balance">>;
-  let running = opening.bal;
-  const lines = raw.map((l) => {
-    running += l.debit - l.credit;
-    return { ...l, balance: running };
-  });
-  return {
-    account: { id: acct.id, code: acct.code, name: acct.name, type: acct.type },
-    openingBalance: opening.bal,
-    lines,
-    closingBalance: running,
-  };
-}
+    // Compute net income up to asOfDate (closes to retained earnings conceptually)
+    const pl = await this.profitAndLoss("0000-01-01", asOfDate);
+    const netIncome = pl.netIncome;
 
-export interface AgingRow {
-  partyId: number;
-  party: string;
-  current: number;
-  d1_30: number;
-  d31_60: number;
-  d61_90: number;
-  d90_plus: number;
-  total: number;
-}
+    const buildSection = (type: string) =>
+      all
+        .filter((a) => a.type === type)
+        .map((a) => {
+          const b = balances.get(a.id) || { balance: 0 };
+          return { accountId: a.id, code: a.code, name: a.name, balance: b.balance };
+        })
+        .filter((r) => r.balance !== 0);
 
-/** Aging buckets by days past due_date, base-currency outstanding. */
-function aging(orgId: number, table: "invoices" | "bills", partyTable: "customers" | "vendors", partyCol: string, asOf: string): AgingRow[] {
-  const docs = db
-    .prepare(
-      `SELECT d.${partyCol} AS partyId, p.name AS party, d.due_date, d.total - d.amount_paid AS outstanding
-       FROM ${table} d JOIN ${partyTable} p ON p.id = d.${partyCol} AND p.org_id = d.org_id
-       WHERE d.org_id = ? AND d.status IN ('open','partial') AND d.date <= ?`,
-    )
-    .all(orgId, asOf) as Array<{ partyId: number; party: string; due_date: string; outstanding: number }>;
-  const byParty = new Map<number, AgingRow>();
-  const asOfMs = Date.parse(asOf + "T00:00:00Z");
-  for (const d of docs) {
-    if (d.outstanding <= 0) continue;
-    let row = byParty.get(d.partyId);
-    if (!row) {
-      row = { partyId: d.partyId, party: d.party, current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90_plus: 0, total: 0 };
-      byParty.set(d.partyId, row);
+    const assets = buildSection("asset");
+    const liabilities = buildSection("liability");
+    const equity = buildSection("equity");
+
+    const totalAssets = assets.reduce((s, r) => s + r.balance, 0);
+    const totalLiabilities = liabilities.reduce((s, r) => s + r.balance, 0);
+    const equityFromAccounts = equity.reduce((s, r) => s + r.balance, 0);
+    // Add current period net income to equity
+    const totalEquity = (equityFromAccounts + netIncome);
+
+    return {
+      asOfDate,
+      assets,
+      liabilities,
+      equity: [...equity, { accountId: -1, code: "—", name: "Net Income (current period)", balance: netIncome }],
+      totalAssets,
+      totalLiabilities,
+      totalEquity,
+      liabilitiesAndEquity: (totalLiabilities + totalEquity),
+    };
+  }
+
+  // Dashboard summary metrics
+  async dashboardStats() {
+    const allInvoices = await db.select().from(invoices).where(eq(invoices.orgId, currentOrgId()));
+    const allBills = await db.select().from(bills).where(eq(bills.orgId, currentOrgId()));
+    const accountsList = await this.listAccounts();
+    const balances = await this.accountBalances();
+
+    const cashAccounts = accountsList.filter((a) => a.subtype === "bank");
+    const cashOnHand = cashAccounts.reduce(
+      (s, a) => s + (balances.get(a.id)?.balance || 0),
+      0
+    );
+
+    const arOutstanding = allInvoices
+      .filter((i) => i.status === "open")
+      .reduce((s, i) => s + (i.total - i.amountPaid), 0);
+    const apOutstanding = allBills
+      .filter((b) => b.status === "open")
+      .reduce((s, b) => s + (b.total - b.amountPaid), 0);
+
+    const today = new Date().toISOString().slice(0, 10);
+    const overdueInvoices = allInvoices.filter((i) => i.status === "open" && i.dueDate < today).length;
+    const overdueBills = allBills.filter((b) => b.status === "open" && b.dueDate < today).length;
+
+    // Revenue & expenses for current month
+    const now = new Date();
+    const startOfMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
+    const pl = await this.profitAndLoss(startOfMonth, today);
+
+    return {
+      cashOnHand: cashOnHand,
+      arOutstanding: arOutstanding,
+      apOutstanding: apOutstanding,
+      overdueInvoices,
+      overdueBills,
+      revenueThisMonth: pl.totalIncome,
+      expensesThisMonth: pl.totalExpenses,
+      netIncomeThisMonth: pl.netIncome,
+    };
+  }
+
+  // ============================================================================
+  // GENERAL LEDGER (per-account drill-down with running balance)
+  // ============================================================================
+  async generalLedger(accountId: number, fromDate: string, toDate: string) {
+    // Org-scoped lookup: IDs are a GLOBAL sequence, so accountId alone is
+    // guessable across tenants — without this filter a user in Org A could
+    // read Org B's entire ledger for any account id they enumerate.
+    const acct = await db.select().from(accounts)
+      .where(and(eq(accounts.id, accountId), eq(accounts.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    if (!acct) throw new Error("Account not found");
+    const isDebitNormal = acct.type === "asset" || acct.type === "expense";
+
+    // Opening balance: sum all activity strictly before fromDate (org-scoped)
+    const op = (await pool.query(`
+      SELECT COALESCE(SUM(jl.debit), 0) as debit, COALESCE(SUM(jl.credit), 0) as credit
+      FROM journal_lines jl
+      INNER JOIN journal_entries je ON je.id = jl.entry_id
+      WHERE jl.account_id = $1 AND je.date < $2 AND je.org_id = $3
+    `, [accountId, fromDate, currentOrgId()])).rows[0] as { debit: number; credit: number };
+    const openingBalance = isDebitNormal ? op.debit - op.credit : op.credit - op.debit;
+
+    // Activity in range (org-scoped)
+    const txs = (await pool.query(`
+      SELECT je.id as "entryId", je.date, je.memo, je.reference, je.source,
+             jl.id as "lineId", jl.debit, jl.credit, jl.description
+      FROM journal_lines jl
+      INNER JOIN journal_entries je ON je.id = jl.entry_id
+      WHERE jl.account_id = $1 AND je.date BETWEEN $2 AND $3 AND je.org_id = $4
+      ORDER BY je.date ASC, je.id ASC, jl.id ASC
+    `, [accountId, fromDate, toDate, currentOrgId()])).rows as Array<{
+      entryId: number;
+      date: string;
+      memo: string | null;
+      reference: string | null;
+      source: string | null;
+      lineId: number;
+      debit: number;
+      credit: number;
+      description: string | null;
+    }>;
+
+    let running = openingBalance;
+    const lines = txs.map((t) => {
+      const change = isDebitNormal ? t.debit - t.credit : t.credit - t.debit;
+      running = (running + change);
+      return {
+        ...t,
+        balance: running,
+      };
+    });
+
+    const totalDebit = txs.reduce((s, t) => s + t.debit, 0);
+    const totalCredit = txs.reduce((s, t) => s + t.credit, 0);
+    const netChange = (isDebitNormal ? totalDebit - totalCredit : totalCredit - totalDebit);
+
+    return {
+      account: acct,
+      fromDate,
+      toDate,
+      openingBalance: openingBalance,
+      lines,
+      totalDebit,
+      totalCredit,
+      netChange,
+      closingBalance: running,
+    };
+  }
+
+  // ============================================================================
+  // A/R AGING — outstanding invoices grouped by age bucket per customer
+  // ============================================================================
+  async arAging(asOfDate?: string) {
+    const today = asOfDate || new Date().toISOString().slice(0, 10);
+    const allInvoices = await db.select().from(invoices).where(eq(invoices.orgId, currentOrgId()));
+    // Direct query, NOT the paginated listCustomers() — aging reports need every customer.
+    const allCustomers = await db.select().from(customers).where(eq(customers.orgId, currentOrgId()));
+    const custMap = new Map(allCustomers.map((c) => [c.id, c]));
+
+    const buckets = ["current", "d1_30", "d31_60", "d61_90", "d90_plus"] as const;
+    type Bucket = typeof buckets[number];
+    const bucketLabel: Record<Bucket, string> = {
+      current: "Current",
+      d1_30: "1-30",
+      d31_60: "31-60",
+      d61_90: "61-90",
+      d90_plus: "90+",
+    };
+
+    function ageOf(dueDate: string): Bucket {
+      const due = new Date(dueDate + "T00:00:00Z");
+      const ref = new Date(today + "T00:00:00Z");
+      const diff = Math.floor((ref.getTime() - due.getTime()) / 86400000);
+      if (diff <= 0) return "current";
+      if (diff <= 30) return "d1_30";
+      if (diff <= 60) return "d31_60";
+      if (diff <= 90) return "d61_90";
+      return "d90_plus";
     }
-    const daysPast = Math.floor((asOfMs - Date.parse(d.due_date + "T00:00:00Z")) / 864e5);
-    if (daysPast <= 0) row.current += d.outstanding;
-    else if (daysPast <= 30) row.d1_30 += d.outstanding;
-    else if (daysPast <= 60) row.d31_60 += d.outstanding;
-    else if (daysPast <= 90) row.d61_90 += d.outstanding;
-    else row.d90_plus += d.outstanding;
-    row.total += d.outstanding;
+
+    type Row = {
+      customerId: number;
+      customerName: string;
+      current: number;
+      d1_30: number;
+      d31_60: number;
+      d61_90: number;
+      d90_plus: number;
+      total: number;
+      invoices: Array<{
+        id: number;
+        number: string;
+        date: string;
+        dueDate: string;
+        balance: number;
+        bucket: Bucket;
+      }>;
+    };
+    const rowMap = new Map<number, Row>();
+
+    for (const inv of allInvoices) {
+      if (inv.status === "void") continue;
+      const balance = (inv.total - inv.amountPaid);
+      if (balance === 0) continue;
+      const bucket = ageOf(inv.dueDate);
+      const cust = custMap.get(inv.customerId);
+      if (!cust) continue;
+      let row = rowMap.get(cust.id);
+      if (!row) {
+        row = {
+          customerId: cust.id,
+          customerName: cust.name,
+          current: 0,
+          d1_30: 0,
+          d31_60: 0,
+          d61_90: 0,
+          d90_plus: 0,
+          total: 0,
+          invoices: [],
+        };
+        rowMap.set(cust.id, row);
+      }
+      row[bucket] = (row[bucket] + balance);
+      row.total = (row.total + balance);
+      row.invoices.push({
+        id: inv.id,
+        number: inv.number,
+        date: inv.date,
+        dueDate: inv.dueDate,
+        balance,
+        bucket,
+      });
+    }
+
+    // Unapplied credit notes appear as NEGATIVE balances per customer. The
+    // credit note already credited A/R in the GL at issue, so including it here
+    // (as of its issue date) keeps the aging total reconciled with the A/R
+    // GL balance. Credit notes have no due date — they sit in "current".
+    const openCredits = await db
+      .select()
+      .from(creditNotes)
+      .where(and(
+        eq(creditNotes.orgId, currentOrgId()),
+        eq(creditNotes.status, "issued"),
+        gt(creditNotes.remainingCredit, 0),
+        lte(creditNotes.date, today),
+      ))
+      ;
+    for (const cn of openCredits) {
+      const cust = custMap.get(cn.customerId);
+      if (!cust) continue;
+      let row = rowMap.get(cust.id);
+      if (!row) {
+        row = {
+          customerId: cust.id,
+          customerName: cust.name,
+          current: 0,
+          d1_30: 0,
+          d31_60: 0,
+          d61_90: 0,
+          d90_plus: 0,
+          total: 0,
+          invoices: [],
+        };
+        rowMap.set(cust.id, row);
+      }
+      const credit = -cn.remainingCredit;
+      row.current = (row.current + credit);
+      row.total = (row.total + credit);
+      row.invoices.push({
+        id: cn.id,
+        number: cn.number, // CN-xxxx — distinguishes it from invoices in the row detail
+        date: cn.date,
+        dueDate: cn.date,
+        balance: credit,
+        bucket: "current",
+      });
+    }
+
+    const rows = Array.from(rowMap.values()).sort((a, b) => b.total - a.total);
+    const totals = {
+      current: rows.reduce((s, r) => s + r.current, 0),
+      d1_30: rows.reduce((s, r) => s + r.d1_30, 0),
+      d31_60: rows.reduce((s, r) => s + r.d31_60, 0),
+      d61_90: rows.reduce((s, r) => s + r.d61_90, 0),
+      d90_plus: rows.reduce((s, r) => s + r.d90_plus, 0),
+      total: rows.reduce((s, r) => s + r.total, 0),
+    };
+
+    // Cross-check against the A/R GL balance. If a manual JE was posted directly to
+    // Accounts Receivable (not through createInvoice/payInvoice), the invoice-based
+    // aging will diverge from the GL. Surface that as a warning so users know.
+    const arAcct = await db.select().from(accounts).where(and(eq(accounts.code, "1100"), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    let glBalance = 0;
+    let warning: string | undefined;
+    if (arAcct) {
+      const bals = await this.accountBalances(today);
+      glBalance = (bals.get(arAcct.id)?.balance || 0);
+      const diff = (totals.total - glBalance);
+      if (diff !== 0) {
+        warning = `Aging total (${formatMoney(totals.total)}) does not match A/R GL balance (${formatMoney(glBalance)}). Difference: ${formatMoney(diff)}. This usually means manual journal entries were posted directly to A/R bypassing the invoice workflow.`;
+      }
+    }
+    return { asOfDate: today, bucketLabel, rows, totals, glBalance, warning };
   }
-  return [...byParty.values()].sort((a, b) => b.total - a.total);
+
+  // ============================================================================
+  // A/P AGING — outstanding bills grouped by age bucket per vendor
+  // ============================================================================
+  async apAging(asOfDate?: string) {
+    const today = asOfDate || new Date().toISOString().slice(0, 10);
+    const allBills = await db.select().from(bills).where(eq(bills.orgId, currentOrgId()));
+    // Direct query, NOT the paginated listVendors() — aging reports need every vendor.
+    const allVendors = await db.select().from(vendors).where(eq(vendors.orgId, currentOrgId()));
+    const venMap = new Map(allVendors.map((v) => [v.id, v]));
+
+    const buckets = ["current", "d1_30", "d31_60", "d61_90", "d90_plus"] as const;
+    type Bucket = typeof buckets[number];
+    const bucketLabel: Record<Bucket, string> = {
+      current: "Current",
+      d1_30: "1-30",
+      d31_60: "31-60",
+      d61_90: "61-90",
+      d90_plus: "90+",
+    };
+
+    function ageOf(dueDate: string): Bucket {
+      const due = new Date(dueDate + "T00:00:00Z");
+      const ref = new Date(today + "T00:00:00Z");
+      const diff = Math.floor((ref.getTime() - due.getTime()) / 86400000);
+      if (diff <= 0) return "current";
+      if (diff <= 30) return "d1_30";
+      if (diff <= 60) return "d31_60";
+      if (diff <= 90) return "d61_90";
+      return "d90_plus";
+    }
+
+    type Row = {
+      vendorId: number;
+      vendorName: string;
+      current: number;
+      d1_30: number;
+      d31_60: number;
+      d61_90: number;
+      d90_plus: number;
+      total: number;
+      bills: Array<{
+        id: number;
+        number: string;
+        date: string;
+        dueDate: string;
+        balance: number;
+        bucket: Bucket;
+      }>;
+    };
+    const rowMap = new Map<number, Row>();
+
+    for (const b of allBills) {
+      if (b.status === "void") continue;
+      const balance = (b.total - b.amountPaid);
+      if (balance === 0) continue;
+      const bucket = ageOf(b.dueDate);
+      const ven = venMap.get(b.vendorId);
+      if (!ven) continue;
+      let row = rowMap.get(ven.id);
+      if (!row) {
+        row = {
+          vendorId: ven.id,
+          vendorName: ven.name,
+          current: 0,
+          d1_30: 0,
+          d31_60: 0,
+          d61_90: 0,
+          d90_plus: 0,
+          total: 0,
+          bills: [],
+        };
+        rowMap.set(ven.id, row);
+      }
+      row[bucket] = (row[bucket] + balance);
+      row.total = (row.total + balance);
+      row.bills.push({
+        id: b.id,
+        number: b.number,
+        date: b.date,
+        dueDate: b.dueDate,
+        balance,
+        bucket,
+      });
+    }
+
+    // Unapplied debit notes appear as NEGATIVE balances per vendor — the note
+    // already debited A/P at creation, so the aging total stays reconciled
+    // with the A/P GL balance. No due date — they sit in "current".
+    const openDebits = await db
+      .select()
+      .from(debitNotes)
+      .where(and(
+        eq(debitNotes.orgId, currentOrgId()),
+        eq(debitNotes.status, "sent"),
+        gt(debitNotes.remainingDebit, 0),
+        lte(debitNotes.date, today),
+      ))
+      ;
+    for (const dn of openDebits) {
+      const ven = venMap.get(dn.vendorId);
+      if (!ven) continue;
+      let row = rowMap.get(ven.id);
+      if (!row) {
+        row = {
+          vendorId: ven.id,
+          vendorName: ven.name,
+          current: 0,
+          d1_30: 0,
+          d31_60: 0,
+          d61_90: 0,
+          d90_plus: 0,
+          total: 0,
+          bills: [],
+        };
+        rowMap.set(ven.id, row);
+      }
+      const debit = -dn.remainingDebit;
+      row.current = (row.current + debit);
+      row.total = (row.total + debit);
+      row.bills.push({
+        id: dn.id,
+        number: dn.number, // DN-xxxx
+        date: dn.date,
+        dueDate: dn.date,
+        balance: debit,
+        bucket: "current",
+      });
+    }
+
+    const rows = Array.from(rowMap.values()).sort((a, b) => b.total - a.total);
+    const totals = {
+      current: rows.reduce((s, r) => s + r.current, 0),
+      d1_30: rows.reduce((s, r) => s + r.d1_30, 0),
+      d31_60: rows.reduce((s, r) => s + r.d31_60, 0),
+      d61_90: rows.reduce((s, r) => s + r.d61_90, 0),
+      d90_plus: rows.reduce((s, r) => s + r.d90_plus, 0),
+      total: rows.reduce((s, r) => s + r.total, 0),
+    };
+
+    // Cross-check against the A/P GL balance — same idea as arAging.
+    const apAcct = await db
+      .select()
+      .from(accounts)
+      .where(and(eq(accounts.code, "2000"), eq(accounts.orgId, currentOrgId())))
+      .then((r: any[]) => r[0]);
+    let glBalance = 0;
+    let warning: string | undefined;
+    if (apAcct) {
+      const bals = await this.accountBalances(today);
+      glBalance = (bals.get(apAcct.id)?.balance || 0);
+      const diff = (totals.total - glBalance);
+      if (diff !== 0) {
+        warning = `Aging total (${formatMoney(totals.total)}) does not match A/P GL balance (${formatMoney(glBalance)}). Difference: ${formatMoney(diff)}. This usually means manual journal entries were posted directly to A/P bypassing the bill workflow.`;
+      }
+    }
+    return { asOfDate: today, bucketLabel, rows, totals, glBalance, warning };
+  }
+
+  // ============================================================================
+  // CASH FLOW STATEMENT (indirect-method-lite)
+  // Operating: Net Income + change in non-cash working capital (A/R, A/P, Inventory)
+  // Investing: change in fixed-asset accounts (subtype 'fixed_asset')
+  // Financing: change in equity & long-term liabilities (Owner's Equity, etc.)
+  // ============================================================================
+  /**
+   * Cash Flow Statement (Indirect Method)
+   *
+   * Mathematical foundation: from the accounting identity A = L + E, taking the period delta
+   * and isolating cash gives:
+   *     ΔCash = ΔLiabilities + ΔEquity + NetIncomeForPeriod − ΔOtherAssets
+   * (where NetIncomeForPeriod stands in for the income/expense account balance changes,
+   * which are equity-on-the-way-to-RE until a closing entry is posted.)
+   *
+   * The cash flow statement is just a categorized restatement of the right-hand side.
+   * For a balanced ledger (which double-entry guarantees), the reconciliation gap MUST be 0.
+   *
+   * Classification rules (every non-cash, non-P&L account belongs to exactly ONE bucket):
+   *   • Operating  — current assets, current liabilities, plus a synthetic "Depreciation &
+   *                  Amortization" add-back from accumulated-depreciation contra-asset deltas.
+   *   • Investing  — long-term assets (subtype 'fixed_asset' or 'intangible_asset').
+   *   • Financing  — long-term liabilities + ALL equity accounts (including Retained Earnings).
+   *
+   * Bug fixes vs prior version:
+   *   #1 Intangibles now included in Investing (previously misclassified as Operating).
+   *   #2 Retained Earnings now included in Financing (previously excluded with `code !== '3100'`,
+   *      which broke reconciliation whenever a closing entry was posted inside the period).
+   *      The exclusion was based on a misunderstanding of the indirect-method identity:
+   *      RE-balance only changes via closing JEs (a discrete past-period transfer), while
+   *      current-period earnings live in income/expense accounts and are captured by NetIncome.
+   *      The two are independent — both belong in the cash flow statement.
+   *   #3 Explicit Depreciation & Amortization add-back line in Operating.
+   *   #4 Robust handling of NULL/missing subtype — falls back to "current asset" / "current
+   *      liability" classification with a warning in the response so the UI can flag the
+   *      misconfiguration. The schema was also tightened to require subtype on new accounts.
+   */
+  async cashFlowStatement(fromDate: string, toDate: string) {
+    const all = await this.listAccounts();
+    const beforeFrom = (() => {
+      const d = new Date(fromDate + "T00:00:00Z");
+      d.setUTCDate(d.getUTCDate() - 1);
+      return d.toISOString().slice(0, 10);
+    })();
+    const startBalances = await this.accountBalances(beforeFrom);
+    const endBalances = await this.accountBalances(toDate);
+
+    const change = (acctId: number) => {
+      const s = startBalances.get(acctId)?.balance || 0;
+      const e = endBalances.get(acctId)?.balance || 0;
+      return (e - s);
+    };
+
+    const pl = await this.profitAndLoss(fromDate, toDate);
+    const netIncome = pl.netIncome;
+
+    // Track unclassified accounts for diagnostic warnings
+    const warnings: string[] = [];
+
+    // Helper: subtype tests with NULL-safe behavior
+    const isLongTermAsset = (a: typeof all[number]) =>
+      a.type === "asset" && (a.subtype === "fixed_asset" || a.subtype === "intangible_asset");
+    const isAccumDepreciation = (a: typeof all[number]) =>
+      a.type === "asset" &&
+      (a.subtype === "accumulated_depreciation" ||
+        a.subtype === "accumulated_amortization" ||
+        /^accumulated\b.*(depreciation|amortization)/i.test(a.name));
+    const isLongTermLiability = (a: typeof all[number]) =>
+      a.type === "liability" && a.subtype === "long_term_liability";
+    const isBank = (a: typeof all[number]) => a.subtype === "bank";
+
+    // ---------- OPERATING ACTIVITIES ----------
+    const operatingItems: Array<{ label: string; amount: number }> = [
+      { label: "Net Income", amount: netIncome },
+    ];
+
+    // Fix #3: Depreciation & Amortization add-back.
+    // Accumulated depreciation is a contra-asset. As depreciation is recorded, its balance becomes
+    // more negative (Cr Accum Dep). The period's depreciation expense equals the negative of the
+    // change in accumulated-depreciation balance. We add this back to NI as a non-cash adjustment.
+    let depreciationAddback = 0;
+    for (const a of all.filter(isAccumDepreciation)) {
+      const ch = change(a.id);
+      if (ch === 0) continue;
+      // accountBalances signs assets as (debit - credit), so accumulated dep typically has a negative balance.
+      // A more negative balance (ch < 0) means MORE depreciation was recorded → add back |ch|.
+      depreciationAddback += -ch;
+    }
+    depreciationAddback = depreciationAddback;
+    if (depreciationAddback !== 0) {
+      operatingItems.push({ label: "Depreciation & Amortization", amount: depreciationAddback });
+    }
+
+    // Working capital changes — current assets and current liabilities
+    for (const a of all) {
+      const ch = change(a.id);
+      if (ch === 0) continue;
+      if (isBank(a)) continue;                        // cash itself
+      if (a.type === "income" || a.type === "expense") continue;  // already in NI
+      if (isLongTermAsset(a)) continue;               // → Investing
+      if (isAccumDepreciation(a)) continue;           // already handled as add-back
+      if (isLongTermLiability(a)) continue;           // → Financing
+      if (a.type === "equity") continue;              // → Financing
+
+      if (a.type === "asset") {
+        // Current asset (default for asset without long-term subtype)
+        if (a.subtype !== "current_asset" && a.subtype !== null && a.subtype !== undefined && a.subtype !== "") {
+          // Unknown subtype: classify as current but warn
+          warnings.push(`Account "${a.name}" (${a.code}) has unrecognized subtype "${a.subtype}" — treated as current asset.`);
+        }
+        operatingItems.push({ label: `Change in ${a.name}`, amount: -ch });
+      } else if (a.type === "liability") {
+        if (
+          a.subtype !== "current_liability" &&
+          a.subtype !== "credit_card" &&
+          a.subtype !== null && a.subtype !== undefined && a.subtype !== ""
+        ) {
+          warnings.push(`Account "${a.name}" (${a.code}) has unrecognized subtype "${a.subtype}" — treated as current liability.`);
+        }
+        operatingItems.push({ label: `Change in ${a.name}`, amount: ch });
+      }
+    }
+    const operatingTotal = operatingItems.reduce((s, i) => s + i.amount, 0);
+
+    // ---------- INVESTING ACTIVITIES ----------
+    const investingItems: Array<{ label: string; amount: number }> = [];
+    for (const a of all.filter(isLongTermAsset)) {
+      const ch = change(a.id);
+      if (ch === 0) continue;
+      const verb = a.subtype === "intangible_asset" ? "Investment in" : "Purchase/sale of";
+      investingItems.push({ label: `${verb} ${a.name}`, amount: -ch });
+    }
+    const investingTotal = investingItems.reduce((s, i) => s + i.amount, 0);
+
+    // ---------- FINANCING ACTIVITIES ----------
+    // Fix #2: Include ALL equity accounts (including Retained Earnings) without any offset.
+    //
+    // The previous code excluded code='3100' under the false belief that "Net Income captures it."
+    // That's incorrect. The accounting identity is:
+    //   ΔCash = ΔLiabilities + ΔEquity + NetIncomeForPeriod − ΔOtherAssets
+    // where ΔEquity is the change in equity-account BALANCES (which only includes RE movement
+    // from closing entries, not current-period earnings — those still sit in income/expense accounts
+    // and are captured by NetIncomeForPeriod via profitAndLoss).
+    //
+    // When a closing entry fires inside the period, profitAndLoss correctly nets the closing-JE's
+    // debit to Income against current-period sales credits, giving the right NI for the period.
+    // RE's balance change (+prior_year_NI) shows up in Financing as the actual transfer it represents.
+    // The math works out — no manual offsetting required.
+    const financingItems: Array<{ label: string; amount: number }> = [];
+    for (const a of all.filter((x) => x.type === "equity")) {
+      const ch = change(a.id);
+      if (ch === 0) continue;
+      financingItems.push({ label: `Change in ${a.name}`, amount: ch });
+    }
+    for (const a of all.filter(isLongTermLiability)) {
+      const ch = change(a.id);
+      if (ch === 0) continue;
+      financingItems.push({ label: `Change in ${a.name}`, amount: ch });
+    }
+    const financingTotal = financingItems.reduce((s, i) => s + i.amount, 0);
+
+    const netCashChange = (operatingTotal + investingTotal + financingTotal);
+
+    // ---------- DETECT YEAR-END CLOSE INSIDE PERIOD (UX warning) ----------
+    // If a closing entry was posted inside the cash flow period, the math is still correct
+    // (the engine reconciles), but the "Net Income" line shown to the user mixes current-period
+    // earnings with a debit from the closing entry. Flag this so the UI can suggest the user
+    // run separate reports for the two sub-periods.
+    const closingInPeriod = (await pool.query(`
+      SELECT COUNT(*) AS c FROM journal_entries
+      WHERE date >= $1 AND date <= $2
+        AND (memo LIKE 'Year-end close%' OR reference LIKE 'YE-%')
+    `, [fromDate, toDate])).rows[0] as { c: number } | undefined;
+    if (closingInPeriod && closingInPeriod.c > 0) {
+      warnings.push(
+        "A year-end-close entry was posted inside this date range. The Net Income line above mixes earnings from before and after the close. " +
+        "For clearer reporting, consider running two separate cash flow reports: one ending on the fiscal year-end, one starting the day after."
+      );
+    }
+
+
+    const cashAccts = all.filter(isBank);
+    const cashStart = cashAccts.reduce((s, a) => s + (startBalances.get(a.id)?.balance || 0), 0);
+    const cashEnd = cashAccts.reduce((s, a) => s + (endBalances.get(a.id)?.balance || 0), 0);
+    const reconciliationGap = (cashEnd - cashStart - netCashChange);
+
+    return {
+      fromDate,
+      toDate,
+      operating: { items: operatingItems, total: operatingTotal },
+      investing: { items: investingItems, total: investingTotal },
+      financing: { items: financingItems, total: financingTotal },
+      netCashChange,
+      cashStart,
+      cashEnd,
+      reconciliationGap,
+      reconciles: reconciliationGap === 0, // exact — integer cents
+      warnings,
+    };
+  }
+
+  // ============================================================================
+  // CUSTOMER STATEMENT — invoices + payments for one customer in a date range
+  // ============================================================================
+  async customerStatement(customerId: number, fromDate: string, toDate: string) {
+    const cust = await db.select().from(customers).where(and(eq(customers.id, customerId), eq(customers.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!cust) throw new Error("Customer not found");
+
+    // Opening balance: A/R activity for this customer strictly before fromDate.
+    // We approximate by summing invoices.total - payments before from.
+    const allInv = await db
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.customerId, customerId), eq(invoices.orgId, currentOrgId())));
+
+    let openingBalance = 0;
+    const activity: Array<{
+      date: string;
+      type: "invoice" | "payment";
+      reference: string;
+      description: string;
+      charge: number;
+      payment: number;
+      balance: number;
+    }> = [];
+
+    // Payment events: journal entries whose reference matches one of this customer's invoice numbers.
+    // We require a credit on A/R (code 1100) — that's how invoice payments hit the GL — to filter out
+    // unrelated entries that happen to share the same reference. Source values vary ('payment' for the
+    // direct payInvoice flow, 'invoice_payment' for bank-match flow), so we look at GL impact, not source.
+    const invByNumber = new Map(allInv.map((i) => [i.number, i]));
+    let payments: Array<{ date: string; reference: string | null; memo: string | null; debit: number }> = [];
+    if (invByNumber.size > 0) {
+      // PostgreSQL: pass the number list as an array (= ANY($1)); HAVING cannot
+      // reference SELECT aliases, so the aggregate expression is repeated.
+      const rows = (await pool.query(`
+        SELECT je.date, je.reference, je.memo,
+               COALESCE(SUM(CASE WHEN ar.id = jl.account_id THEN jl.credit ELSE 0 END), 0) AS ar_credit,
+               COALESCE(SUM(CASE WHEN bank.subtype = 'bank' AND jl.account_id = bank.id THEN jl.debit ELSE 0 END), 0) AS bank_debit
+        FROM journal_entries je
+        INNER JOIN journal_lines jl ON jl.entry_id = je.id
+        INNER JOIN accounts ar ON ar.code = '1100' AND ar.org_id = $2
+        LEFT JOIN accounts bank ON bank.id = jl.account_id AND bank.subtype = 'bank'
+        WHERE je.reference = ANY($1)
+          AND je.source IN ('payment', 'invoice_payment')
+          AND je.org_id = $2
+        GROUP BY je.id, je.date, je.reference, je.memo
+        HAVING COALESCE(SUM(CASE WHEN ar.id = jl.account_id THEN jl.credit ELSE 0 END), 0) > 0
+      `, [Array.from(invByNumber.keys()), currentOrgId()])).rows as Array<{ date: string; reference: string | null; memo: string | null; ar_credit: number; bank_debit: number }>;
+      payments = rows.map((r) => ({ date: r.date, reference: r.reference, memo: r.memo, debit: r.ar_credit }));
+    }
+
+    type Evt = { date: string; type: "invoice" | "payment"; reference: string; description: string; charge: number; payment: number };
+    const events: Evt[] = [];
+    for (const inv of allInv) {
+      events.push({
+        date: inv.date,
+        type: "invoice",
+        reference: inv.number,
+        description: `Invoice ${inv.number}`,
+        charge: inv.total,
+        payment: 0,
+      });
+    }
+    for (const p of payments) {
+      if (!p.reference) continue;
+      const inv = invByNumber.get(p.reference);
+      if (!inv) continue;
+      events.push({
+        date: p.date,
+        type: "payment",
+        reference: p.reference,
+        description: `Payment: ${p.memo || p.reference}`,
+        charge: 0,
+        payment: p.debit,
+      });
+    }
+
+    events.sort((a, b) => a.date.localeCompare(b.date) || a.type.localeCompare(b.type));
+
+    let running = 0;
+    for (const e of events) {
+      running = (running + e.charge - e.payment);
+      if (e.date < fromDate) {
+        openingBalance = running;
+        continue;
+      }
+      if (e.date > toDate) break;
+      activity.push({ ...e, balance: running });
+    }
+
+    const totalCharges = activity.reduce((s, a) => s + a.charge, 0);
+    const totalPayments = activity.reduce((s, a) => s + a.payment, 0);
+    const closingBalance = running;
+
+    return {
+      customer: cust,
+      fromDate,
+      toDate,
+      openingBalance,
+      activity,
+      totalCharges,
+      totalPayments,
+      closingBalance,
+    };
+  }
+
+  // ============================================================================
+  // VENDOR STATEMENT — bills + payments for one vendor in a date range
+  // ============================================================================
+  async vendorStatement(vendorId: number, fromDate: string, toDate: string) {
+    const ven = await db.select().from(vendors).where(and(eq(vendors.id, vendorId), eq(vendors.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!ven) throw new Error("Vendor not found");
+
+    const allBills = await db
+      .select()
+      .from(bills)
+      .where(and(eq(bills.vendorId, vendorId), eq(bills.orgId, currentOrgId())));
+
+    // Payment events: journal entries whose reference matches one of this vendor's bill numbers AND
+    // that have a debit to A/P (code 2000). Source can be 'payment' or 'bill_payment'.
+    const billByNumber = new Map(allBills.map((b) => [b.number, b]));
+    let payments: Array<{ date: string; reference: string | null; memo: string | null; credit: number }> = [];
+    if (billByNumber.size > 0) {
+      const rows = (await pool.query(`
+        SELECT je.date, je.reference, je.memo,
+               COALESCE(SUM(CASE WHEN ap.id = jl.account_id THEN jl.debit ELSE 0 END), 0) AS ap_debit
+        FROM journal_entries je
+        INNER JOIN journal_lines jl ON jl.entry_id = je.id
+        INNER JOIN accounts ap ON ap.code = '2000' AND ap.org_id = $2
+        WHERE je.reference = ANY($1)
+          AND je.source IN ('payment', 'bill_payment')
+          AND je.org_id = $2
+        GROUP BY je.id, je.date, je.reference, je.memo
+        HAVING COALESCE(SUM(CASE WHEN ap.id = jl.account_id THEN jl.debit ELSE 0 END), 0) > 0
+      `, [Array.from(billByNumber.keys()), currentOrgId()])).rows as Array<{ date: string; reference: string | null; memo: string | null; ap_debit: number }>;
+      payments = rows.map((r) => ({ date: r.date, reference: r.reference, memo: r.memo, credit: r.ap_debit }));
+    }
+
+    type Evt = { date: string; type: "bill" | "payment"; reference: string; description: string; charge: number; payment: number };
+    const events: Evt[] = [];
+    for (const b of allBills) {
+      events.push({
+        date: b.date,
+        type: "bill",
+        reference: b.number,
+        description: `Bill ${b.number}`,
+        charge: b.total,
+        payment: 0,
+      });
+    }
+    for (const p of payments) {
+      if (!p.reference) continue;
+      const bill = billByNumber.get(p.reference);
+      if (!bill) continue;
+      events.push({
+        date: p.date,
+        type: "payment",
+        reference: p.reference,
+        description: `Payment: ${p.memo || p.reference}`,
+        charge: 0,
+        payment: p.credit,
+      });
+    }
+    events.sort((a, b) => a.date.localeCompare(b.date) || a.type.localeCompare(b.type));
+
+    let running = 0;
+    let openingBalance = 0;
+    const activity: Array<{ date: string; type: "bill" | "payment"; reference: string; description: string; charge: number; payment: number; balance: number }> = [];
+    for (const e of events) {
+      running = (running + e.charge - e.payment);
+      if (e.date < fromDate) {
+        openingBalance = running;
+        continue;
+      }
+      if (e.date > toDate) break;
+      activity.push({ ...e, balance: running });
+    }
+
+    const totalCharges = activity.reduce((s, a) => s + a.charge, 0);
+    const totalPayments = activity.reduce((s, a) => s + a.payment, 0);
+    const closingBalance = running;
+
+    return {
+      vendor: ven,
+      fromDate,
+      toDate,
+      openingBalance,
+      activity,
+      totalCharges,
+      totalPayments,
+      closingBalance,
+    };
+  }
+
+  // ============================================================================
+  // ATTACHMENTS
+  // ============================================================================
+  // Entity ownership is verified BEFORE any blob write: entity_id alone is
+  // guessable (global sequences), so the entity row must exist under
+  // currentOrgId() — the same rule as every other lookup in this file.
+  async assertAttachmentEntity(entityType: string, entityId: number): Promise<void> {
+    const table =
+      entityType === "invoice" ? "invoices" :
+      entityType === "bill" ? "bills" :
+      entityType === "bank_transaction" ? "bank_transactions" :
+      entityType === "journal_entry" ? "journal_entries" : null;
+    if (!table) throw new Error(`Unsupported entity type "${entityType}"`);
+    const r = (await pool.query(`SELECT 1 FROM ${table} WHERE id = $1 AND org_id = $2`, [entityId, currentOrgId()])).rows[0];
+    if (!r) throw new Error(`${entityType.replace("_", " ")} not found`);
+  }
+
+  async createAttachment(input: {
+    entityType: string; entityId: number; filename: string; mimeType: string; sizeBytes: number; storageKey: string;
+  }): Promise<{ id: number }> {
+    const r = (await pool.query(
+      `INSERT INTO attachments (org_id, entity_type, entity_id, filename, mime_type, size_bytes, storage_key, uploaded_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [currentOrgId(), input.entityType, input.entityId, input.filename, input.mimeType, input.sizeBytes, input.storageKey, currentUserId() ?? null]
+    )).rows[0];
+    await this.audit("upload", "attachment", Number(r.id), `Attached "${input.filename}" (${input.mimeType}, ${input.sizeBytes} bytes) to ${input.entityType} #${input.entityId}`);
+    return { id: Number(r.id) };
+  }
+
+  async getAttachment(id: number): Promise<{ id: number; entityType: string; entityId: number; filename: string; mimeType: string; sizeBytes: number; storageKey: string } | undefined> {
+    const r = (await pool.query(
+      `SELECT id, entity_type AS "entityType", entity_id AS "entityId", filename, mime_type AS "mimeType",
+              size_bytes AS "sizeBytes", storage_key AS "storageKey"
+         FROM attachments WHERE id = $1 AND org_id = $2`,
+      [id, currentOrgId()]
+    )).rows[0];
+    return r as any || undefined;
+  }
+
+  async listAttachments(entityType: string, entityId: number): Promise<any[]> {
+    return (await pool.query(
+      `SELECT id, filename, mime_type AS "mimeType", size_bytes AS "sizeBytes", created_at AS "createdAt"
+         FROM attachments WHERE org_id = $1 AND entity_type = $2 AND entity_id = $3 ORDER BY id DESC`,
+      [currentOrgId(), entityType, entityId]
+    )).rows;
+  }
+
+  async deleteAttachment(id: number): Promise<{ storageKey: string }> {
+    const r = (await pool.query(
+      `DELETE FROM attachments WHERE id = $1 AND org_id = $2 RETURNING storage_key AS "storageKey", filename`,
+      [id, currentOrgId()]
+    )).rows[0];
+    if (!r) throw new Error("Attachment not found");
+    await this.audit("delete", "attachment", id, `Deleted attachment "${r.filename}"`);
+    return { storageKey: r.storageKey };
+  }
+
+  // ============================================================================
+  // REPORT PACK (Phase 3): sales by customer, expenses by vendor, monthly P&L,
+  // budgets + budget-vs-actual. All figures BASE-currency integer cents.
+  // DATE GROUPING NOTE: dates are TEXT "YYYY-MM-DD" throughout the schema, so
+  // substr(date, 1, 7) = "YYYY-MM" is an EXACT calendar-month grouping — no
+  // timezone drift, no date_trunc needed.
+  // ============================================================================
+
+  async salesByCustomer(fromDate: string, toDate: string) {
+    // invoiced = non-void invoice totals; credited = issued/applied credit
+    // notes; paid = amount_paid on those invoices; balance = net - paid.
+    const rows = (await pool.query(`
+      SELECT c.id AS "customerId", c.name AS "customerName",
+             COALESCE(inv.invoiced, 0)::int AS invoiced,
+             COALESCE(cn.credited, 0)::int AS credited,
+             (COALESCE(inv.invoiced, 0) - COALESCE(cn.credited, 0))::int AS net,
+             COALESCE(inv.paid, 0)::int AS paid,
+             (COALESCE(inv.invoiced, 0) - COALESCE(cn.credited, 0) - COALESCE(inv.paid, 0))::int AS balance
+        FROM customers c
+        LEFT JOIN (
+          SELECT customer_id, SUM(total) AS invoiced, SUM(amount_paid) AS paid
+            FROM invoices
+           WHERE org_id = $1 AND status != 'void' AND date >= $2 AND date <= $3
+           GROUP BY customer_id
+        ) inv ON inv.customer_id = c.id
+        LEFT JOIN (
+          SELECT customer_id, SUM(total) AS credited
+            FROM credit_notes
+           WHERE org_id = $1 AND status NOT IN ('void','draft') AND date >= $2 AND date <= $3
+           GROUP BY customer_id
+        ) cn ON cn.customer_id = c.id
+       WHERE c.org_id = $1
+         AND (inv.invoiced IS NOT NULL OR cn.credited IS NOT NULL)
+       ORDER BY net DESC, c.name
+    `, [currentOrgId(), fromDate, toDate])).rows;
+    return rows;
+  }
+
+  async expensesByVendor(fromDate: string, toDate: string) {
+    const rows = (await pool.query(`
+      SELECT v.id AS "vendorId", v.name AS "vendorName",
+             COALESCE(b.billed, 0)::int AS billed,
+             COALESCE(dn.debited, 0)::int AS debited,
+             (COALESCE(b.billed, 0) - COALESCE(dn.debited, 0))::int AS net,
+             COALESCE(b.paid, 0)::int AS paid,
+             (COALESCE(b.billed, 0) - COALESCE(dn.debited, 0) - COALESCE(b.paid, 0))::int AS balance
+        FROM vendors v
+        LEFT JOIN (
+          SELECT vendor_id, SUM(total) AS billed, SUM(amount_paid) AS paid
+            FROM bills
+           WHERE org_id = $1 AND status != 'void' AND date >= $2 AND date <= $3
+           GROUP BY vendor_id
+        ) b ON b.vendor_id = v.id
+        LEFT JOIN (
+          SELECT vendor_id, SUM(total) AS debited
+            FROM debit_notes
+           WHERE org_id = $1 AND status NOT IN ('void','draft') AND date >= $2 AND date <= $3
+           GROUP BY vendor_id
+        ) dn ON dn.vendor_id = v.id
+       WHERE v.org_id = $1
+         AND (b.billed IS NOT NULL OR dn.debited IS NOT NULL)
+       ORDER BY net DESC, v.name
+    `, [currentOrgId(), fromDate, toDate])).rows;
+    return rows;
+  }
+
+  async profitLossMonthly(fromDate: string, toDate: string) {
+    // One SQL pass: month bucket via substr(date,1,7) (exact — TEXT dates),
+    // income sign = credit-normal, expense = debit-normal.
+    const rows = (await pool.query(`
+      SELECT substr(je.date, 1, 7) AS month,
+             a.id AS "accountId", a.code, a.name, a.type,
+             SUM(CASE WHEN a.type = 'income' THEN jl.credit - jl.debit ELSE jl.debit - jl.credit END)::int AS amount
+        FROM journal_lines jl
+        JOIN journal_entries je ON je.id = jl.entry_id
+        JOIN accounts a ON a.id = jl.account_id
+       WHERE je.org_id = $1 AND a.org_id = $1
+         AND a.type IN ('income', 'expense')
+         AND je.date >= $2 AND je.date <= $3
+       GROUP BY substr(je.date, 1, 7), a.id, a.code, a.name, a.type
+       ORDER BY a.code, month
+    `, [currentOrgId(), fromDate, toDate])).rows as Array<{ month: string; accountId: number; code: string; name: string; type: string; amount: number }>;
+
+    // Pivot: one column per calendar month present in the range.
+    const months = Array.from(new Set(rows.map((r) => r.month))).sort();
+    const byAccount = new Map<number, { accountId: number; code: string; name: string; type: string; byMonth: Record<string, number>; total: number }>();
+    for (const r of rows) {
+      let acc = byAccount.get(r.accountId);
+      if (!acc) {
+        acc = { accountId: r.accountId, code: r.code, name: r.name, type: r.type, byMonth: {}, total: 0 };
+        byAccount.set(r.accountId, acc);
+      }
+      acc.byMonth[r.month] = (acc.byMonth[r.month] ?? 0) + Number(r.amount);
+      acc.total += Number(r.amount);
+    }
+    const accounts = Array.from(byAccount.values());
+    const netByMonth: Record<string, number> = {};
+    for (const m of months) {
+      netByMonth[m] = accounts.reduce((s, a) => s + (a.type === "income" ? (a.byMonth[m] ?? 0) : -(a.byMonth[m] ?? 0)), 0);
+    }
+    return { months, accounts, netByMonth };
+  }
+
+  // ---------------- Budgets ----------------
+  async listBudgets() {
+    return (await pool.query(
+      `SELECT id, name, fiscal_year AS "fiscalYear", created_at AS "createdAt" FROM budgets WHERE org_id = $1 ORDER BY fiscal_year DESC, id DESC`,
+      [currentOrgId()]
+    )).rows;
+  }
+
+  async getBudget(id: number) {
+    const b = (await pool.query(`SELECT id, name, fiscal_year AS "fiscalYear" FROM budgets WHERE id = $1 AND org_id = $2`, [id, currentOrgId()])).rows[0];
+    if (!b) return undefined;
+    const lines = (await pool.query(
+      `SELECT bl.id, bl.account_id AS "accountId", a.code, a.name AS "accountName", bl.month, bl.amount
+         FROM budget_lines bl JOIN accounts a ON a.id = bl.account_id
+        WHERE bl.budget_id = $1 AND bl.org_id = $2 ORDER BY a.code, bl.month`,
+      [id, currentOrgId()]
+    )).rows;
+    return { ...b, lines };
+  }
+
+  async createBudget(input: { name: string; fiscalYear: number }) {
+    const r = (await pool.query(
+      `INSERT INTO budgets (org_id, name, fiscal_year) VALUES ($1, $2, $3) RETURNING id, name, fiscal_year AS "fiscalYear"`,
+      [currentOrgId(), input.name, input.fiscalYear]
+    )).rows[0];
+    await this.audit("create", "budget", Number(r.id), `Created budget "${input.name}" (FY${input.fiscalYear})`);
+    return r;
+  }
+
+  // Replace-style line upsert: lines for (account, month) are set to the given
+  // integer-cent amounts; the UNIQUE(budget_id, account_id, month) key makes
+  // this idempotent.
+  async setBudgetLines(budgetId: number, lines: Array<{ accountId: number; month: number; amount: number }>) {
+    const b = (await pool.query(`SELECT id FROM budgets WHERE id = $1 AND org_id = $2`, [budgetId, currentOrgId()])).rows[0];
+    if (!b) throw new Error("Budget not found");
+    // Every referenced account must belong to this org.
+    for (const l of lines) {
+      const a = (await pool.query(`SELECT 1 FROM accounts WHERE id = $1 AND org_id = $2`, [l.accountId, currentOrgId()])).rows[0];
+      if (!a) throw new Error(`Account ${l.accountId} not found`);
+    }
+    await db.transaction(async () => {
+      for (const l of lines) {
+        await pool.query(
+          `INSERT INTO budget_lines (org_id, budget_id, account_id, month, amount)
+           VALUES ($1,$2,$3,$4,$5)
+           ON CONFLICT (budget_id, account_id, month) DO UPDATE SET amount = EXCLUDED.amount`,
+          [currentOrgId(), budgetId, l.accountId, l.month, l.amount]
+        );
+      }
+    });
+    await this.audit("update", "budget", budgetId, `Set ${lines.length} budget line(s)`);
+    return { ok: true };
+  }
+
+  async deleteBudget(id: number) {
+    const r = await pool.query(`DELETE FROM budgets WHERE id = $1 AND org_id = $2`, [id, currentOrgId()]);
+    if ((r.rowCount ?? 0) === 0) throw new Error("Budget not found");
+    await this.audit("delete", "budget", id, `Deleted budget #${id}`);
+    return { ok: true };
+  }
+
+  // Budget vs actual: budget = sum of budget_lines whose month falls inside
+  // [from,to] (months of the budget's fiscal year); actual = P&L activity for
+  // the same account and range. Variance sign convention: income variance =
+  // actual - budget (over-performing is positive); expense variance =
+  // budget - actual (underspending is positive) — the convention accountants
+  // expect on a management pack.
+  async budgetVsActual(budgetId: number, fromDate: string, toDate: string) {
+    const budget = (await pool.query(`SELECT id, name, fiscal_year AS "fiscalYear" FROM budgets WHERE id = $1 AND org_id = $2`, [budgetId, currentOrgId()])).rows[0];
+    if (!budget) throw new Error("Budget not found");
+    const fy = Number(budget.fiscalYear);
+    // Which of the budget's months land inside the requested range?
+    const monthsInRange: number[] = [];
+    for (let m = 1; m <= 12; m++) {
+      const monthKey = `${fy}-${String(m).padStart(2, "0")}`;
+      if (monthKey >= fromDate.slice(0, 7) && monthKey <= toDate.slice(0, 7)) monthsInRange.push(m);
+    }
+    const rows = (await pool.query(`
+      SELECT a.id AS "accountId", a.code, a.name, a.type,
+             COALESCE(bl.budget, 0)::int AS budget,
+             COALESCE(act.actual, 0)::int AS actual
+        FROM accounts a
+        LEFT JOIN (
+          SELECT account_id, SUM(amount) AS budget
+            FROM budget_lines
+           WHERE budget_id = $1 AND org_id = $2 AND month = ANY($5::int[])
+           GROUP BY account_id
+        ) bl ON bl.account_id = a.id
+        LEFT JOIN (
+          SELECT jl.account_id,
+                 SUM(CASE WHEN a2.type = 'income' THEN jl.credit - jl.debit ELSE jl.debit - jl.credit END) AS actual
+            FROM journal_lines jl
+            JOIN journal_entries je ON je.id = jl.entry_id
+            JOIN accounts a2 ON a2.id = jl.account_id
+           WHERE je.org_id = $2 AND a2.org_id = $2 AND a2.type IN ('income','expense')
+             AND je.date >= $3 AND je.date <= $4
+           GROUP BY jl.account_id
+        ) act ON act.account_id = a.id
+       WHERE a.org_id = $2 AND a.type IN ('income','expense')
+         AND (bl.budget IS NOT NULL OR act.actual IS NOT NULL)
+       ORDER BY a.code
+    `, [budgetId, currentOrgId(), fromDate, toDate, monthsInRange])).rows as any[];
+    return {
+      budget,
+      from: fromDate,
+      to: toDate,
+      rows: rows.map((r) => {
+        const budgetC = Number(r.budget), actualC = Number(r.actual);
+        const variance = r.type === "income" ? actualC - budgetC : budgetC - actualC;
+        return {
+          ...r,
+          budget: budgetC,
+          actual: actualC,
+          variance,
+          variancePct: budgetC !== 0 ? Math.round((variance / Math.abs(budgetC)) * 10000) / 100 : null,
+        };
+      }),
+    };
+  }
 }
 
-export const arAging = (orgId: number, asOf: string): AgingRow[] => aging(orgId, "invoices", "customers", "customer_id", asOf);
-export const apAging = (orgId: number, asOf: string): AgingRow[] => aging(orgId, "bills", "vendors", "vendor_id", asOf);
-
-export interface CashFlowReport {
-  from: string;
-  to: string;
-  openingCash: number;
-  receipts: number;
-  payments: number;
-  netChange: number;
-  closingCash: number;
-  byAccount: Array<{ code: string; name: string; opening: number; inflow: number; outflow: number; closing: number }>;
-}
-
-/** Cash-basis cash flow over bank-subtype accounts (direct method). */
-export function cashFlow(orgId: number, from: string, to: string): CashFlowReport {
-  const banks = db
-    .prepare("SELECT id, code, name FROM accounts WHERE org_id = ? AND subtype = 'bank' ORDER BY code")
-    .all(orgId) as Array<{ id: number; code: string; name: string }>;
-  const byAccount = banks.map((b) => {
-    const opening = (db
-      .prepare(
-        `SELECT COALESCE(SUM(jl.debit - jl.credit), 0) AS bal FROM journal_lines jl
-         JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = jl.org_id
-         WHERE jl.org_id = ? AND jl.account_id = ? AND je.date < ?`,
-      )
-      .get(orgId, b.id, from) as { bal: number }).bal;
-    const flow = db
-      .prepare(
-        `SELECT COALESCE(SUM(jl.debit), 0) AS inflow, COALESCE(SUM(jl.credit), 0) AS outflow FROM journal_lines jl
-         JOIN journal_entries je ON je.id = jl.entry_id AND je.org_id = jl.org_id
-         WHERE jl.org_id = ? AND jl.account_id = ? AND je.date BETWEEN ? AND ?`,
-      )
-      .get(orgId, b.id, from, to) as { inflow: number; outflow: number };
-    return { code: b.code, name: b.name, opening, inflow: flow.inflow, outflow: flow.outflow, closing: opening + flow.inflow - flow.outflow };
-  });
-  const openingCash = byAccount.reduce((s, a) => s + a.opening, 0);
-  const receipts = byAccount.reduce((s, a) => s + a.inflow, 0);
-  const payments = byAccount.reduce((s, a) => s + a.outflow, 0);
-  return { from, to, openingCash, receipts, payments, netChange: receipts - payments, closingCash: openingCash + receipts - payments, byAccount };
-}
+export const storage = new DatabaseStorage();

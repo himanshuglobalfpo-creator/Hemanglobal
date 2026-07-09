@@ -1,235 +1,283 @@
 # LedgerLite
 
-Multi-tenant, double-entry accounting SaaS. Node 20+ / TypeScript / Express /
-SQLite (better-sqlite3) / Zod. Vanilla-JS single-page client served statically.
+A multi-tenant accounting SaaS — invoices, bills, banking, double-entry journal,
+period close, and the full standard report set (P&L, Balance Sheet, Trial Balance,
+Cash Flow, A/R Aging, A/P Aging, General Ledger, Tax Liability).
 
-**Global rules** (enforced everywhere):
+Built with TypeScript, Express, React, Drizzle ORM, and SQLite (Postgres-ready).
 
-- Every business row is **org-scoped** (`org_id` column + index + FK).
-- Multi-statement writes run inside **transactions** (`db.transaction`).
-- Money is **integer cents**; dates are **TEXT `YYYY-MM-DD`** (so
-  `substr(date,1,7)` is an exact month bucket — used by the monthly P&L).
-- Validation lives in **`shared/schema.ts`** (Zod).
-- Schema changes are **numbered idempotent migrations** in `migrations/`,
-  applied once each and recorded in `schema_migrations`.
+---
 
 ## Quick start
 
 ```bash
+# 1. Install
 npm install
-npm start            # http://localhost:3000
-npm run check        # tsc --noEmit
-npm test             # tsc --noEmit + eslint + node --test (53 tests)
+
+# 2. Configure
+cp .env.example .env
+# Edit .env — at minimum set APP_BASE_URL. Email/Stripe/Plaid are optional.
+
+# 3. Run
+npm run dev          # http://localhost:5000
+
+# 4. Sign up
+# Open the URL above and create your first account.
+# The first user becomes the owner of a new organization.
 ```
 
-Register an account in the UI — this creates your org, seeds the chart of
-accounts (including FX Gain 4950 / FX Loss 6950), and signs you in as owner.
-
-## Deploying
+### Production
 
 ```bash
-# Bare metal / VM (Node 20+):
-cp .env.example .env            # set a strong VAULT_KEY
-npm ci --omit=dev               # tsx is a runtime dependency; dev types excluded
-NODE_ENV=production npm start   # put nginx/caddy in front for HTTPS
-
-# Docker:
-docker build -t ledgerlite .
-docker run -d -p 3000:3000 -e VAULT_KEY="$(openssl rand -hex 32)" \
-  -v ledgerlite-data:/data ledgerlite
+docker compose up -d
 ```
 
-Production checklist: strong `VAULT_KEY`, HTTPS termination in front
-(`NODE_ENV=production` turns on secure cookies), and scheduled backups of
-`DATA_DIR` (SQLite DB + local uploads). Migrations run automatically on boot
-and are idempotent, so upgrades are: pull, install, restart.
+Or without Docker:
 
-## Environment variables
+```bash
+npm run build
+NODE_ENV=production npm start
+```
 
-| Variable       | Default                      | Purpose |
-|----------------|------------------------------|---------|
-| `PORT`         | `3000`                       | HTTP port |
-| `DATA_DIR`     | `./data`                     | Root for SQLite DB + local uploads |
-| `DB_PATH`      | `./data/ledgerlite.db`       | SQLite file (`:memory:` when `NODE_ENV=test`) |
-| `VAULT_KEY`    | dev fallback (change it!)    | Key for crypto-vault v1 (AES-256-GCM) — encrypts TOTP secrets |
-| `FILE_STORAGE` | `local`                      | Attachment driver: `local` or `s3` |
-| `FILE_DIR`     | `./data/uploads`             | Local attachment directory (`<orgId>/<uuid>` keys) |
-| `S3_ENDPOINT`  | —                            | S3-compatible endpoint (required for `FILE_STORAGE=s3`) |
-| `S3_BUCKET`    | —                            | Bucket name |
-| `S3_KEY`       | —                            | Access key id |
-| `S3_SECRET`    | —                            | Secret access key |
-| `S3_REGION`    | `us-east-1`                  | SigV4 region |
-| `NODE_ENV`     | —                            | `production` enables secure cookies; `test` uses in-memory DB |
+---
 
-## Migrations
+## Features
 
-| File | Contents |
-|------|----------|
-| `0001_init.sql` | Base schema: orgs, users, org_users, sessions, accounts, customers, vendors, journal, invoices/lines, bills/lines, credit_notes, bank_transactions, closed_periods, audit_log |
-| `0002_multi_currency.sql` | Customer/vendor `currency`; invoice/bill `currency`, `fx_rate`, `foreign_*` cents; `fx_rates` table |
-| `0003_mfa.sql` | `users.totp_secret` (vault-encrypted), `totp_enabled`, `recovery_codes`; `mfa_challenges` |
-| `0004_attachments.sql` | `attachments` (entity-typed, org-scoped) |
-| `0005_budgets.sql` | `budgets`, `budget_lines` (month 1–12, integer cents) |
-| `0006_webhooks.sql` | `webhooks`, `webhook_deliveries` |
-| `0007_hot_path_indexes.sql` | Composite indexes for paginated lists, party reports, P&L/budget aggregation, webhook due-scan, audit filters |
-| `0008_bank_reconciliation.sql` | Bank rec: transaction status + import hash, `bank_matches` join table, `reconciliations` history |
+### Accounting core
+- **Double-entry ledger** — every transaction is a balanced journal entry.
+  Debits-must-equal-credits is enforced at both the Zod and SQL layers.
+- **Reports** — P&L, Balance Sheet, Trial Balance, Cash Flow Statement (indirect
+  method), A/R Aging, A/P Aging, General Ledger, Tax Liability. All computed
+  live from the journal — no batch jobs, no drift between reports.
+- **Period close + year-end close** — supports non-calendar fiscal years.
+  Closing entry posts to Retained Earnings; reopen reverses it.
+- **Audit log** — every mutation is recorded with action, entity, summary, and metadata.
 
-## Multi-currency model (single-rate, phase 1)
+### Multi-tenancy
+- Organizations + users + memberships. Sessions stored server-side (revocable).
+- Roles: owner, admin, accountant, viewer.
+- Every business table carries `org_id`. Reports and queries scope to the
+  active org via AsyncLocalStorage middleware.
 
-- Each org has a **base currency**; the GL is 100% base currency.
-- Customers/vendors may carry a foreign currency (NULL = base).
-- A foreign invoice/bill stores **both** foreign cents and base cents converted
-  at the **document-date rate** — rounded **per line, then summed**.
-- No revaluation engine: realized FX gain/loss only, **on payment**.
-  Example: €100 invoice @ 1.10 books \$110 to A/R. Paying €100 @ 1.08 books
-  \$108 to bank and \$2 to **6950 FX Loss** (rate 1.12 would credit
-  **4950 FX Gain** \$2). The final payment on a document relieves the exact
-  remaining base balance, so per-payment rounding can never strand a cent.
-- Manual rates: `GET/PUT /api/settings/fx-rates`. An explicit `fxRate` on a
-  document wins; otherwise the latest stored rate on/before the document date
-  is used; otherwise the request is rejected with `FX_RATE_REQUIRED`.
+### Security
+- bcrypt password hashing (10 rounds).
+- Account lockout: 5 failed logins → 15-min cool-off.
+- Server-side session table with TTL + cleanup.
+- Public share tokens have configurable expiry (default 90 days) and can be revoked.
+- Per-IP rate limiting on public endpoints (60 req/min).
+- Per-route input validation via Zod (ISO-date validation, length bounds, etc.).
 
-## MFA (TOTP)
+### Banking
+- Manual entry, CSV import, and **Plaid** sync (cursor-based incremental).
+- Bank rules engine: priority + filters + auto-post action.
+- Reconciliation flow with statement balance matching.
 
-- Dependency-free RFC 6238 (SHA-1, 6 digits, 30 s, ±1 step) in `server/totp.ts`
-  — verified against the RFC test vectors in `tests/totp.test.ts`.
-- Flow: `POST /api/auth/mfa/setup` → `POST /api/auth/mfa/enable {code}`
-  (returns 8 single-use recovery codes **once**; stored bcrypt-hashed).
-  Login on an MFA account returns `{ mfaRequired, mfaToken }` (5-minute
-  single-use challenge, **not** a session) → `POST /api/auth/mfa/verify
-  { mfaToken, code | recoveryCode }`. Verify is rate-limited to 5/min/token.
-- Enforcement: owners get a 7-day grace period from account creation; after
-  that the business API returns `403 {"code":"MFA_REQUIRED"}` until enrolled
-  (auth routes stay open so enrollment is always possible).
-- TOTP secrets are encrypted at rest with crypto-vault v1
-  (`v1:<iv>:<tag>:<ct>`, AES-256-GCM, key from `VAULT_KEY`).
+### Invoicing
+- Invoice + bill creation with sales tax. Per-line rounding ensures JEs balance exactly.
+- PDF export (PDFKit-based).
+- Public share links (token-based, no auth, rate-limited).
+- **Stripe Checkout** integration: customer pays online → webhook auto-records the payment.
 
-## Attachments
+### Recurring transactions
+- Templates for invoices, bills, and journal entries.
+- Frequencies: daily / weekly / monthly / quarterly / yearly.
+- Catch-up scheduler runs on server start (idempotent).
 
-Upload contract (deliberately **not** multipart): send raw file bytes as the
-body with the file's `Content-Type`, metadata in the query string —
-`POST /api/attachments?entityType=bill&entityId=7&filename=receipt.pdf`.
-Rationale: `express.raw` with a 10 MB limit is fewer moving parts than a
-hand-rolled multipart parser (no boundary/encoding edge cases) and works from
-`fetch`/`curl` one-liners. Mime whitelist: pdf, png, jpg, webp, csv, xlsx.
-The entity must exist **and belong to your org** — cross-org access is a 404.
-Drivers: `local` (default) or `s3` (SigV4 with plain `fetch`, no SDK).
+---
 
-## Reports
+## Configuration
 
-All under `/api/reports/*`, all accept `?from=&to=` and **`?format=csv`**
-(RFC 4180 via `server/csv.ts`, CRLF, quotes doubled — opens cleanly in Excel):
-`trial-balance`, `balance-sheet` (A = L + E with current earnings rolled
-into equity), `profit-loss-monthly` (one column per calendar month),
-`cash-flow` (cash-basis over bank accounts), `general-ledger?accountId=`
-(running balance), `ar-aging` / `ap-aging` (current/1-30/31-60/61-90/90+),
-`sales-by-customer`, `expenses-by-vendor`, and `budget-vs-actual?budgetId=`
-(variance is favorable-positive; actuals use the same aggregation as the
-P&L so the two always tie).
+See `.env.example` for the complete list. Most features are optional and
+gracefully no-op when their credentials are missing.
 
-## Journals, team & company
+| Variable | Required | Purpose |
+|---|---|---|
+| `APP_BASE_URL` | Yes | Public URL of the app (used in share links) |
+| `DB_PATH` | No | SQLite file path. Default `data.db` |
+| `PORT` | No | HTTP port. Default `5000` |
+| `SMTP_*` | No | Email sending. Without these, emails log to stdout |
+| `STRIPE_SECRET_KEY` | No | Online invoice payments |
+| `STRIPE_WEBHOOK_SECRET` | No | Stripe webhook signature verification |
+| `PLAID_CLIENT_ID`, `PLAID_SECRET` | No | Bank connections |
+| `PLAID_ENV` | No | `sandbox` / `development` / `production` |
 
-Manual journal entries (`POST /api/journal-entries`, balanced-or-rejected)
-with one-shot reversal (`POST /api/journal-entries/:id/reverse`); bill void;
-team management under `/api/org/users` (owner adds/re-roles/removes members);
-self-service password change; org rename; account edit/deactivate and
-delete-if-unused; case-insensitive duplicate prevention and soft delete for
-customers/vendors. Posted invoices/bills are immutable by design — void and
-reissue (audit-trail discipline).
+---
 
-## Bank reconciliation
+## API
 
-Statement lines import via `POST /api/bank/import?accountId=` (CSV:
-`date,description,amount` signed dollars; sha256 dedup makes re-imports a
-no-op). `GET /api/bank/suggestions` proposes exact-amount matches within ±7
-days; `POST /api/bank/transactions/:id/match {entryIds}` clears one line
-against one or MANY journal entries (a single deposit covering several
-invoice payments); `categorize` posts a balanced JE from signed splits
-(merchant fees, transfers) and clears the line in one step; `exclude` parks
-duplicates. `POST /api/bank/reconcile` returns the classic identity —
-statement ending balance + deposits in transit − outstanding checks =
-ledger balance — with itemized outstanding lists, and `complete:true`
-persists the reconciliation only when the difference is zero.
+The complete API is at `/api/*`. Auth-required for all endpoints except:
 
-## Data import
+- `POST /api/auth/signup`, `POST /api/auth/login`, etc.
+- `GET /api/health`
+- `POST /api/stripe/webhook`, `POST /api/plaid/webhook`
+- `GET /p/invoice/:token` (public token-based share)
 
-`POST /api/import/{customers|vendors|chart-of-accounts|invoices|opening-balances}`
-with a `text/csv` body (or JSON `{"csv":"..."}`). All support `?dryRun=true`
-(full run inside a transaction, then rolled back — the report is exactly what
-a real run would do). Invoices support `?partial=true` (per-row SAVEPOINTs);
-otherwise any row error rejects the whole file. Opening balances require
-`?asOfDate=YYYY-MM-DD`, must balance to the cent (the error reports the exact
-difference), and post exactly **one** journal entry with source
-`opening_balance`. Response shape:
-`{ inserted, skipped, errors: [{row, message}], dryRun }`.
-CSV templates live in [`templates/`](templates/).
+Auth flow:
 
-## Webhooks
+```bash
+# Sign up
+curl -X POST http://localhost:5000/api/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alice@example.com","password":"correct horse battery","name":"Alice","orgName":"Acme Inc."}'
 
-- CRUD under `/api/webhooks` (owner/admin). Events: `invoice.created`,
-  `invoice.paid`, `invoice.voided`, `bill.created`, `bill.paid`,
-  `credit_note.issued`, `period.closed` (+ `ping` for tests).
-- Events are enqueued **after** the business transaction commits, never inside.
-- Delivery worker: 30 s unref'd interval, 10 s fetch timeout, backoff
-  1m/5m/30m/2h/12h, max 6 attempts, marks success on 2xx.
-- SSRF guard at create **and** delivery time: hostnames are resolved and
-  loopback/RFC1918/link-local/CGNAT/v6-private ranges are rejected
-  (e.g. `http://169.254.169.254` → `400 SSRF_BLOCKED`); redirects are refused.
+# Login (sets ll_session cookie)
+curl -X POST http://localhost:5000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -c cookies.txt \
+  -d '{"email":"alice@example.com","password":"correct horse battery"}'
 
-### Verifying a signature (receiver side)
+# Use the cookie
+curl http://localhost:5000/api/auth/me -b cookies.txt
+```
+
+---
+
+## Testing
+
+```bash
+npm test
+```
+
+Runs five test suites:
+
+| Suite | What it verifies |
+|---|---|
+| `cashflow_test.js` | 5 hand-crafted scenarios — bug regression coverage |
+| `cashflow_property_test.js` | 100 random ledgers × 4 sub-periods = 400 cases. Reconciliation gap = exactly 0.00 in every one |
+| `balance_sheet_test.js` | 400 random scenarios. Assets = Liabilities + Equity always |
+| `invoice_rounding_test.js` | Invoice JEs balance for tricky decimal inputs |
+| `multi_tenant_test.js` | Two orgs in one database stay completely isolated |
+
+All five pass on every commit. Wire into CI with `npm test`.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  client/  (React + Vite + Tailwind + shadcn/ui)                 │
+│  └── 16 pages, all using react-query for state                  │
+└─────────────────────────────────────────────────────────────────┘
+                              ▼ (HTTP/JSON)
+┌─────────────────────────────────────────────────────────────────┐
+│  server/                                                         │
+│  ├── auth.ts          — bcrypt, sessions, middleware            │
+│  ├── auth-routes.ts   — signup/login/me/switch-org              │
+│  ├── org-scope.ts     — AsyncLocalStorage per request           │
+│  ├── routes.ts        — 100+ business endpoints                 │
+│  ├── storage.ts       — accounting domain (3,400 lines)         │
+│  ├── plaid.ts         — bank connections                        │
+│  ├── stripe.ts        — invoice payments                        │
+│  ├── pdf.ts           — invoice / statement PDFs                │
+│  └── email.ts         — SMTP                                     │
+└─────────────────────────────────────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  SQLite (Drizzle ORM)                                           │
+│  19 tables. Every business table has org_id (FK organizations). │
+│  Auto-migrations on first boot — no manual steps.               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Why the cash flow report is correct
+
+The cash flow statement is derived live from the journal — never stored,
+never cached. The math follows the accounting identity:
+
+```
+ΔCash = ΔLiabilities + ΔEquity + NetIncome − ΔOtherAssets
+```
+
+For any well-formed (balanced) ledger, the three-section total **must** equal
+the actual change in bank balances exactly. The engine includes a self-check
+that surfaces a `reconciliationGap` when this invariant breaks. Across 400
+randomized property tests, the gap is always 0.00.
+
+The four classification bugs that originally caused non-zero gaps —
+intangibles misclassified, Retained Earnings excluded, depreciation not added
+back, NULL subtypes — are all fixed and regression-tested.
+
+---
+
+## Database migrations
+
+LedgerLite uses **forward-compatible auto-migrations**. On every boot:
+
+1. `CREATE TABLE IF NOT EXISTS …` runs for every table.
+2. For tables that exist but lack newer columns (org_id, expires_at, etc.),
+   `ALTER TABLE ADD COLUMN` runs guarded by PRAGMA probes — safe to run repeatedly.
+3. The default organization (id=1, slug="default") is auto-created if no org exists.
+4. All pre-existing rows are attributed to org_id=1 via the `DEFAULT 1` clause.
+
+This means you can deploy a new version on top of an existing database without
+running anything manually.
+
+---
+
+## License
+
+MIT
+
+## New environment variables (v2.2.0)
+
+| Variable | Purpose |
+|---|---|
+| `APP_ENCRYPTION_KEY` | 64 hex chars (32 bytes) — AES-256-GCM key for encrypting Plaid access tokens at rest; **required in production** (boot fails without it). Generate: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `CSP_ENFORCE` | Set to `true` to serve the Content-Security-Policy as enforcing; otherwise it is sent as `Content-Security-Policy-Report-Only` so violations can be observed safely first. |
+| `METRICS_TOKEN` | Shared secret for `GET /api/metrics` (send as `x-metrics-token` header). When unset, the metrics endpoint returns 404 and is effectively disabled. |
+
+## Phase 3 — competitive parity (v2.3.0)
+
+### Environment variables (full)
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `DATABASE_URL` | yes | PostgreSQL connection string. |
+| `APP_ENCRYPTION_KEY` | prod | 64 hex chars (32 bytes). Encrypts Plaid tokens **and** TOTP secrets at rest. Boot fails in production without it. |
+| `CSP_ENFORCE` | no | `true` serves an enforcing CSP; otherwise report-only. |
+| `METRICS_TOKEN` | no | Bearer for `GET /api/metrics` (`x-metrics-token`). Unset → 404. |
+| `FILE_STORAGE` | no | `local` (default) or `s3`. |
+| `FILE_DIR` | no | Local attachment root (default `./data/uploads`). |
+| `S3_ENDPOINT` / `S3_BUCKET` / `S3_KEY` / `S3_SECRET` / `S3_REGION` | s3 | S3-compatible storage (SigV4, no SDK). |
+| `PORT` | no | HTTP port (default 5000). |
+
+### Migrations (apply in order; runner is automatic at boot)
+
+`0000_init`, `0001_add_foreign_keys`, `0002_pagination_indexes`, `0003_recon_backfill`, `0004_number_sequences`, `0005_updated_at`, `0006_multi_currency`, `0007_mfa`, `0008_attachments`, `0009_budgets`, `0010_webhooks`, `0011_phase3_indexes`.
+
+### Webhook signature verification
+
+Every delivery carries `x-ledgerlite-event` and `x-ledgerlite-signature` (hex HMAC-SHA256 of the **raw request body** using the webhook's secret). Verify in your receiver:
 
 ```js
 import crypto from "node:crypto";
-
-app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
-  const expected = crypto
-    .createHmac("sha256", process.env.LEDGERLITE_WEBHOOK_SECRET) // shown once at creation
-    .update(req.body) // RAW body bytes — do not re-serialize
-    .digest("hex");
-  const got = req.headers["x-ledgerlite-signature"] ?? "";
-  const ok = got.length === expected.length &&
-    crypto.timingSafeEqual(Buffer.from(got, "hex"), Buffer.from(expected, "hex"));
-  if (!ok) return res.status(401).end();
-  const event = req.headers["x-ledgerlite-event"];
-  // ... handle JSON.parse(req.body)
-  res.status(200).end();
-});
+function verify(rawBody, signatureHeader, secret) {
+  const expected = crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
+  // constant-time compare
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signatureHeader));
+}
 ```
 
-## Audit log
+Events: `invoice.created`, `invoice.paid`, `invoice.voided`, `bill.created`, `bill.paid`, `credit_note.issued`, `period.closed`. Retries: 6 attempts, backoff 1m/5m/30m/2h/12h.
 
-`GET /api/audit-log` (owner/admin/accountant) with filters `userId`,
-`entityId`, `entityType`, `action`, `from`, `to`, and free-text `q` against
-the summary (LIKE with `%`/`_` escaped), paginated, plus `?format=csv`.
-Client page at `#/audit`.
+### Import CSV templates
 
-## Production sweep notes (org-scoping audit)
+All import endpoints accept a `text/csv` body (or JSON `{ csv }`), support `?dryRun=true`, and return `{ inserted, skipped, errors[] }`.
 
-Every query over business tables carries an `org_id` predicate. The
-intentionally global exceptions, each commented in code:
+- **customers / vendors** (`POST /api/import/customers`, `/vendors`):
+  `name,email,phone,address,shipping_city,shipping_state,shipping_zip`
+- **chart-of-accounts** (`POST /api/import/chart-of-accounts`):
+  `code,name,type,subtype`
+- **invoices** (`POST /api/import/invoices`, flat rows grouped by `number`; `?partial=true` to allow per-row skips):
+  `number,customer_name,date,due_date,line_description,quantity,rate,income_account_code,tax_rate`
+- **opening-balances** (`POST /api/import/opening-balances`, JSON body `{ csv, asOfDate }`; debits must equal credits):
+  `account_code,debit,credit`
 
-1. `server/auth.ts` — `sessions` lookups/deletes are keyed by a 256-bit
-   opaque token (the credential itself); `users`/`org_users` lookups are
-   pre-auth by definition.
-2. `server/routes.ts` (auth section) — `users` / `mfa_challenges` by unique
-   email / token / authenticated user id: these are account-level, not
-   org-level, tables.
-3. `server/index.ts` — boot-time `SELECT id FROM orgs` to run the idempotent
-   FX-account seed for every org.
-4. `server/webhooks.ts` — the delivery worker drains due deliveries across
-   all orgs by design; rows are addressed only by primary key and carry
-   their own `org_id`.
+### Multi-currency
 
-Hot-path `EXPLAIN QUERY PLAN` results (all index-backed) are what migration
-`0007_hot_path_indexes.sql` was written against: paginated invoice list →
-`idx_invoices_org_date_id`; sales-by-customer → `idx_invoices_org_date_id`
-range scan; P&L / budget-vs-actual → `idx_jl_org_account` + PK joins;
-webhook due-scan → `idx_wh_deliveries_due`.
+Org has a base currency; customers/vendors may carry a foreign currency. Foreign invoices/bills store both foreign and base cents (converted at the document-date rate). The GL is 100% base currency; realized FX gain/loss posts on payment to `4950 FX Gain` / `6950 FX Loss`. Manage rates at `GET/PUT /api/settings/fx-rates`.
 
-## Printable documents
+### MFA (TOTP)
 
-Invoice documents and customer statements are print-ready HTML
-(`/api/invoices/:id/document`, `/api/customers/:id/statement`) rendered with
-`formatMoney(cents, currency)` — the **document** currency for foreign
-invoices, base for everything else. Browser print-to-PDF produces the PDF,
-keeping the server dependency-free.
+`POST /api/auth/mfa/setup` → `enable` (returns recovery codes once) → on login, TOTP-enabled accounts get `{ mfaRequired, mfaToken }`, completed via `POST /api/auth/mfa/verify`. Owners must enable MFA within 7 days of account creation.

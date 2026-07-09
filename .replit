@@ -1,0 +1,15 @@
+run = "npm run dev"
+entrypoint = "server/index.ts"
+hidden = ["data.db", "data.db-shm", "data.db-wal", "node_modules", ".git"]
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["sh", "-c", "npm run build && NODE_ENV=production node dist/index.cjs"]
+deploymentTarget = "cloudrun"
+build = ["sh", "-c", "npm install && npm run build"]
+
+[[ports]]
+localPort = 5000
+externalPort = 80

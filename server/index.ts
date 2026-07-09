@@ -1,51 +1,274 @@
-/**
- * server/index.ts — application entrypoint.
- * Boot order: migrations → idempotent per-org seeds → HTTP server → webhook worker.
- */
-import express from "express";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { db, runMigrations } from "./db.js";
-import { buildRouter } from "./routes.js";
-import { attachSession } from "./auth.js";
-import { ensureFxAccounts } from "./storage.js";
-import { startWebhookWorker } from "./webhooks.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// Fail fast: running production with the dev fallback vault key would mean
-// TOTP secrets are encrypted with a publicly-known key.
-if (process.env.NODE_ENV === "production" && !process.env.VAULT_KEY) {
-  console.error("FATAL: VAULT_KEY must be set in production (see .env.example)");
-  process.exit(1);
-}
-
-const applied = runMigrations();
-if (applied.length > 0) console.log(`migrations applied: ${applied.join(", ")}`);
-
-// TASK 1: idempotent FX account seeds for every existing org (new orgs get
-// them in seedChartOfAccounts at registration time).
-for (const { id } of db.prepare("SELECT id FROM orgs").all() as Array<{ id: number }>) {
-  ensureFxAccounts(id);
-}
+import "dotenv/config";
+import express, { Response, NextFunction } from 'express';
+import type { Request } from 'express';
+import { registerRoutes } from "./routes";
+import { serveStatic } from "./static";
+import { storage, initDatabase, closeDatabase } from "./storage";
+import { createServer } from "node:http";
+import crypto from "node:crypto";
+import { logger } from "./logger";
 
 const app = express();
-app.disable("x-powered-by");
-app.use((_req, res, next) => {
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "DENY");
-  res.setHeader("Referrer-Policy", "same-origin");
-  // The client is fully self-contained (no CDNs), so a strict CSP is free.
-  // style-src allows inline <style> because printable documents/statements
-  // embed their print CSS; scripts remain 'self'-only.
-  res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'");
+const httpServer = createServer(app);
+
+declare module "http" {
+  interface IncomingMessage {
+    rawBody: unknown;
+  }
+}
+
+// Trust the first proxy hop so req.ip / req.protocol are correct behind nginx / Cloudflare.
+// Only enable in production; in dev (Vite middleware) we don't need it and it can be misleading.
+if (process.env.NODE_ENV === "production") {
+  app.set("trust proxy", 1);
+}
+
+// ----------------------------------------------------------------------------
+// Request IDs (Task: structured logging). Honor an incoming x-request-id from
+// a trusted proxy if it looks sane; otherwise mint a UUID. Echo it back so the
+// client and every log line share the same correlation key.
+// ----------------------------------------------------------------------------
+declare global {
+  namespace Express {
+    interface Request {
+      reqId?: string;
+    }
+  }
+}
+
+const REQ_ID_RE = /^[\w-]{1,64}$/;
+app.use((req, res, next) => {
+  const incoming = req.headers["x-request-id"];
+  const candidate = typeof incoming === "string" ? incoming : undefined;
+  req.reqId = candidate && REQ_ID_RE.test(candidate) ? candidate : crypto.randomUUID();
+  res.setHeader("x-request-id", req.reqId);
   next();
 });
-app.use(attachSession);
-app.use(buildRouter());
-app.use(express.static(path.join(__dirname, "..", "client")));
 
-const port = Number(process.env.PORT ?? 3000);
-app.listen(port, () => console.log(`LedgerLite listening on :${port}`));
+// Security headers. Kept dependency-free (helmet equivalent for what we need).
+//
+// Content-Security-Policy: served REPORT-ONLY until CSP_ENFORCE=true so
+// violations can be observed in the browser console / report tooling before
+// anything breaks in production. Allow-list rationale:
+//   script-src  — self + Plaid Link + Stripe.js (both load from their CDNs)
+//   style-src   — 'unsafe-inline' is required by the public invoice share page
+//                 (routes.ts /p/invoice/:token) which inlines its stylesheet,
+//                 and by Plaid/Stripe injected iframes' host styles
+//   frame-src   — Plaid Link and Stripe render in iframes
+//   connect-src — Plaid API (production + sandbox) and Stripe API XHR
+//   object-src 'none', base-uri/form-action 'self' — standard hardening
+const CSP_POLICY = [
+  "default-src 'self'",
+  "script-src 'self' https://cdn.plaid.com https://js.stripe.com",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "frame-src https://cdn.plaid.com https://js.stripe.com",
+  "connect-src 'self' https://production.plaid.com https://sandbox.plaid.com https://api.stripe.com",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+].join("; ");
 
-startWebhookWorker();
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  // Report-only by default; flip CSP_ENFORCE=true once the violation log is clean.
+  const cspHeader =
+    process.env.CSP_ENFORCE === "true"
+      ? "Content-Security-Policy"
+      : "Content-Security-Policy-Report-Only";
+  res.setHeader(cspHeader, CSP_POLICY);
+  if (process.env.NODE_ENV === "production" && req.secure) {
+    res.setHeader("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
+  }
+  next();
+});
+
+// Body size limits — most accounting requests are small. Large CSV imports route through
+// importBankTransactions which bundles parsed rows into a JSON array; 5MB covers ~50k tx.
+app.use(
+  express.json({
+    limit: "5mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
+
+app.use(express.urlencoded({ extended: false, limit: "1mb" }));
+
+// ----------------------------------------------------------------------------
+// Request timeouts (Task 7). Default 30s; PDF streaming and Plaid sync get
+// 120s (PDFs stream large statements, Plaid sync pages through the provider
+// API). On timeout: 503 if nothing has been sent yet, then destroy the socket
+// so the connection can't linger half-open.
+// ----------------------------------------------------------------------------
+const DEFAULT_TIMEOUT_MS = 30_000;
+const LONG_TIMEOUT_MS = 120_000;
+
+app.use((req, res, next) => {
+  const isLongRunning =
+    req.path.includes("/pdf") || /^\/api\/plaid\/items\/\d+\/sync$/.test(req.path);
+  const timeoutMs = isLongRunning ? LONG_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+
+  req.setTimeout(timeoutMs);
+  res.setTimeout(timeoutMs, () => {
+    if (!res.headersSent) {
+      res.status(503).json({ error: "Request timed out" });
+    }
+    // Kill the socket either way — a handler stuck mid-stream must not hold
+    // the connection (and its pooled DB work) open indefinitely.
+    res.socket?.destroy();
+  });
+  next();
+});
+
+export function log(message: string, source = "express") {
+  const formattedTime = new Date().toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
+
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+
+const MAX_LOG_BODY_CHARS = 200;
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path = req.path;
+  let capturedJsonResponse: Record<string, any> | undefined = undefined;
+
+  const originalResJson = res.json;
+  res.json = function (bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path.startsWith("/api")) {
+      const fields: Record<string, unknown> = {
+        method: req.method,
+        path,
+        status: res.statusCode,
+        durationMs: duration,
+        reqId: req.reqId,
+        userId: req.user?.id,
+        orgId: req.org?.id,
+      };
+      // Only log response bodies for non-2xx (errors) and only a short prefix —
+      // dumping every successful report response floods logs and may include data
+      // we'd prefer not to persist (customer info, tax IDs in error envelopes etc.).
+      if (capturedJsonResponse && res.statusCode >= 400) {
+        const s = JSON.stringify(capturedJsonResponse);
+        fields.body = s.length > MAX_LOG_BODY_CHARS ? s.slice(0, MAX_LOG_BODY_CHARS) + "…" : s;
+      }
+      logger.info(`${req.method} ${path} ${res.statusCode} in ${duration}ms`, fields);
+    }
+  });
+
+  next();
+});
+
+(async () => {
+  // PostgreSQL bootstrap MUST complete before any route can touch the DB:
+  // runs pending migrations, then seeds the default chart of accounts.
+  await initDatabase();
+
+  await registerRoutes(httpServer, app);
+
+  // Periodic session cleanup (deletes expired sessions hourly)
+  const { startSessionCleanup } = await import("./auth");
+  startSessionCleanup();
+
+  // Run recurring transaction catch-up on server start
+  try {
+    const caught = await storage.runCatchUp();
+    if (caught.length > 0) {
+      logger.info(`Recurring catch-up: posted ${caught.reduce((s, c) => s + c.posted, 0)} occurrence(s) across ${caught.length} template(s)`);
+    }
+  } catch (e: any) {
+    logger.error("Recurring catch-up failed", { error: e.message });
+  }
+
+  app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+
+    // Structured, correlated: this reqId matches the x-request-id header the
+    // client received — the join key between a support ticket and the logs.
+    logger.error("Internal Server Error", {
+      reqId: req.reqId,
+      status,
+      error: message,
+      stack: err?.stack?.split("\n").slice(0, 5).join(" | "),
+    });
+
+    if (res.headersSent) {
+      return next(err);
+    }
+
+    return res.status(status).json({ message });
+  });
+
+  // importantly only setup vite in development and after
+  // setting up all the other routes so the catch-all route
+  // doesn't interfere with the other routes
+  if (process.env.NODE_ENV === "production") {
+    serveStatic(app);
+  } else {
+    const { setupVite } = await import("./vite");
+    await setupVite(httpServer, app);
+  }
+
+  // ALWAYS serve the app on the port specified in the environment variable PORT
+  // Other ports are firewalled. Default to 5000 if not specified.
+  // this serves both the API and the client.
+  // It is the only port that is not firewalled.
+  const port = parseInt(process.env.PORT || "5000", 10);
+  httpServer.listen(
+    {
+      port,
+      host: "0.0.0.0",
+      reusePort: true,
+    },
+    () => {
+      logger.info(`serving on port ${port}`);
+    },
+  );
+
+  // Graceful shutdown: stop accepting new connections, let in-flight requests drain.
+  // Without this, a SIGTERM during recurring-catch-up could interrupt a multi-line JE
+  // post mid-transaction and leave the database in an inconsistent state.
+  let shuttingDown = false;
+  function shutdown(signal: string) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info(`Received ${signal}, shutting down gracefully…`);
+    httpServer.close((err) => {
+      if (err) {
+        console.error("Error during shutdown:", err);
+        process.exit(1);
+      }
+      logger.info("HTTP server closed.");
+      closeDatabase()
+        .then(() => {
+          logger.info("PostgreSQL pool drained.");
+          process.exit(0);
+        })
+        .catch(() => process.exit(0));
+    });
+    // Hard timeout — if connections won't drain in 10s, force exit
+    setTimeout(() => {
+      console.error("Shutdown timed out, forcing exit");
+      process.exit(1);
+    }, 10000).unref();
+  }
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+})();
