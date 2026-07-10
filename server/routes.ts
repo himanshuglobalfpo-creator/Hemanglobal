@@ -1743,6 +1743,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/recurring/run-catchup", (_req, res) =>
     handle(res, () => storage.runCatchUp())
   );
+  // Invoices this recurring template has generated (recorded via recurringTemplateId).
+  app.get("/api/recurring/:id/invoices", (req, res) =>
+    handle(res, () => storage.listInvoicesForRecurring(parseId(req.params.id)))
+  );
 
   // ---------- Batch Reclassify ----------
   app.post("/api/reclassify", (req, res) =>

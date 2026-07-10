@@ -34,6 +34,13 @@ let cachedTransporter: nodemailer.Transporter | null | undefined;
 
 function getTransporter(): nodemailer.Transporter | null {
   if (cachedTransporter !== undefined) return cachedTransporter;
+  // Dev/testing seam: SMTP_TRANSPORT=json captures emails as JSON (nodemailer's
+  // jsonTransport) instead of dialing a real SMTP server — configured=true, no
+  // network. Used by the recurring-invoice test and handy for local dev.
+  if (process.env.SMTP_TRANSPORT === "json") {
+    cachedTransporter = nodemailer.createTransport({ jsonTransport: true });
+    return cachedTransporter;
+  }
   const host = process.env.SMTP_HOST;
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
