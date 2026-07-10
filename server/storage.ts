@@ -6133,15 +6133,26 @@ export class DatabaseStorage {
   // Entity ownership is verified BEFORE any blob write: entity_id alone is
   // guessable (global sequences), so the entity row must exist under
   // currentOrgId() — the same rule as every other lookup in this file.
+  // Entity types that can carry attachments. Every branch validates the entity
+  // exists IN THE CURRENT ORG, so attachments inherit the same org-scoped access
+  // control as everything else — a receipt can never be attached to (or, via the
+  // org-scoped get/list/delete below, read from) another tenant's record.
+  //   • payment → the journal entry that recorded an invoice/bill payment
+  //     (source 'payment'/'bill_payment'), so receipts attach to the payment
+  //     itself rather than only the generic journal entry.
   async assertAttachmentEntity(entityType: string, entityId: number): Promise<void> {
-    const table =
-      entityType === "invoice" ? "invoices" :
-      entityType === "bill" ? "bills" :
-      entityType === "bank_transaction" ? "bank_transactions" :
-      entityType === "journal_entry" ? "journal_entries" : null;
-    if (!table) throw new Error(`Unsupported entity type "${entityType}"`);
-    const r = (await pool.query(`SELECT 1 FROM ${table} WHERE id = $1 AND org_id = $2`, [entityId, currentOrgId()])).rows[0];
-    if (!r) throw new Error(`${entityType.replace("_", " ")} not found`);
+    const org = currentOrgId();
+    let sql: string;
+    switch (entityType) {
+      case "invoice": sql = `SELECT 1 FROM invoices WHERE id = $1 AND org_id = $2`; break;
+      case "bill": sql = `SELECT 1 FROM bills WHERE id = $1 AND org_id = $2`; break;
+      case "bank_transaction": sql = `SELECT 1 FROM bank_transactions WHERE id = $1 AND org_id = $2`; break;
+      case "journal_entry": sql = `SELECT 1 FROM journal_entries WHERE id = $1 AND org_id = $2`; break;
+      case "payment": sql = `SELECT 1 FROM journal_entries WHERE id = $1 AND org_id = $2 AND source IN ('payment','bill_payment')`; break;
+      default: throw new Error(`Unsupported entity type "${entityType}"`);
+    }
+    const r = (await pool.query(sql, [entityId, org])).rows[0];
+    if (!r) throw new Error(`${entityType.replace(/_/g, " ")} not found`);
   }
 
   async createAttachment(input: {
