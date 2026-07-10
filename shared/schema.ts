@@ -157,6 +157,39 @@ export type InsertVendor = z.infer<typeof insertVendorSchema>;
 export type Vendor = typeof vendors.$inferSelect;
 
 // ============================================================================
+// DIMENSIONS — class & location (QBO-style "class tracking" / Xero "tracking")
+// ============================================================================
+// Optional tags applied to journal lines (and to invoice/bill lines, which
+// propagate onto the GL). Reports can filter P&L / Balance Sheet by one or both.
+// Two parallel definition tables so an org can run e.g. departments (class) and
+// offices (location) independently.
+export const classes = pgTable("classes", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  name: text("name").notNull(),
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export const insertClassSchema = createInsertSchema(classes)
+  .omit({ id: true, orgId: true, createdAt: true })
+  .extend({ name: z.string().min(1, "Class name is required").max(120), isActive: z.boolean().optional() });
+export type InsertClass = z.infer<typeof insertClassSchema>;
+export type Class = typeof classes.$inferSelect;
+
+export const locations = pgTable("locations", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  name: text("name").notNull(),
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export const insertLocationSchema = createInsertSchema(locations)
+  .omit({ id: true, orgId: true, createdAt: true })
+  .extend({ name: z.string().min(1, "Location name is required").max(120), isActive: z.boolean().optional() });
+export type InsertLocation = z.infer<typeof insertLocationSchema>;
+export type Location = typeof locations.$inferSelect;
+
+// ============================================================================
 // SHARED VALIDATORS
 // ============================================================================
 // ISO date YYYY-MM-DD with calendar-validity check (rejects 2026-02-30 etc.)
@@ -217,6 +250,9 @@ export const journalLines = pgTable("journal_lines", {
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
   credit: bigint("credit", { mode: "number" }).notNull().default(0),
   description: text("description"),
+  // Optional dimensions (class/location). Reports filter on these.
+  classId: integer("class_id"),
+  locationId: integer("location_id"),
 });
 
 export const insertJournalLineSchema = createInsertSchema(journalLines).omit({ id: true });
@@ -237,6 +273,8 @@ export const postJournalEntrySchema = z.object({
         debit: z.number().min(0).default(0),
         credit: z.number().min(0).default(0),
         description: z.string().max(500).optional(),
+        classId: z.number().int().positive().nullable().optional(),
+        locationId: z.number().int().positive().nullable().optional(),
       }).refine(
         (l) => !((l.debit || 0) > 0 && (l.credit || 0) > 0),
         { message: "A single line cannot have both a debit and a credit. Split into two lines." }
@@ -418,6 +456,9 @@ export const invoiceLines = pgTable("invoice_lines", {
   amount: bigint("amount", { mode: "number" }).notNull().default(0),
   incomeAccountId: integer("income_account_id").notNull(), // which income account this line credits
   itemId: integer("item_id"), // optional link to a catalog item (drives income account + COGS)
+  // Optional dimensions (class/location) — propagated onto the GL income line.
+  classId: integer("class_id"),
+  locationId: integer("location_id"),
 });
 
 export const insertInvoiceLineSchema = createInsertSchema(invoiceLines).omit({ id: true });
@@ -449,6 +490,8 @@ export const createInvoiceSchema = z.object({
         // OR name the income account directly. At least one is required.
         itemId: z.number().int().positive().optional(),
         incomeAccountId: z.number().int().positive().optional(),
+        classId: z.number().int().positive().nullable().optional(),
+        locationId: z.number().int().positive().nullable().optional(),
       }).refine((l) => l.itemId !== undefined || l.incomeAccountId !== undefined, {
         message: "Each line must reference an itemId or an incomeAccountId",
         path: ["incomeAccountId"],
@@ -909,6 +952,9 @@ export const billLines = pgTable("bill_lines", {
   amount: bigint("amount", { mode: "number" }).notNull().default(0),
   expenseAccountId: integer("expense_account_id").notNull(),
   itemId: integer("item_id"), // optional link to a catalog item (drives GL account + stock)
+  // Optional dimensions (class/location) — propagated onto the GL expense line.
+  classId: integer("class_id"),
+  locationId: integer("location_id"),
 });
 
 export const insertBillLineSchema = createInsertSchema(billLines).omit({ id: true });
@@ -938,6 +984,8 @@ export const createBillSchema = z.object({
         // service/non-inventory items expense) OR name the expense account.
         itemId: z.number().int().positive().optional(),
         expenseAccountId: z.number().int().positive().optional(),
+        classId: z.number().int().positive().nullable().optional(),
+        locationId: z.number().int().positive().nullable().optional(),
       }).refine((l) => l.itemId !== undefined || l.expenseAccountId !== undefined, {
         message: "Each line must reference an itemId or an expenseAccountId",
         path: ["expenseAccountId"],

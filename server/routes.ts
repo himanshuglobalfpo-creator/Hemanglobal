@@ -23,6 +23,8 @@ import {
   payPayrollLiabilitiesSchema,
   insertCustomerSchema,
   insertVendorSchema,
+  insertClassSchema,
+  insertLocationSchema,
   postJournalEntrySchema,
   createInvoiceSchema,
   createBillSchema,
@@ -106,6 +108,14 @@ function parseId(raw: unknown, label = "id"): number {
     throw new Error(`Invalid ${label}: "${raw}" is not a positive integer`);
   }
   return n;
+}
+
+// Parse optional ?classId=&locationId= into a DimFilter for report filtering.
+function dimFilterFromQuery(req: Request): { classId?: number; locationId?: number } {
+  const f: { classId?: number; locationId?: number } = {};
+  if (req.query.classId !== undefined) f.classId = parseId(req.query.classId, "classId");
+  if (req.query.locationId !== undefined) f.locationId = parseId(req.query.locationId, "locationId");
+  return f;
 }
 
 // Validate ISO date string YYYY-MM-DD. Returns the input if valid, throws otherwise.
@@ -949,6 +959,34 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     })
   );
 
+  // ---------- Dimensions: classes & locations (Settings) ----------
+  app.get("/api/classes", (req, res) =>
+    handle(res, () => storage.listClasses(req.query.includeInactive !== "false"))
+  );
+  app.post("/api/classes", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => storage.createClass(insertClassSchema.parse(req.body)))
+  );
+  app.patch("/api/classes/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const updated = await storage.updateClass(parseId(req.params.id), insertClassSchema.partial().parse(req.body));
+      if (!updated) throw new Error("Class not found");
+      return updated;
+    })
+  );
+  app.get("/api/locations", (req, res) =>
+    handle(res, () => storage.listLocations(req.query.includeInactive !== "false"))
+  );
+  app.post("/api/locations", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => storage.createLocation(insertLocationSchema.parse(req.body)))
+  );
+  app.patch("/api/locations/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const updated = await storage.updateLocation(parseId(req.params.id), insertLocationSchema.partial().parse(req.body));
+      if (!updated) throw new Error("Location not found");
+      return updated;
+    })
+  );
+
   // ---------- Journal ----------
   app.get("/api/journal", (req, res) =>
     handle(res, () => {
@@ -1035,13 +1073,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     handle(res, async () => {
       const from = (req.query.from as string) || `${new Date().getFullYear()}-01-01`;
       const to = (req.query.to as string) || new Date().toISOString().slice(0, 10);
-      return storage.profitAndLoss(from, to);
+      return storage.profitAndLoss(from, to, dimFilterFromQuery(req));
     })
   );
   app.get("/api/reports/balance-sheet", (req, res) =>
     handle(res, async () => {
       const asOf = (req.query.asOf as string) || new Date().toISOString().slice(0, 10);
-      return storage.balanceSheet(asOf);
+      return storage.balanceSheet(asOf, dimFilterFromQuery(req));
     })
   );
   app.get("/api/reports/general-ledger", (req, res) =>

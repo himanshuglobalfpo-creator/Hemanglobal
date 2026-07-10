@@ -36,8 +36,14 @@ import {
   payrollItems,
   payrollLiabilityPayments,
   payrollLiabilityPaymentLines,
+  classes,
+  locations,
   type OrgNexusState,
   type NexusStateInput,
+  type Class,
+  type InsertClass,
+  type Location,
+  type InsertLocation,
 } from "@shared/schema";
 import { organizations } from "@shared/auth-schema";
 import { applyPurchase, costOfSale, buildCogsJournalLines, type CogsComponent } from "@shared/inventory";
@@ -342,6 +348,9 @@ export async function initDatabase(): Promise<void> {
 export async function closeDatabase(): Promise<void> {
   await pool.end();
 }
+
+// Optional dimensional filter for reports (class/location tracking).
+export type DimFilter = { classId?: number | null; locationId?: number | null };
 
 // ----------------------------------------------------------------------------
 // Storage
@@ -1222,6 +1231,52 @@ export class DatabaseStorage {
       .set(data)
       .where(and(eq(vendors.id, id), eq(vendors.orgId, currentOrgId())))
       .returning().then((r) => r[0]);
+  }
+
+  // ---------- Dimensions: classes & locations ----------
+  async listClasses(includeInactive = true): Promise<Class[]> {
+    const where = includeInactive
+      ? eq(classes.orgId, currentOrgId())
+      : and(eq(classes.orgId, currentOrgId()), eq(classes.isActive, true));
+    return await db.select().from(classes).where(where).orderBy(classes.name);
+  }
+  async createClass(data: InsertClass): Promise<Class> {
+    return await db.insert(classes).values({ ...data, orgId: currentOrgId() }).returning().then((r) => r[0]);
+  }
+  async updateClass(id: number, data: Partial<InsertClass>): Promise<Class | undefined> {
+    return db.update(classes).set(data)
+      .where(and(eq(classes.id, id), eq(classes.orgId, currentOrgId())))
+      .returning().then((r) => r[0]);
+  }
+  async listLocations(includeInactive = true): Promise<Location[]> {
+    const where = includeInactive
+      ? eq(locations.orgId, currentOrgId())
+      : and(eq(locations.orgId, currentOrgId()), eq(locations.isActive, true));
+    return await db.select().from(locations).where(where).orderBy(locations.name);
+  }
+  async createLocation(data: InsertLocation): Promise<Location> {
+    return await db.insert(locations).values({ ...data, orgId: currentOrgId() }).returning().then((r) => r[0]);
+  }
+  async updateLocation(id: number, data: Partial<InsertLocation>): Promise<Location | undefined> {
+    return db.update(locations).set(data)
+      .where(and(eq(locations.id, id), eq(locations.orgId, currentOrgId())))
+      .returning().then((r) => r[0]);
+  }
+  // Validate that every referenced class/location id exists in THIS org. Nulls
+  // and undefineds are ignored (dimensions are optional). Cheap: at most two
+  // membership queries, only when dimensions are actually used.
+  private async assertDimensions(classIds: Array<number | null | undefined>, locationIds: Array<number | null | undefined>): Promise<void> {
+    const check = async (ids: Array<number | null | undefined>, table: typeof classes | typeof locations, label: string) => {
+      const uniq = [...new Set(ids.filter((v): v is number => typeof v === "number"))];
+      if (uniq.length === 0) return;
+      const found = await db.select({ id: table.id }).from(table)
+        .where(and(inArray(table.id, uniq), eq(table.orgId, currentOrgId())));
+      const foundIds = new Set(found.map((r) => r.id));
+      const missing = uniq.filter((id) => !foundIds.has(id));
+      if (missing.length > 0) throw new Error(`Unknown ${label} id(s) for this organization: ${missing.join(", ")}`);
+    };
+    await check(classIds, classes, "class");
+    await check(locationIds, locations, "location");
   }
 
   // ---------- Items / Inventory ----------
@@ -2397,6 +2452,13 @@ export class DatabaseStorage {
       );
     }
 
+    // Validate any class/location dimensions referenced by the lines belong to
+    // this org (defense in depth for every caller, not just the API route).
+    await this.assertDimensions(
+      input.lines.map((l) => (l as any).classId),
+      input.lines.map((l) => (l as any).locationId),
+    );
+
     // FIX #15: All inserts inside the transaction callback must use `txOrDb`, not `db`.
     // When _tx is supplied by a caller already inside a transaction, we skip the outer
     // db.transaction() wrapper so all writes belong to the same transaction / connection.
@@ -2423,6 +2485,8 @@ export class DatabaseStorage {
             debit: l.debit || 0,
             credit: l.credit || 0,
             description: l.description,
+            classId: (l as any).classId ?? null,
+            locationId: (l as any).locationId ?? null,
           })
           .returning().then((r: any[]) => r[0]);
         insertedLines.push(line);
@@ -2619,17 +2683,27 @@ export class DatabaseStorage {
             amount: fx ? lineAmountsRaw[idx] : lineAmounts[idx],
             incomeAccountId: resolvedIncomeAccountIds[idx],
             itemId: l.itemId ?? null,
+            classId: (l as any).classId ?? null,
+            locationId: (l as any).locationId ?? null,
           });
       }
-      // Post journal entry: Dr A/R, Cr each Income account, Cr Sales Tax Payable
+      // Post journal entry: Dr A/R, Cr each Income account, Cr Sales Tax Payable.
+      // Group income by (account, class, location) so each dimension combination
+      // lands on its own GL credit line — this is what makes a dimension-filtered
+      // P&L accurate.
       const lines: any[] = [{ accountId: ar.id, debit: total, credit: 0, description: `Invoice ${invNumber}` }];
-      // Group by income account using the per-line rounded amounts
-      const incomeMap = new Map<number, number>();
+      const incomeMap = new Map<string, { accountId: number; classId: number | null; locationId: number | null; amt: number }>();
       input.lines.forEach((l, idx) => {
-        incomeMap.set(resolvedIncomeAccountIds[idx], ((incomeMap.get(resolvedIncomeAccountIds[idx]) || 0) + lineAmounts[idx]));
+        const acctId = resolvedIncomeAccountIds[idx];
+        const classId = (l as any).classId ?? null;
+        const locationId = (l as any).locationId ?? null;
+        const key = `${acctId}|${classId}|${locationId}`;
+        const cur = incomeMap.get(key);
+        if (cur) cur.amt += lineAmounts[idx];
+        else incomeMap.set(key, { accountId: acctId, classId, locationId, amt: lineAmounts[idx] });
       });
-      for (const [acctId, amt] of incomeMap.entries()) {
-        lines.push({ accountId: acctId, debit: 0, credit: amt, description: `Invoice ${invNumber}` });
+      for (const g of incomeMap.values()) {
+        lines.push({ accountId: g.accountId, debit: 0, credit: g.amt, description: `Invoice ${invNumber}`, classId: g.classId, locationId: g.locationId });
       }
       if (tax > 0 && taxLiabAccountId) {
         lines.push({ accountId: taxLiabAccountId, debit: 0, credit: tax, description: `Sales tax on ${invNumber}` });
@@ -3044,17 +3118,26 @@ export class DatabaseStorage {
             amount: fx ? lineAmountsRaw[idx] : lineAmounts[idx], // document-currency detail for FX
             expenseAccountId: resolvedDebitAccountIds[idx],
             itemId: l.itemId ?? null,
+            classId: (l as any).classId ?? null,
+            locationId: (l as any).locationId ?? null,
           });
       }
       // Dr each Expense/Inventory account (rounded line amounts), Dr Sales Tax
-      // Receivable (or first debit acct as fallback), Cr A/P.
+      // Receivable (or first debit acct as fallback), Cr A/P. Group the debits by
+      // (account, class, location) so dimensions land on the GL for filtering.
       const lines: any[] = [];
-      const expMap = new Map<number, number>();
+      const expMap = new Map<string, { accountId: number; classId: number | null; locationId: number | null; amt: number }>();
       input.lines.forEach((l, idx) => {
-        expMap.set(resolvedDebitAccountIds[idx], ((expMap.get(resolvedDebitAccountIds[idx]) || 0) + lineAmounts[idx]));
+        const acctId = resolvedDebitAccountIds[idx];
+        const classId = (l as any).classId ?? null;
+        const locationId = (l as any).locationId ?? null;
+        const key = `${acctId}|${classId}|${locationId}`;
+        const cur = expMap.get(key);
+        if (cur) cur.amt += lineAmounts[idx];
+        else expMap.set(key, { accountId: acctId, classId, locationId, amt: lineAmounts[idx] });
       });
-      for (const [acctId, amt] of expMap.entries()) {
-        lines.push({ accountId: acctId, debit: amt, credit: 0, description: `Bill ${billNumber}` });
+      for (const g of expMap.values()) {
+        lines.push({ accountId: g.accountId, debit: g.amt, credit: 0, description: `Bill ${billNumber}`, classId: g.classId, locationId: g.locationId });
       }
       if (tax > 0) {
         const taxAcctId = taxAsset?.id ?? [...expMap.keys()][0];
@@ -4940,22 +5023,26 @@ export class DatabaseStorage {
 
   // ---------- Reports ----------
   // Compute account balances. Returns map accountId -> { debit, credit, balance(signed by normal side) }
-  async accountBalances(asOfDate?: string): Promise<Map<number, { debit: number; credit: number; balance: number }>> {
+  async accountBalances(asOfDate?: string, filter?: DimFilter): Promise<Map<number, { debit: number; credit: number; balance: number }>> {
     // Org-scope: filter by je.org_id. Note: even though this method is wrapped by listAccounts()
     // (which is also org-scoped), filtering at the SQL level is faster AND defends against the
     // case where journal_lines from other orgs accidentally reference our account IDs.
     const orgId = currentOrgId();
-    const cond = asOfDate ? `WHERE je.org_id = $1 AND je.date <= $2` : `WHERE je.org_id = $1`;
+    const params: any[] = [orgId];
+    const conds: string[] = [`je.org_id = $1`];
+    if (asOfDate) { params.push(asOfDate); conds.push(`je.date <= $${params.length}`); }
+    if (filter?.classId != null) { params.push(filter.classId); conds.push(`jl.class_id = $${params.length}`); }
+    if (filter?.locationId != null) { params.push(filter.locationId); conds.push(`jl.location_id = $${params.length}`); }
     const q = `
       SELECT jl.account_id as "accountId",
              COALESCE(SUM(jl.debit), 0) as debit,
              COALESCE(SUM(jl.credit), 0) as credit
       FROM journal_lines jl
       INNER JOIN journal_entries je ON je.id = jl.entry_id
-      ${cond}
+      WHERE ${conds.join(" AND ")}
       GROUP BY jl.account_id
     `;
-    const rows = (await pool.query(q, asOfDate ? [orgId, asOfDate] : [orgId])).rows as Array<{
+    const rows = (await pool.query(q, params)).rows as Array<{
       accountId: number;
       debit: number;
       credit: number;
@@ -5006,9 +5093,15 @@ export class DatabaseStorage {
     };
   }
 
-  // Profit & Loss for date range
-  async profitAndLoss(fromDate: string, toDate: string) {
+  // Profit & Loss for date range (optionally filtered by class/location).
+  async profitAndLoss(fromDate: string, toDate: string, filter?: DimFilter) {
     const orgId = currentOrgId();
+    // Dimension predicate lives INSIDE the je-match group so undimensioned
+    // accounts still resolve to 0 (not dropped), and a null filter is a no-op.
+    const params: any[] = [orgId, fromDate, toDate];
+    let dimPred = "";
+    if (filter?.classId != null) { params.push(filter.classId); dimPred += ` AND jl.class_id = $${params.length}`; }
+    if (filter?.locationId != null) { params.push(filter.locationId); dimPred += ` AND jl.location_id = $${params.length}`; }
     const q = `
       SELECT a.id as "accountId", a.code, a.name, a.type, a.subtype,
              COALESCE(SUM(jl.debit), 0) as debit,
@@ -5017,11 +5110,11 @@ export class DatabaseStorage {
       LEFT JOIN journal_lines jl ON jl.account_id = a.id
       LEFT JOIN journal_entries je ON je.id = jl.entry_id
       WHERE a.type IN ('income','expense') AND a.org_id = $1
-        AND (je.id IS NULL OR (je.org_id = $1 AND je.date BETWEEN $2 AND $3))
+        AND (je.id IS NULL OR (je.org_id = $1 AND je.date BETWEEN $2 AND $3${dimPred}))
       GROUP BY a.id
       ORDER BY a.code
     `;
-    const rows = (await pool.query(q, [orgId, fromDate, toDate])).rows as any[];
+    const rows = (await pool.query(q, params)).rows as any[];
     const income = rows
       .filter((r) => r.type === "income")
       .map((r) => ({ ...r, amount: (r.credit - r.debit) }))
@@ -5036,13 +5129,13 @@ export class DatabaseStorage {
     return { fromDate, toDate, income, expenses, totalIncome, totalExpenses, netIncome };
   }
 
-  // Balance Sheet as of date
-  async balanceSheet(asOfDate: string) {
-    const balances = await this.accountBalances(asOfDate);
+  // Balance Sheet as of date (optionally filtered by class/location).
+  async balanceSheet(asOfDate: string, filter?: DimFilter) {
+    const balances = await this.accountBalances(asOfDate, filter);
     const all = await this.listAccounts();
 
     // Compute net income up to asOfDate (closes to retained earnings conceptually)
-    const pl = await this.profitAndLoss("0000-01-01", asOfDate);
+    const pl = await this.profitAndLoss("0000-01-01", asOfDate, filter);
     const netIncome = pl.netIncome;
 
     const buildSection = (type: string) =>

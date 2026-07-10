@@ -10,6 +10,45 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { fmtMoney, fmtDate, todayISO, startOfYearISO } from "@/lib/format";
 import { apiRequest } from "@/lib/queryClient";
 
+// ────────────────────────────────────────────────────────────────────────────
+// Dimension (class/location) filtering — shared by P&L and Balance Sheet
+// ────────────────────────────────────────────────────────────────────────────
+type Dim = { id: number; name: string; isActive: boolean };
+
+function useDimensionOptions() {
+  const { data: classes = [] } = useQuery<Dim[]>({ queryKey: ["/api/classes"] });
+  const { data: locations = [] } = useQuery<Dim[]>({ queryKey: ["/api/locations"] });
+  return { classes, locations };
+}
+
+function DimensionSelect({ label, items, value, onChange, testid }: {
+  label: string; items: Dim[]; value?: number; onChange: (v?: number) => void; testid: string;
+}) {
+  // Hidden entirely when the org uses no dimensions of this kind — keeps the
+  // report toolbar clean for the common case.
+  if (items.length === 0) return null;
+  return (
+    <div>
+      <Label>{label}</Label>
+      <select
+        className="flex h-9 w-40 rounded-md border border-input bg-background px-2 text-sm"
+        value={value ?? ""}
+        onChange={(e) => onChange(e.target.value ? Number(e.target.value) : undefined)}
+        data-testid={testid}
+      >
+        <option value="">All</option>
+        {items.filter((i) => i.isActive || i.id === value).map((i) => (
+          <option key={i.id} value={i.id}>{i.name}</option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function dimQuery(classId?: number, locationId?: number): string {
+  return `${classId ? `&classId=${classId}` : ""}${locationId ? `&locationId=${locationId}` : ""}`;
+}
+
 export default function Reports() {
   return (
     <Layout>
@@ -42,9 +81,12 @@ export default function Reports() {
 function ProfitLoss() {
   const [from, setFrom] = useState(startOfYearISO());
   const [to, setTo] = useState(todayISO());
+  const { classes, locations } = useDimensionOptions();
+  const [classId, setClassId] = useState<number | undefined>();
+  const [locationId, setLocationId] = useState<number | undefined>();
   const { data } = useQuery<any>({
-    queryKey: ["/api/reports/profit-loss", from, to],
-    queryFn: async () => (await apiRequest("GET", `/api/reports/profit-loss?from=${from}&to=${to}`)).json(),
+    queryKey: ["/api/reports/profit-loss", from, to, classId, locationId],
+    queryFn: async () => (await apiRequest("GET", `/api/reports/profit-loss?from=${from}&to=${to}${dimQuery(classId, locationId)}`)).json(),
   });
 
   if (!data) return <Loader />;
@@ -52,9 +94,11 @@ function ProfitLoss() {
   return (
     <Card>
       <CardContent className="p-6">
-        <div className="flex items-end gap-3 mb-6">
+        <div className="flex items-end gap-3 mb-6 flex-wrap">
           <div><Label>From</Label><Input type="date" data-testid="input-pl-from" value={from} onChange={(e) => setFrom(e.target.value)} /></div>
           <div><Label>To</Label><Input type="date" data-testid="input-pl-to" value={to} onChange={(e) => setTo(e.target.value)} /></div>
+          <DimensionSelect label="Class" items={classes} value={classId} onChange={setClassId} testid="select-pl-class" />
+          <DimensionSelect label="Location" items={locations} value={locationId} onChange={setLocationId} testid="select-pl-location" />
         </div>
         <div className="text-center mb-6">
           <h2 className="text-base font-semibold">Profit & Loss</h2>
@@ -87,9 +131,12 @@ function ProfitLoss() {
 // ────────────────────────────────────────────────────────────────────────────
 function BalanceSheet() {
   const [asOf, setAsOf] = useState(todayISO());
+  const { classes, locations } = useDimensionOptions();
+  const [classId, setClassId] = useState<number | undefined>();
+  const [locationId, setLocationId] = useState<number | undefined>();
   const { data } = useQuery<any>({
-    queryKey: ["/api/reports/balance-sheet", asOf],
-    queryFn: async () => (await apiRequest("GET", `/api/reports/balance-sheet?asOf=${asOf}`)).json(),
+    queryKey: ["/api/reports/balance-sheet", asOf, classId, locationId],
+    queryFn: async () => (await apiRequest("GET", `/api/reports/balance-sheet?asOf=${asOf}${dimQuery(classId, locationId)}`)).json(),
   });
   if (!data) return <Loader />;
 
@@ -107,8 +154,10 @@ function BalanceSheet() {
   return (
     <Card>
       <CardContent className="p-6">
-        <div className="flex items-end gap-3 mb-6">
+        <div className="flex items-end gap-3 mb-6 flex-wrap">
           <div><Label>As of</Label><Input type="date" data-testid="input-bs-asof" value={asOf} onChange={(e) => setAsOf(e.target.value)} /></div>
+          <DimensionSelect label="Class" items={classes} value={classId} onChange={setClassId} testid="select-bs-class" />
+          <DimensionSelect label="Location" items={locations} value={locationId} onChange={setLocationId} testid="select-bs-location" />
         </div>
         <div className="text-center mb-6">
           <h2 className="text-base font-semibold">Balance Sheet</h2>

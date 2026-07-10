@@ -10,7 +10,7 @@
 
 import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { CheckCircle2, XCircle, CreditCard, MapPin } from "lucide-react";
+import { CheckCircle2, XCircle, CreditCard, MapPin, Tags } from "lucide-react";
 import type { Account } from "@shared/schema";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -51,6 +51,54 @@ function StatusRow({ ok, label, detail }: { ok: boolean; label: string; detail?:
         {!ok && detail ? <p className="text-muted-foreground text-xs mt-0.5">{detail}</p> : null}
       </div>
     </div>
+  );
+}
+
+// Manage a single dimension type (classes OR locations): list, add, and
+// activate/deactivate. Inactive entries stay on historical transactions but are
+// hidden from new-entry pickers.
+function DimensionManager({ kind, title, canEdit }: { kind: "classes" | "locations"; title: string; canEdit: boolean }) {
+  const { toast } = useToast();
+  const singular = kind === "classes" ? "class" : "location";
+  const { data: items = [] } = useQuery<Array<{ id: number; name: string; isActive: boolean }>>({ queryKey: [`/api/${kind}`] });
+  const [name, setName] = useState("");
+  const createMut = useMutation({
+    mutationFn: async () => (await apiRequest("POST", `/api/${kind}`, { name: name.trim() })).json(),
+    onSuccess: () => { setName(""); queryClient.invalidateQueries({ queryKey: [`/api/${kind}`] }); },
+    onError: (e: any) => toast({ title: "Error", description: String(e?.message || e), variant: "destructive" }),
+  });
+  const toggleMut = useMutation({
+    mutationFn: async (it: { id: number; isActive: boolean }) => { await apiRequest("PATCH", `/api/${kind}/${it.id}`, { isActive: !it.isActive }); },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: [`/api/${kind}`] }),
+  });
+  return (
+    <Card data-testid={`card-${kind}`}>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2"><Tags className="h-5 w-5" /> {title}</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <ul className="divide-y">
+          {items.map((it) => (
+            <li key={it.id} className="flex items-center justify-between py-1.5 text-sm" data-testid={`row-${kind}-${it.id}`}>
+              <span className={it.isActive ? "" : "text-muted-foreground line-through"}>{it.name}</span>
+              {canEdit && (
+                <button className="text-xs underline text-muted-foreground hover:text-foreground" onClick={() => toggleMut.mutate(it)} data-testid={`toggle-${kind}-${it.id}`}>
+                  {it.isActive ? "Deactivate" : "Activate"}
+                </button>
+              )}
+            </li>
+          ))}
+          {items.length === 0 && <li className="py-1.5 text-sm text-muted-foreground">None yet.</li>}
+        </ul>
+        {canEdit && (
+          <div className="flex gap-2">
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder={`New ${singular}`} data-testid={`input-new-${kind}`}
+              onKeyDown={(e) => { if (e.key === "Enter" && name.trim()) createMut.mutate(); }} />
+            <Button onClick={() => createMut.mutate()} disabled={!name.trim() || createMut.isPending} data-testid={`button-add-${kind}`}>Add</Button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -271,6 +319,9 @@ export default function Settings() {
             </Button>
           </CardContent>
         </Card>
+
+        <DimensionManager kind="classes" title="Classes" canEdit={canEdit} />
+        <DimensionManager kind="locations" title="Locations" canEdit={canEdit} />
       </div>
     </Layout>
   );
