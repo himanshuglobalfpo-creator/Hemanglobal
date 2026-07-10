@@ -26,6 +26,7 @@ import { and, eq } from "drizzle-orm";
 import { formatMoney } from "@shared/money";
 import { appBaseUrl } from "./email";
 import { withOrg } from "./org-scope";
+import { logger } from "./logger";
 
 // Exact message the webhook/UI contract depends on — do not reword casually.
 export const CLEARING_ACCOUNT_NOT_CONFIGURED =
@@ -88,7 +89,7 @@ function getStripe(): any | null {
     return _stripe;
   } catch (e: any) {
     _stripeError = `stripe SDK not installed (npm i stripe): ${e?.message || e}`;
-    console.warn("[stripe]", _stripeError);
+    logger.warn("[stripe] SDK load failed", { error: _stripeError });
     return null;
   }
 }
@@ -198,7 +199,7 @@ export function registerStripeRoutes(app: Express) {
       });
       res.json({ url: session.url, sessionId: session.id });
     } catch (e: any) {
-      console.error("[stripe/payment-link]", e);
+      logger.error("[stripe/payment-link] failed", { error: e?.message, stack: e?.stack?.split("\n").slice(0, 5).join(" | ") });
       res.status(500).json({ error: e?.message || "Failed to create payment link" });
     }
   });
@@ -232,7 +233,7 @@ export function registerStripeRoutes(app: Express) {
       // which tenant this payment belongs to. Never default to org 1.
       const orgId = (data as any).orgId;
       if (!Number.isInteger(orgId) || orgId <= 0) {
-        console.error(`[stripe/pay] share ${token} has no valid orgId`);
+        logger.error("[stripe/pay] share has no valid orgId", { token });
         res.status(500).type("html").send("<h1>Payment error</h1><p>This payment link is misconfigured. Please contact the sender.</p>");
         return;
       }
@@ -242,7 +243,7 @@ export function registerStripeRoutes(app: Express) {
       try {
         await getConfiguredClearingAccount(orgId);
       } catch (e: any) {
-        console.error(`[stripe/pay] org ${orgId}: ${e?.message || e}`);
+        logger.error("[stripe/pay] clearing account not configured", { orgId, error: e?.message || String(e) });
         res.status(503).type("html").send("<h1>Online payment not available</h1><p>The sender has not finished setting up online payments. Please contact them to pay another way.</p>");
         return;
       }
@@ -264,7 +265,7 @@ export function registerStripeRoutes(app: Express) {
       });
       res.redirect(303, session.url);
     } catch (e: any) {
-      console.error("[stripe/pay]", e);
+      logger.error("[stripe/pay] failed to start checkout", { error: e?.message, stack: e?.stack?.split("\n").slice(0, 5).join(" | ") });
       res.status(500).type("html").send("<h1>Payment error</h1><p>Something went wrong starting the payment. Please try again or contact the sender.</p>");
     }
   });
@@ -289,7 +290,7 @@ export function registerStripeRoutes(app: Express) {
     try {
       event = stripe.webhooks.constructEvent(req.rawBody as Buffer, sig, secret);
     } catch (err: any) {
-      console.error("[stripe/webhook] signature verification failed:", err.message);
+      logger.error("[stripe/webhook] signature verification failed", { error: err.message });
       res.status(400).send(`Webhook Error: ${err.message}`);
       return;
     }
@@ -304,9 +305,7 @@ export function registerStripeRoutes(app: Express) {
           // A session without our metadata was not created by this app (or is
           // corrupt). Recording it against a guessed tenant would post money to
           // the wrong books — ack it so Stripe stops retrying, and log loudly.
-          console.error(
-            `[stripe/webhook] checkout.session.completed ${session.id} missing invoiceId/orgId metadata — ignored`
-          );
+          logger.error("[stripe/webhook] checkout.session.completed missing invoiceId/orgId metadata — ignored", { sessionId: session.id });
           res.json({ received: true, ignored: true });
           return;
         }
@@ -335,12 +334,12 @@ export function registerStripeRoutes(app: Express) {
             bankAccountId: bank.id,
             memo: `Stripe payment ${session.id}`,
           });
-          console.log(`[stripe/webhook] paid invoice ${inv.number} for ${formatMoney(session.amount_total || 0)} via ${session.id}`);
+          logger.info("[stripe/webhook] invoice paid", { invoice: inv.number, amount: formatMoney(session.amount_total || 0), sessionId: session.id });
         });
       }
       res.json({ received: true });
     } catch (e: any) {
-      console.error("[stripe/webhook] processing error:", e);
+      logger.error("[stripe/webhook] processing error", { error: e?.message, stack: e?.stack?.split("\n").slice(0, 5).join(" | ") });
       // Return 200 so Stripe doesn't keep retrying — we've logged the error
       // (alternative: return 500 to retry; depends on operator preference)
       res.status(500).json({ error: e?.message });

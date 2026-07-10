@@ -72,6 +72,7 @@ import { calculateSalesTax, validateAddress, taxjarStatus } from "./taxjar";
 import { z } from "zod";
 import { publicLimiter, writeLimiter, importLimiter } from "./rate-limit";
 import { logger } from "./logger";
+import { mapDbError } from "./db-errors";
 import { metricsMiddleware, metricsHandler } from "./metrics";
 import crypto from "node:crypto";
 import { fileDriver, ATTACHMENT_MAX_BYTES, ATTACHMENT_MIME_WHITELIST } from "./files";
@@ -152,6 +153,60 @@ function assertUnmodifiedSince(row: { updatedAt?: string | null } | undefined, i
   }
 }
 
+// Single place every route helper funnels errors through, so the mapping order
+// is identical for sync and async handlers:
+//   1. Zod validation      → 400 with field details
+//   2. explicit httpStatus  → honored verbatim (e.g. 409 duplicate-name/conflict)
+//   3. raw Postgres error   → sanitized {status,message} (BUG-004); raw driver
+//                             text/constraint stays in the structured log only
+//   4. business-rule text   → 400 (USER_ERROR_PATTERNS)
+//   5. anything else        → 500 with a generic message (never leak internals)
+function respondError(res: Response, err: any): void {
+  if (res.headersSent) return; // response already streamed; nothing to add
+  if (err instanceof z.ZodError) {
+    res.status(400).json({ error: "Validation failed", details: err.errors });
+    return;
+  }
+  // Errors can carry an explicit HTTP status (e.g. 409 optimistic-concurrency
+  // conflicts, duplicate-name detection) — honor it before any other mapping.
+  if (typeof err?.httpStatus === "number") {
+    const body: Record<string, unknown> = { error: err.message };
+    // Duplicate-name detection (BUG-006) attaches the existing record so the
+    // client can offer "use existing / create anyway".
+    if (err.existing !== undefined) body.existing = err.existing;
+    res.status(err.httpStatus).json(body);
+    return;
+  }
+  // Raw Postgres driver error → friendly envelope. Log the full detail first.
+  const friendly = mapDbError(err);
+  if (friendly) {
+    logger.error("Database error", {
+      reqId: (res.req as any)?.reqId,
+      path: (res.req as any)?.path,
+      status: friendly.status,
+      pgCode: err?.code ?? err?.cause?.code,
+      pgDetail: err?.detail ?? err?.cause?.detail,
+      pgConstraint: err?.constraint ?? err?.cause?.constraint,
+    });
+    res.status(friendly.status).json({ error: friendly.message });
+    return;
+  }
+  const msg: string = err?.message || "Server error";
+  if (USER_ERROR_PATTERNS.some((p) => p.test(msg))) {
+    res.status(400).json({ error: msg });
+  } else {
+    // res.req is the paired request — carries the reqId minted in index.ts,
+    // so this 5xx line and the client's x-request-id header correlate 1:1.
+    logger.error("Unhandled route error", {
+      reqId: (res.req as any)?.reqId,
+      path: (res.req as any)?.path,
+      error: msg,
+      stack: err?.stack?.split("\n").slice(0, 5).join(" | "),
+    });
+    res.status(500).json({ error: msg });
+  }
+}
+
 async function handle<T>(res: Response, fn: () => T | Promise<T>) {
   try {
     const out = await fn();
@@ -159,56 +214,14 @@ async function handle<T>(res: Response, fn: () => T | Promise<T>) {
     // finish inside fn() — do not double-send.
     if (!res.headersSent) res.json(out);
   } catch (err: any) {
-    if (res.headersSent) return; // response already streamed; nothing to add
-    if (err instanceof z.ZodError) {
-      res.status(400).json({ error: "Validation failed", details: err.errors });
-      return;
-    }
-    // Errors can carry an explicit HTTP status (e.g. 409 optimistic-concurrency
-    // conflicts) — honor it before the pattern-based 400 mapping.
-    if (typeof err?.httpStatus === "number") {
-      res.status(err.httpStatus).json({ error: err.message });
-      return;
-    }
-    const msg: string = err?.message || "Server error";
-    if (USER_ERROR_PATTERNS.some((p) => p.test(msg))) {
-      res.status(400).json({ error: msg });
-    } else {
-      // res.req is the paired request — carries the reqId minted in index.ts,
-      // so this 5xx line and the client's x-request-id header correlate 1:1.
-      logger.error("Unhandled route error", {
-        reqId: (res.req as any)?.reqId,
-        path: (res.req as any)?.path,
-        error: msg,
-        stack: err?.stack?.split("\n").slice(0, 5).join(" | "),
-      });
-      res.status(500).json({ error: msg });
-    }
+    respondError(res, err);
   }
 }
 
 function handleAsync<T>(res: Response, fn: () => Promise<T>) {
   fn()
     .then((out) => { if (!res.headersSent) res.json(out); })
-    .catch((err: any) => {
-      if (res.headersSent) return;
-      if (err instanceof z.ZodError) {
-        res.status(400).json({ error: "Validation failed", details: err.errors });
-        return;
-      }
-      const msg: string = err?.message || "Server error";
-      if (USER_ERROR_PATTERNS.some((p) => p.test(msg))) {
-        res.status(400).json({ error: msg });
-      } else {
-        logger.error("Unhandled route error", {
-          reqId: (res.req as any)?.reqId,
-          path: (res.req as any)?.path,
-          error: msg,
-          stack: err?.stack?.split("\n").slice(0, 5).join(" | "),
-        });
-        res.status(500).json({ error: msg });
-      }
-    });
+    .catch((err: any) => respondError(res, err));
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
@@ -880,7 +893,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/customers", (req, res) =>
     handle(res, async () => {
       const data = insertCustomerSchema.parse(req.body);
-      return storage.createCustomer(data);
+      // `force` bypasses duplicate-name detection (BUG-006). It is not part of
+      // the insert schema, so read it from the raw body.
+      const force = req.body?.force === true;
+      return storage.createCustomer(data, { force });
     })
   );
   app.patch("/api/customers/:id", (req, res) =>
@@ -911,7 +927,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/vendors", (req, res) =>
     handle(res, async () => {
       const data = insertVendorSchema.parse(req.body);
-      return storage.createVendor(data);
+      const force = req.body?.force === true;
+      return storage.createVendor(data, { force });
     })
   );
   app.patch("/api/vendors/:id", (req, res) =>
@@ -952,7 +969,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           debit: toCents(l.debit || 0),
           credit: toCents(l.credit || 0),
         })),
-      });
+      }, { futureDateCheck: true });
     })
   );
 
@@ -1518,7 +1535,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const result = handlePlaidWebhook(req.body);
       res.json(result);
     } catch (e: any) {
-      console.error("[plaid/webhook]", e);
+      logger.error("[plaid/webhook] processing error", { error: e?.message, stack: e?.stack?.split("\n").slice(0, 5).join(" | ") });
       res.status(200).json({ ok: false }); // don't 500 — Plaid will retry forever
     }
   });
@@ -2148,14 +2165,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(403).json({ error: "Not available in production" });
     }
     return handle(res, async () => {
-      // Customers
-      const c1 = await storage.createCustomer({ name: "Acme Corp", email: "ap@acme.com", phone: "555-0100", address: undefined, notes: undefined });
-      const c2 = await storage.createCustomer({ name: "Globex LLC", email: "billing@globex.com", phone: "555-0200", address: undefined, notes: undefined });
-      const c3 = await storage.createCustomer({ name: "Initech Inc", email: "accounts@initech.com", phone: undefined, address: undefined, notes: undefined });
+      // Customers — force past duplicate-name detection so the dev seed stays
+      // re-runnable (BUG-006).
+      const c1 = await storage.createCustomer({ name: "Acme Corp", email: "ap@acme.com", phone: "555-0100", address: undefined, notes: undefined }, { force: true });
+      const c2 = await storage.createCustomer({ name: "Globex LLC", email: "billing@globex.com", phone: "555-0200", address: undefined, notes: undefined }, { force: true });
+      const c3 = await storage.createCustomer({ name: "Initech Inc", email: "accounts@initech.com", phone: undefined, address: undefined, notes: undefined }, { force: true });
       // Vendors
-      const v1 = await storage.createVendor({ name: "WeWork", email: "billing@wework.com", phone: undefined, address: undefined, notes: undefined });
-      const v2 = await storage.createVendor({ name: "AWS", email: "billing@aws.com", phone: undefined, address: undefined, notes: undefined });
-      const v3 = await storage.createVendor({ name: "Office Depot", email: undefined, phone: undefined, address: undefined, notes: undefined });
+      const v1 = await storage.createVendor({ name: "WeWork", email: "billing@wework.com", phone: undefined, address: undefined, notes: undefined }, { force: true });
+      const v2 = await storage.createVendor({ name: "AWS", email: "billing@aws.com", phone: undefined, address: undefined, notes: undefined }, { force: true });
+      const v3 = await storage.createVendor({ name: "Office Depot", email: undefined, phone: undefined, address: undefined, notes: undefined }, { force: true });
 
       const accts = await storage.listAccounts();
       const byCode = (code: string) => accts.find((a) => a.code === code)!;

@@ -7,6 +7,7 @@ import { storage, initDatabase, closeDatabase } from "./storage";
 import { createServer } from "node:http";
 import crypto from "node:crypto";
 import { logger } from "./logger";
+import { mapDbError } from "./db-errors";
 
 const app = express();
 const httpServer = createServer(app);
@@ -125,17 +126,6 @@ app.use((req, res, next) => {
   next();
 });
 
-export function log(message: string, source = "express") {
-  const formattedTime = new Date().toLocaleTimeString("en-US", {
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true,
-  });
-
-  console.log(`${formattedTime} [${source}] ${message}`);
-}
-
 const MAX_LOG_BODY_CHARS = 200;
 
 app.use((req, res, next) => {
@@ -215,15 +205,22 @@ app.use((req, res, next) => {
   }
 
   app.use((err: any, req: Request, res: Response, next: NextFunction) => {
-    const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
+    // Map raw Postgres driver errors (unique/FK/range/etc.) to a safe, friendly
+    // response. The FULL error — SQLSTATE, constraint, detail, stack — is kept in
+    // the structured log below; only the sanitized envelope reaches the client.
+    const friendly = mapDbError(err);
+    const status = friendly?.status || err.status || err.statusCode || 500;
+    const clientMessage = friendly?.message || err.message || "Internal Server Error";
 
     // Structured, correlated: this reqId matches the x-request-id header the
     // client received — the join key between a support ticket and the logs.
     logger.error("Internal Server Error", {
       reqId: req.reqId,
       status,
-      error: message,
+      error: err?.message,
+      pgCode: err?.code ?? err?.cause?.code,
+      pgDetail: err?.detail ?? err?.cause?.detail,
+      pgConstraint: err?.constraint ?? err?.cause?.constraint,
       stack: err?.stack?.split("\n").slice(0, 5).join(" | "),
     });
 
@@ -231,7 +228,7 @@ app.use((req, res, next) => {
       return next(err);
     }
 
-    return res.status(status).json({ message });
+    return res.status(status).json({ message: clientMessage });
   });
 
   // importantly only setup vite in development and after
@@ -270,7 +267,7 @@ app.use((req, res, next) => {
     logger.info(`Received ${signal}, shutting down gracefully…`);
     httpServer.close((err) => {
       if (err) {
-        console.error("Error during shutdown:", err);
+        logger.error("Error during shutdown", { error: err.message });
         process.exit(1);
       }
       logger.info("HTTP server closed.");
@@ -283,7 +280,7 @@ app.use((req, res, next) => {
     });
     // Hard timeout — if connections won't drain in 10s, force exit
     setTimeout(() => {
-      console.error("Shutdown timed out, forcing exit");
+      logger.error("Shutdown timed out, forcing exit");
       process.exit(1);
     }, 10000).unref();
   }

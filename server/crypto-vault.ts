@@ -14,6 +14,7 @@
 //      break, and storage lazily re-encrypts them on first read.
 
 import crypto from "node:crypto";
+import { logger } from "./logger";
 
 const ALGO = "aes-256-gcm";
 const IV_BYTES = 12; // 96-bit IV — the NIST-recommended size for GCM
@@ -40,7 +41,7 @@ export function assertEncryptionKey(): void {
     );
   }
   if (!valid && hex) {
-    console.warn("[vault] APP_ENCRYPTION_KEY is set but malformed — secrets will NOT be encrypted (non-production).");
+    logger.warn("[vault] APP_ENCRYPTION_KEY is set but malformed — secrets will NOT be encrypted (non-production).");
   }
 }
 

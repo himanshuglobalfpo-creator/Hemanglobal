@@ -20,6 +20,8 @@
  *      storage.importBankTransactions, persists the new cursor.
  */
 
+import { logger } from "./logger";
+
 let _plaid: any = null;
 let _plaidLoadError: string | null = null;
 
@@ -47,7 +49,7 @@ function loadPlaidSdk():
     return _plaid;
   } catch (e: any) {
     _plaidLoadError = `plaid SDK not installed (run: npm i plaid). Error: ${e?.message || e}`;
-    console.warn("[plaid]", _plaidLoadError);
+    logger.warn("[plaid] SDK load failed", { error: _plaidLoadError });
     return { error: _plaidLoadError };
   }
 }
@@ -97,7 +99,7 @@ export async function createLinkToken(
     });
     return { link_token: res.data.link_token, expiration: res.data.expiration };
   } catch (e: any) {
-    console.error("[plaid] linkTokenCreate failed:", e?.response?.data || e?.message);
+    logger.error("[plaid] linkTokenCreate failed", { error: e?.response?.data || e?.message });
     return { error: `Plaid error: ${e?.response?.data?.error_message || e?.message || e}` };
   }
 }
@@ -112,7 +114,7 @@ export async function exchangePublicToken(
     const res = await sdk.client.itemPublicTokenExchange({ public_token: publicToken });
     return { access_token: res.data.access_token, item_id: res.data.item_id };
   } catch (e: any) {
-    console.error("[plaid] itemPublicTokenExchange failed:", e?.response?.data || e?.message);
+    logger.error("[plaid] itemPublicTokenExchange failed", { error: e?.response?.data || e?.message });
     return { error: `Plaid error: ${e?.response?.data?.error_message || e?.message || e}` };
   }
 }
@@ -161,7 +163,7 @@ export async function syncTransactions(
       has_more: data.has_more,
     };
   } catch (e: any) {
-    console.error("[plaid] transactionsSync failed:", e?.response?.data || e?.message);
+    logger.error("[plaid] transactionsSync failed", { error: e?.response?.data || e?.message });
     return { error: `Plaid error: ${e?.response?.data?.error_message || e?.message || e}` };
   }
 }
@@ -176,7 +178,7 @@ export function handlePlaidWebhook(body: any): { ok: boolean; action?: string } 
       webhook_code === "INITIAL_UPDATE" ||
       webhook_code === "HISTORICAL_UPDATE"
     ) {
-      console.log(`[plaid/webhook] item ${item_id}: ${webhook_code}`);
+      logger.info("[plaid/webhook] update available", { itemId: item_id, webhookCode: webhook_code });
       return { ok: true, action: "sync_pending" };
     }
   }

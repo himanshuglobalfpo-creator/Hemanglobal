@@ -41,6 +41,7 @@ import { generateTotpSecret, verifyTotp, otpauthUri, generateRecoveryCodes } fro
 import { encryptSecret, decryptSecret } from "./crypto-vault";
 import { users, organizations, accounts } from "@shared/schema";
 import { db, pool } from "./storage";
+import { logger } from "./logger";
 
 // Same patterns as routes.ts — keep duplicates minimal but localized.
 function handle<T>(res: Response, fn: () => Promise<T> | T) {
@@ -55,7 +56,7 @@ function handle<T>(res: Response, fn: () => Promise<T> | T) {
       const msg = err?.message || "Server error";
       const userError = /not found|missing|required|invalid|exists|locked|expired|incorrect/i.test(msg);
       res.status(userError ? 400 : 500).json({ error: msg });
-      if (!userError) console.error(err);
+      if (!userError) logger.error("Auth route error", { error: msg, stack: err?.stack?.split("\n").slice(0, 5).join(" | ") });
     });
 }
 
@@ -92,10 +93,10 @@ export function registerAuthRoutes(app: Express) {
         `You have 24 hours of full access before verification is required.`,
       ].join("\n"),
     }).then((r) => {
-      if (!r.ok) console.error(`[verify email] send failed for user ${u.id}: ${r.error}`);
+      if (!r.ok) logger.error("[verify email] send failed", { userId: u.id, error: r.error });
     });
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[verify email] ${u.email}: token=${u.emailVerifyToken}`);
+      logger.info("[verify email] token issued (dev)", { email: u.email, token: u.emailVerifyToken });
     }
   }
 
@@ -377,10 +378,10 @@ export function registerAuthRoutes(app: Express) {
             `If you didn't request this, you can safely ignore this email.`,
           ].join("\n"),
         }).then((r) => {
-          if (!r.ok) console.error(`[password reset] email send failed for user ${u.id}: ${r.error}`);
+          if (!r.ok) logger.error("[password reset] email send failed", { userId: u.id, error: r.error });
         });
         if (process.env.NODE_ENV !== "production") {
-          console.log(`[password reset] ${u.email}: token=${token}`);
+          logger.info("[password reset] token issued (dev)", { email: u.email, token });
         }
       }
       return { ok: true, message: "If that email is registered, a reset link has been sent." };
@@ -539,10 +540,10 @@ export function registerAuthRoutes(app: Express) {
           ].join("\n"),
         });
         if (!inviteSend.ok) {
-          console.error(`[invite] email send failed for ${data.email}: ${inviteSend.error}`);
+          logger.error("[invite] email send failed", { email: data.email, error: inviteSend.error });
         }
         if (process.env.NODE_ENV !== "production") {
-          console.log(`[invite] ${data.email} to ${req.org.name}: setup token=${token}`);
+          logger.info("[invite] setup token issued (dev)", { email: data.email, org: req.org.name, token });
         }
       } else {
         // Existing user: notify them they've been added (no credential link needed)
@@ -551,7 +552,7 @@ export function registerAuthRoutes(app: Express) {
           subject: `You've been added to ${req.org.name} on LedgerLite`,
           text: `${req.user.name || req.user.email} added you to "${req.org.name}" on LedgerLite as ${data.role}. Log in at ${appBaseUrl()} and switch organizations to access it.`,
         }).then((r) => {
-          if (!r.ok) console.error(`[invite] notification send failed for ${data.email}: ${r.error}`);
+          if (!r.ok) logger.error("[invite] notification send failed", { email: data.email, error: r.error });
         });
       }
       const m = await addMember(u.id, orgId, data.role);

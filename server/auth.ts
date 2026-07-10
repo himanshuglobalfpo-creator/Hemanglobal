@@ -28,6 +28,7 @@ import {
 // open its own connection (one Pool singleton for the whole app).
 // ----------------------------------------------------------------------------
 import { db, pool } from "./storage";
+import { logger } from "./logger";
 
 // ----------------------------------------------------------------------------
 // Constants
@@ -115,6 +116,8 @@ export async function listOrgsForUser(userId: number): Promise<Array<Organizatio
     timezone: r.timezone,
     stripeClearingAccountId: r.stripe_clearing_account_id ?? null,
     allowNegativeStock: r.allow_negative_stock ?? false,
+    strictFutureDates: r.strict_future_dates ?? false,
+    futureDatedGraceDays: r.future_dated_grace_days ?? 0,
     addressCity: r.address_city ?? null,
     addressState: r.address_state ?? null,
     addressZip: r.address_zip ?? null,
@@ -184,7 +187,7 @@ export async function setActiveOrg(sessionId: string, orgId: number) {
 // Periodic cleanup: delete expired sessions hourly
 export function startSessionCleanup() {
   const interval = setInterval(() => {
-    db.delete(sessions).where(lt(sessions.expiresAt, new Date().toISOString())).catch((e) => console.warn("[auth] session cleanup failed:", e?.message));
+    db.delete(sessions).where(lt(sessions.expiresAt, new Date().toISOString())).catch((e) => logger.warn("[auth] session cleanup failed", { error: e?.message }));
   }, 3600_000);
   if (typeof interval.unref === "function") interval.unref();
 }

@@ -115,6 +115,7 @@ import type {
 } from "@shared/schema";
 import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
+import { futureDatedWarning } from "@shared/dates";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { currentOrgId, currentUserId, withOrg } from "./org-scope";
 import { encryptSecret, decryptSecret, isLegacyPlaintext, encryptionAvailable, assertEncryptionKey } from "./crypto-vault";
@@ -158,7 +159,7 @@ export const pool = new Pool({
 
 // Surface pool-level errors (e.g. backend restarts) instead of crashing silently.
 pool.on("error", (err) => {
-  console.error("[pg] idle client error:", err.message);
+  logger.error("[pg] idle client error", { error: err.message });
 });
 
 export const db = drizzle(pool);
@@ -203,7 +204,9 @@ export async function runMigrations(): Promise<void> {
       await client.query(sqlText);
       await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
       await client.query("COMMIT");
-      console.log(`[migration] applied ${file}`);
+      // Migration bootstrap runs during initDatabase(); the logger is
+      // dependency-free so it's safe here too.
+      logger.info(`[migration] applied ${file}`);
     } catch (err) {
       await client.query("ROLLBACK");
       throw new Error(`Migration ${file} failed: ${(err as Error).message}`);
@@ -363,7 +366,7 @@ export class DatabaseStorage {
         ;
     } catch (e) {
       // Audit must never break the operation
-      console.warn("audit log write failed:", e);
+      logger.warn("audit log write failed", { error: (e as Error)?.message });
     }
   }
   async listAuditLog(
@@ -412,6 +415,34 @@ export class DatabaseStorage {
   async isDateLocked(date: string): Promise<boolean> {
     const lock = await this.effectiveLockDate();
     return lock !== null && date <= lock;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Future-dated document policy (BUG-005). Reads the org's grace-days + strict
+  // flag once. `checkFutureDate` either returns a non-blocking warning string
+  // (soft mode) or throws a 400 (strict mode). Callers run it BEFORE any write
+  // so a rejected document never touches the ledger, and attach the returned
+  // warning to their response so the client can surface it.
+  // ---------------------------------------------------------------------------
+  private async futureDatePolicy(): Promise<{ graceDays: number; strict: boolean }> {
+    const row = await db
+      .select({ grace: organizations.futureDatedGraceDays, strict: organizations.strictFutureDates })
+      .from(organizations)
+      .where(eq(organizations.id, currentOrgId()))
+      .then((r: any[]) => r[0]);
+    return { graceDays: row?.grace ?? 0, strict: !!row?.strict };
+  }
+
+  async checkFutureDate(date: string, docLabel: string): Promise<string | null> {
+    const { graceDays, strict } = await this.futureDatePolicy();
+    const warning = futureDatedWarning(date, graceDays, docLabel);
+    if (!warning) return null;
+    if (strict) {
+      const err: any = new Error(`${warning} Strict mode is enabled, so this ${docLabel} cannot be saved.`);
+      err.httpStatus = 400;
+      throw err;
+    }
+    return warning;
   }
   async closePeriod(input: ClosePeriodInput): Promise<PeriodLock> {
     // Sanity: must be after the previous lock date
@@ -691,14 +722,10 @@ export class DatabaseStorage {
 
     if (!canAutoCalc) {
       if (taxjarConfigured() && cust && (!cust.shippingZip || !cust.shippingState)) {
-        console.warn(
-          `[taxjar] invoice ${input.number ?? "(auto)"}: customer "${cust.name}" has no shipping ZIP/state — using manual tax`
-        );
+        logger.warn("[taxjar] customer has no shipping ZIP/state — using manual tax", { invoice: input.number ?? "(auto)", customer: cust.name });
       }
       if (taxjarConfigured() && (!ctx.fromZip || !ctx.fromState)) {
-        console.warn(
-          `[taxjar] invoice ${input.number ?? "(auto)"}: organization has no ship-from address configured — using manual tax`
-        );
+        logger.warn("[taxjar] organization has no ship-from address configured — using manual tax", { invoice: input.number ?? "(auto)" });
       }
       return await this.createInvoice(input);
     }
@@ -726,7 +753,7 @@ export class DatabaseStorage {
     } catch (e: any) {
       // calculateSalesTax only throws on invalid input (bad state code etc.) —
       // API failures already fall back internally. Still: never block the invoice.
-      console.warn(`[taxjar] invoice ${input.number ?? "(auto)"}: calculation error (${e?.message}); using manual tax`);
+      logger.warn("[taxjar] calculation error; using manual tax", { invoice: input.number ?? "(auto)", error: e?.message });
       return await this.createInvoice(input);
     }
 
@@ -1049,7 +1076,25 @@ export class DatabaseStorage {
     const rows = await db.select().from(customers).where(where).orderBy(customers.name).limit(limit).offset(offset);
     return { rows, total, limit, offset };
   }
-  async createCustomer(data: InsertCustomer): Promise<Customer> {
+  async createCustomer(data: InsertCustomer, opts: { force?: boolean } = {}): Promise<Customer> {
+    // Duplicate-name detection (BUG-006): block a same-name customer (case-
+    // insensitive, same org) unless the caller explicitly forces it. The 409
+    // carries the existing record's id so the client can offer
+    // "use existing / create anyway".
+    if (!opts.force) {
+      const existing = await db
+        .select({ id: customers.id, name: customers.name })
+        .from(customers)
+        .where(and(eq(customers.orgId, currentOrgId()), sql`lower(${customers.name}) = lower(${data.name})`))
+        .limit(1)
+        .then((r: any[]) => r[0]);
+      if (existing) {
+        const err: any = new Error(`A customer named "${existing.name}" already exists. Use the existing one, or resubmit with force to create a duplicate.`);
+        err.httpStatus = 409;
+        err.existing = { id: existing.id, name: existing.name };
+        throw err;
+      }
+    }
     return await db.insert(customers).values({ ...data, orgId: currentOrgId() }).returning().then((r) => r[0]);
   }
   async getCustomer(id: number): Promise<Customer | undefined> {
@@ -1084,7 +1129,22 @@ export class DatabaseStorage {
     const rows = await db.select().from(vendors).where(where).orderBy(vendors.name).limit(limit).offset(offset);
     return { rows, total, limit, offset };
   }
-  async createVendor(data: InsertVendor): Promise<Vendor> {
+  async createVendor(data: InsertVendor, opts: { force?: boolean } = {}): Promise<Vendor> {
+    // Duplicate-name detection (BUG-006): mirror createCustomer.
+    if (!opts.force) {
+      const existing = await db
+        .select({ id: vendors.id, name: vendors.name })
+        .from(vendors)
+        .where(and(eq(vendors.orgId, currentOrgId()), sql`lower(${vendors.name}) = lower(${data.name})`))
+        .limit(1)
+        .then((r: any[]) => r[0]);
+      if (existing) {
+        const err: any = new Error(`A vendor named "${existing.name}" already exists. Use the existing one, or resubmit with force to create a duplicate.`);
+        err.httpStatus = 409;
+        err.existing = { id: existing.id, name: existing.name };
+        throw err;
+      }
+    }
     return await db.insert(vendors).values({ ...data, orgId: currentOrgId() }).returning().then((r) => r[0]);
   }
   async getVendor(id: number): Promise<Vendor | undefined> {
@@ -2239,7 +2299,12 @@ export class DatabaseStorage {
   // Sprint C: opts.bypassLock allows the year-end close itself to post on the lock date.
   // opts._tx: optional external drizzle transaction — pass when calling from within an
   // existing db.transaction() so all writes land in ONE atomic unit (no nested savepoint).
-  async postJournalEntry(input: PostJournalEntry, opts: { bypassLock?: boolean; _tx?: any } = {}): Promise<{ entry: JournalEntry; lines: JournalLine[] }> {
+  async postJournalEntry(input: PostJournalEntry, opts: { bypassLock?: boolean; _tx?: any; futureDateCheck?: boolean } = {}): Promise<{ entry: JournalEntry; lines: JournalLine[]; warnings?: string[] }> {
+    // Future-dated guard (BUG-005) — opt-in, so ONLY user-facing manual journal
+    // entries (the /api/journal route) are policed; internal system postings
+    // (invoice/bill/payment/payroll/depreciation JEs) are exempt. Throws in
+    // strict mode before any write; otherwise returns a warning below.
+    const futureWarning = opts.futureDateCheck ? await this.checkFutureDate(input.date, "journal entry") : null;
     // FIX #10: Compute lockDate FIRST — both the condition and the error message need it.
     // The old code interpolated `this.effectiveLockDate()` (un-awaited) into the string,
     // producing "[object Promise]" in the error message and never actually comparing correctly.
@@ -2312,10 +2377,9 @@ export class DatabaseStorage {
       return { entry, lines: insertedLines };
     };
 
-    if (opts._tx) {
-      return doInserts(opts._tx);
-    }
-    return db.transaction(doInserts);
+    const result = opts._tx ? await doInserts(opts._tx) : await db.transaction(doInserts);
+    if (futureWarning) return { ...result, warnings: [futureWarning] };
+    return result;
   }
 
   async listJournalEntries(
@@ -2387,6 +2451,9 @@ export class DatabaseStorage {
     // Auto-numbering: when the caller omits `number`, allocate the next per-org
     // value atomically. Manual override remains legal; duplicates are caught by
     // UNIQUE(org_id, number) and translated to a friendly 400 below.
+    // Future-dated guard (BUG-005): throws in strict mode BEFORE any write;
+    // otherwise yields a warning attached to the returned invoice below.
+    const futureWarning = await this.checkFutureDate(input.date, "invoice");
     const invNumber: string = input.number ?? await this.nextNumber("invoice");
     const ar = await db
       .select()
@@ -2583,6 +2650,8 @@ export class DatabaseStorage {
         const totalCogs = cogsComponents.reduce((s, c) => s + c.cogsCents, 0);
         await this.audit("post", "inventory_cogs", inv.id, `Relieved inventory for invoice ${invNumber} (COGS ${formatMoney(totalCogs)})`);
       }
+      // Non-blocking future-dated warning for the client (soft mode).
+      if (futureWarning) (inv as any).warnings = [futureWarning];
       return inv;
     };
 
@@ -2826,6 +2895,9 @@ export class DatabaseStorage {
   // bill.created webhook is NOT emitted here; the caller fires it after the
   // outer commit (a rolled-back bill must never notify).
   async createBill(input: CreateBillInput, opts: { _tx?: any } = {}): Promise<Bill> {
+    // Future-dated guard (BUG-005): throws in strict mode BEFORE any write;
+    // otherwise yields a warning attached to the returned bill below.
+    const futureWarning = await this.checkFutureDate(input.date, "bill");
     // Auto-numbering: same contract as createInvoice (see comment there).
     const billNumber: string = input.number ?? await this.nextNumber("bill");
     const ap = await db.select().from(accounts).where(and(eq(accounts.code, "2000"), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
@@ -2985,6 +3057,8 @@ export class DatabaseStorage {
         }
         await this.audit("post", "inventory_receipt", b.id, `Received inventory on bill ${billNumber}`);
       }
+      // Non-blocking future-dated warning for the client (soft mode).
+      if (futureWarning) (b as any).warnings = [futureWarning];
       return b;
     };
 
@@ -4697,7 +4771,7 @@ export class DatabaseStorage {
             ;
           template = (await this.getRecurring(template.id))!;
         } catch (e: any) {
-          console.error(`Recurring run failed for template ${template.id}:`, e.message);
+          logger.error("Recurring run failed for template", { templateId: template.id, error: e.message });
           break;
         }
       }

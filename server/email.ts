@@ -13,6 +13,7 @@
  */
 
 import nodemailer from "nodemailer";
+import { logger } from "./logger";
 
 export type SendOpts = {
   to: string;
@@ -69,12 +70,13 @@ export async function sendEmail(opts: SendOpts): Promise<SendResult> {
 
   if (!transporter) {
     // Dev mode: log it and pretend it worked so the share flow still completes.
-    console.log("\n[email:dev-mode] (SMTP not configured — would have sent:)");
-    console.log("  From:    ", from);
-    console.log("  To:      ", opts.to);
-    if (opts.cc) console.log("  Cc:      ", opts.cc);
-    console.log("  Subject: ", opts.subject);
-    console.log("  Body:\n" + opts.text.split("\n").map((l) => "    " + l).join("\n"));
+    logger.info("[email:dev-mode] SMTP not configured — email not sent", {
+      from,
+      to: opts.to,
+      cc: opts.cc,
+      subject: opts.subject,
+      body: opts.text,
+    });
     return { ok: true, mode: "dev", messageId: `dev-${Date.now()}` };
   }
 

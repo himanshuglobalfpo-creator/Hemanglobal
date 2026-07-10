@@ -16,6 +16,13 @@ export default defineConfig({
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
+    // Modern evergreen-browser baseline. Vite's default "modules" target
+    // (chrome87/es2020/…) forces esbuild to DOWN-transform destructuring that
+    // some dependencies ship, which esbuild 0.28 refuses ("Transforming
+    // destructuring to the configured target environment is not supported
+    // yet") — breaking the whole build. es2022 is supported natively by every
+    // browser this SaaS targets, so esbuild passes the syntax through instead.
+    target: "es2022",
   },
   server: {
     fs: {

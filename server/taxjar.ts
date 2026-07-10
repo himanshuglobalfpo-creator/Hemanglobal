@@ -25,6 +25,8 @@
 // removed because it pulled the deprecated `request`/`form-data`/`tough-cookie`
 // chain (SSRF + prototype-pollution advisories). These two endpoints are the
 // only ones we use, so direct calls are simpler and dependency-free.
+import { logger } from "./logger";
+
 const TAXJAR_PROD_URL = "https://api.taxjar.com";
 const TAXJAR_SANDBOX_URL = "https://api.sandbox.taxjar.com";
 const TAXJAR_TIMEOUT_MS = 15_000;
@@ -163,12 +165,12 @@ function fallbackResult(
 ): CalculateSalesTaxResult {
   if (!fallback) {
     const warning = `${reason} — no manual tax code available; charging 0 tax`;
-    console.warn(`[taxjar] ${warning}`);
+    logger.warn(`[taxjar] ${warning}`);
     return zeroResult("manual_fallback", warning);
   }
   const taxAmount = manualTaxCents(amountCents, fallback.rate);
   const warning = `${reason} — using manual rate ${fallback.rate}%${fallback.label ? ` (${fallback.label})` : ""}`;
-  console.warn(`[taxjar] ${warning}`);
+  logger.warn(`[taxjar] ${warning}`);
   return {
     taxAmount,
     taxRate: fallback.rate,
@@ -281,7 +283,7 @@ export async function validateAddress(address: AddressInput): Promise<ValidateAd
     // 404 from TaxJar means "no match found" — that's a validity answer, not an outage.
     if (e?.status === 404) return { valid: false, normalized: null, candidates: [] };
     const warning = `TaxJar address validation error: ${e?.detail || e?.message || e}`;
-    console.warn(`[taxjar] ${warning}`);
+    logger.warn(`[taxjar] ${warning}`);
     return { valid: false, normalized: null, warning };
   }
 }
