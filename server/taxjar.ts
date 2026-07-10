@@ -21,14 +21,13 @@
 // so the decision logic is unit-testable without a network or a database.
 // listNexusRegions()/orgCalculateContext() are the DB-aware wrappers.
 
-import Taxjar from "taxjar";
-
-// ----------------------------------------------------------------------------
-// Client (lazy, like server/stripe.ts): boots fine with no key configured.
-// ----------------------------------------------------------------------------
-let _client: Taxjar | null = null;
-let _clientKey: string | undefined;
-let _clientSandbox: boolean | undefined;
+// TaxJar REST API via native fetch (Node 18+). The official `taxjar` SDK was
+// removed because it pulled the deprecated `request`/`form-data`/`tough-cookie`
+// chain (SSRF + prototype-pollution advisories). These two endpoints are the
+// only ones we use, so direct calls are simpler and dependency-free.
+const TAXJAR_PROD_URL = "https://api.taxjar.com";
+const TAXJAR_SANDBOX_URL = "https://api.sandbox.taxjar.com";
+const TAXJAR_TIMEOUT_MS = 15_000;
 
 export function taxjarConfigured(): boolean {
   return !!process.env.TAXJAR_API_KEY;
@@ -38,19 +37,52 @@ export function taxjarSandbox(): boolean {
   return process.env.TAXJAR_SANDBOX === "true";
 }
 
-function getClient(): Taxjar | null {
-  const key = process.env.TAXJAR_API_KEY;
-  if (!key) return null;
-  const sandbox = taxjarSandbox();
-  // Rebuild if config changed (tests flip env vars)
-  if (_client && _clientKey === key && _clientSandbox === sandbox) return _client;
-  _client = new Taxjar({
-    apiKey: key,
-    ...(sandbox ? { apiUrl: Taxjar.SANDBOX_API_URL } : {}),
-  });
-  _clientKey = key;
-  _clientSandbox = sandbox;
-  return _client;
+function taxjarBaseUrl(): string {
+  return taxjarSandbox() ? TAXJAR_SANDBOX_URL : TAXJAR_PROD_URL;
+}
+
+/** A TaxJar API error carrying the HTTP status + detail, matching the shape the
+ * callers already handle (`e.status`, `e.detail`). */
+class TaxjarApiError extends Error {
+  status?: number;
+  detail?: string;
+  constructor(message: string, status?: number, detail?: string) {
+    super(message);
+    this.name = "TaxjarApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+/** POST a JSON body to a TaxJar endpoint. Returns parsed JSON, or throws a
+ * TaxjarApiError (with status/detail) on a non-2xx response or transport error.
+ * Requires TAXJAR_API_KEY to be set — callers gate on taxjarConfigured() first. */
+async function taxjarPost(path: string, body: unknown): Promise<any> {
+  const key = process.env.TAXJAR_API_KEY!;
+  let res: Response;
+  try {
+    res = await fetch(`${taxjarBaseUrl()}${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TAXJAR_TIMEOUT_MS),
+    });
+  } catch (e: any) {
+    // Network / timeout / abort — no HTTP status available.
+    throw new TaxjarApiError(e?.message || "network error", undefined, e?.message);
+  }
+  const text = await res.text();
+  let json: any;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = {};
+  }
+  if (!res.ok) {
+    // TaxJar error bodies look like { error, detail, status }.
+    throw new TaxjarApiError(json?.error || `HTTP ${res.status}`, res.status, json?.detail || text || undefined);
+  }
+  return json;
 }
 
 export function taxjarStatus() {
@@ -165,13 +197,12 @@ export async function calculateSalesTax(params: CalculateSalesTaxParams): Promis
     return zeroResult("no_nexus");
   }
 
-  const client = getClient();
-  if (!client) {
+  if (!taxjarConfigured()) {
     return fallbackResult(amount, fallback, "TAXJAR_API_KEY not set");
   }
 
   try {
-    const res = await client.taxForOrder({
+    const res = await taxjarPost("/v2/taxes", {
       from_country: "US",
       from_zip: params.fromZip,
       from_state: params.fromState,
@@ -191,7 +222,7 @@ export async function calculateSalesTax(params: CalculateSalesTaxParams): Promis
         : {}),
     });
 
-    const tax = res.tax;
+    const tax = res.tax ?? {};
     const bd: any = tax.breakdown ?? {};
     return {
       taxAmount: toCents(tax.amount_to_collect),
@@ -229,8 +260,7 @@ export type ValidateAddressResult = {
 };
 
 export async function validateAddress(address: AddressInput): Promise<ValidateAddressResult> {
-  const client = getClient();
-  if (!client) {
+  if (!taxjarConfigured()) {
     return {
       valid: false,
       normalized: null,
@@ -238,8 +268,8 @@ export async function validateAddress(address: AddressInput): Promise<ValidateAd
     };
   }
   try {
-    const res = await client.validateAddress({ country: "US", ...address });
-    const candidates = (res.addresses || []).map((a) => ({
+    const res = await taxjarPost("/v2/addresses/validate", { country: "US", ...address });
+    const candidates = ((res.addresses as any[]) || []).map((a) => ({
       street: a.street,
       city: a.city,
       state: a.state,
