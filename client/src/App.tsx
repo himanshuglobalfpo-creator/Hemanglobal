@@ -1,31 +1,47 @@
-import { Component, ErrorInfo, ReactNode, useEffect, useState } from "react";
+import { Component, ErrorInfo, ReactNode, Suspense, lazy, useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Switch, Route, Router } from "wouter";
 import { useHashLocation } from "wouter/use-hash-location";
-import { queryClient, apiRequest } from "./lib/queryClient";
 import { QueryClientProvider } from "@tanstack/react-query";
+import { queryClient, apiRequest } from "./lib/queryClient";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
+
+// Auth and NotFound stay eager: Auth is the first screen an anonymous visitor
+// sees (a lazy chunk there just adds a flash), and NotFound is tiny.
 import NotFound from "@/pages/not-found";
-import Dashboard from "@/pages/Dashboard";
-import Customers from "@/pages/Customers";
-import Vendors from "@/pages/Vendors";
-import Accounts from "@/pages/Accounts";
-import Invoices from "@/pages/Invoices";
-import Bills from "@/pages/Bills";
-import Banking from "@/pages/Banking";
-import Journal from "@/pages/Journal";
-import Reports from "@/pages/Reports";
-import BankRules from "@/pages/BankRules";
-import Reconciliation from "@/pages/Reconciliation";
-import Recurring from "@/pages/Recurring";
-import Statements from "@/pages/Statements";
-import SalesTax from "@/pages/SalesTax";
-import PeriodClose from "@/pages/PeriodClose";
-import AuditLog from "@/pages/AuditLog";
-import Security from "@/pages/Security";
-import Settings from "@/pages/Settings";
 import Auth from "@/pages/Auth";
+
+// Route-based code splitting: every authenticated page is its own chunk, loaded
+// on navigation. This keeps the initial bundle small — heavy dependencies like
+// recharts (Reports/Dashboard) never ship until a page that needs them renders.
+const Dashboard = lazy(() => import("@/pages/Dashboard"));
+const Customers = lazy(() => import("@/pages/Customers"));
+const Vendors = lazy(() => import("@/pages/Vendors"));
+const Accounts = lazy(() => import("@/pages/Accounts"));
+const Invoices = lazy(() => import("@/pages/Invoices"));
+const Bills = lazy(() => import("@/pages/Bills"));
+const Banking = lazy(() => import("@/pages/Banking"));
+const Journal = lazy(() => import("@/pages/Journal"));
+const Reports = lazy(() => import("@/pages/Reports"));
+const BankRules = lazy(() => import("@/pages/BankRules"));
+const Reconciliation = lazy(() => import("@/pages/Reconciliation"));
+const Recurring = lazy(() => import("@/pages/Recurring"));
+const Statements = lazy(() => import("@/pages/Statements"));
+const SalesTax = lazy(() => import("@/pages/SalesTax"));
+const PeriodClose = lazy(() => import("@/pages/PeriodClose"));
+const AuditLog = lazy(() => import("@/pages/AuditLog"));
+const Security = lazy(() => import("@/pages/Security"));
+const Settings = lazy(() => import("@/pages/Settings"));
+
+// Shown while a lazily-loaded page chunk is being fetched.
+function PageLoader() {
+  return (
+    <div className="min-h-screen flex items-center justify-center text-muted-foreground text-sm">
+      Loading…
+    </div>
+  );
+}
 
 // Error boundary: when a page throws (typically due to a malformed API response or a
 // missing field), show a recoverable error screen instead of a white page.
@@ -77,6 +93,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
 
 function AppRouter() {
   return (
+    <Suspense fallback={<PageLoader />}>
     <Switch>
       <Route path="/" component={Dashboard} />
       <Route path="/customers" component={Customers} />
@@ -98,6 +115,7 @@ function AppRouter() {
       <Route path="/settings" component={Settings} />
       <Route component={NotFound} />
     </Switch>
+    </Suspense>
   );
 }
 

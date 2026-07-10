@@ -117,15 +117,15 @@ import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
 import { futureDatedWarning } from "@shared/dates";
 import { drizzle } from "drizzle-orm/node-postgres";
+import { eq, ne, sql, and, gt, gte, lte, desc, inArray } from "drizzle-orm";
+import pg from "pg";
+import fs from "node:fs";
+import path from "node:path";
 import { currentOrgId, currentUserId, withOrg } from "./org-scope";
 import { encryptSecret, decryptSecret, isLegacyPlaintext, encryptionAvailable, assertEncryptionKey } from "./crypto-vault";
 import { logger } from "./logger";
 import { emitWebhookEvent } from "./webhooks";
 import { calculateSalesTax, taxjarConfigured, type CalculateSalesTaxResult } from "./taxjar";
-import { eq, ne, sql, and, gt, gte, lte, desc, inArray } from "drizzle-orm";
-import pg from "pg";
-import fs from "node:fs";
-import path from "node:path";
 
 // ----------------------------------------------------------------------------
 // PostgreSQL connection — SINGLE shared pool for the entire app.
@@ -552,7 +552,6 @@ export class DatabaseStorage {
         }
       }
     }
-    netIncome = netIncome;
     if (netIncome > 0) {
       lines.push({ accountId: re.id, debit: 0, credit: netIncome, description: `Net income to Retained Earnings` });
     } else if (netIncome < 0) {
@@ -2423,7 +2422,7 @@ export class DatabaseStorage {
     // Org-scoped: accountId is caller-supplied and ids are a global sequence,
     // so filtering on the joined entry's orgId is required (caught by the
     // org-scope guard test — same class as the fixed generalLedger leak).
-    let q = await db
+    const q = await db
       .select({
         line: journalLines,
         entry: journalEntries,
@@ -5536,7 +5535,6 @@ export class DatabaseStorage {
       // A more negative balance (ch < 0) means MORE depreciation was recorded → add back |ch|.
       depreciationAddback += -ch;
     }
-    depreciationAddback = depreciationAddback;
     if (depreciationAddback !== 0) {
       operatingItems.push({ label: "Depreciation & Amortization", amount: depreciationAddback });
     }

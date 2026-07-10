@@ -48,11 +48,11 @@ import {
   type Invoice,
   type Bill,
 } from "@shared/schema";
+import { toCents, formatMoney } from "@shared/money";
+import { and, eq, gte, lte, desc, sql } from "drizzle-orm";
 import { db, storage } from "./storage";
 import { emitWebhookEvent } from "./webhooks";
-import { toCents, formatMoney } from "@shared/money";
 import { currentOrgId, currentUserId } from "./org-scope";
-import { and, eq, gte, lte, desc, sql } from "drizzle-orm";
 
 // All money is INTEGER CENTS — math is exact, no epsilon needed anywhere.
 // User-input dollars convert ONCE at the API boundary via toCents().

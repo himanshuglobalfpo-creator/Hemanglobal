@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { Download } from "lucide-react";
+import type { Customer, Vendor } from "@shared/schema";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -7,10 +9,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Download } from "lucide-react";
 import { apiRequest } from "@/lib/queryClient";
 import { fmtMoney, fmtDate, todayISO, startOfYearISO } from "@/lib/format";
-import type { Customer, Vendor } from "@shared/schema";
 
 export default function Statements() {
   return (

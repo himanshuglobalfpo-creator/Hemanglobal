@@ -17,11 +17,11 @@ import bcrypt from "bcryptjs";
 import crypto from "node:crypto";
 import type { Request, Response, NextFunction } from "express";
 import { eq, and, lt, gt } from "drizzle-orm";
-import { buildCsrfCookie, buildClearCsrfCookie, generateCsrfToken } from "./csrf";
 import {
   users, sessions, organizations, orgMemberships,
   type User, type Session, type Organization, type OrgRole,
 } from "@shared/schema";
+import { buildCsrfCookie, buildClearCsrfCookie, generateCsrfToken } from "./csrf";
 
 // ----------------------------------------------------------------------------
 // DB handle — the SHARED PostgreSQL pool from storage.ts. auth.ts must never

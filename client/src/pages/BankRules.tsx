@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { Plus, Trash2, Filter, Pencil, Zap } from "lucide-react";
+import type { Account, BankRule } from "@shared/schema";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -21,11 +23,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Plus, Trash2, Filter, Pencil, Zap } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { fmtMoney } from "@/lib/format";
 import { useToast } from "@/hooks/use-toast";
-import type { Account, BankRule } from "@shared/schema";
 
 type RuleForm = {
   name: string;

@@ -23,6 +23,10 @@ import {
   requestPasswordResetSchema, resetPasswordSchema,
   insertOrgSchema, type OrgRole,
 } from "@shared/schema";
+import crypto from "node:crypto";
+import { eq, and } from "drizzle-orm";
+import bcrypt from "bcryptjs";
+import { users, organizations, accounts } from "@shared/schema";
 import {
   createUser, getUserByEmail, getUserById, verifyPassword,
   createOrg, addMember, listOrgsForUser, getMembership,
@@ -31,15 +35,11 @@ import {
   recordFailedLogin, clearFailedLogins, isLocked,
   hashPassword,
 } from "./auth";
-import crypto from "node:crypto";
 import { sendEmail, appBaseUrl } from "./email";
 import { authLimiter } from "./rate-limit";
 import { seedOrgDefaults } from "./storage";
-import { eq, and } from "drizzle-orm";
-import bcrypt from "bcryptjs";
 import { generateTotpSecret, verifyTotp, otpauthUri, generateRecoveryCodes } from "./totp";
 import { encryptSecret, decryptSecret } from "./crypto-vault";
-import { users, organizations, accounts } from "@shared/schema";
 import { db, pool } from "./storage";
 import { logger } from "./logger";
 

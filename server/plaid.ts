@@ -32,7 +32,7 @@ function loadPlaidSdk():
   if (_plaidLoadError) return { error: _plaidLoadError };
   try {
     // Lazy require so server boots even when plaid isn't installed yet.
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
+     
     const plaid = require("plaid");
     const { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } = plaid;
     const env = (process.env.PLAID_ENV || "sandbox") as keyof typeof PlaidEnvironments;

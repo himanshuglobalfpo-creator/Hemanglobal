@@ -1,6 +1,19 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { usePlaidLink } from "react-plaid-link";
+import {
+  Plus,
+  Upload,
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  ArrowLeftRight,
+  Sparkles,
+  Building2,
+  CheckCircle2,
+  XCircle,
+  Banknote,
+} from "lucide-react";
+import type { Account } from "@shared/schema";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -24,22 +37,9 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
-import {
-  Plus,
-  Upload,
-  ArrowDownToLine,
-  ArrowUpFromLine,
-  ArrowLeftRight,
-  Sparkles,
-  Building2,
-  CheckCircle2,
-  XCircle,
-  Banknote,
-} from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { fmtMoney, fmtDate, todayISO } from "@/lib/format";
-import type { Account } from "@shared/schema";
 
 type BankTx = {
   id: number;

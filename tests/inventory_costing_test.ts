@@ -88,7 +88,7 @@ async function main() {
       vendorId, date: "2026-02-01", dueDate: "2026-02-28", taxRate: 0,
       lines: [{ description: "Widgets batch 1", quantity: 10, rate: 2, itemId: item.id }],
     } as any));
-    let after1 = await run(() => storage.getItem(item.id));
+    const after1 = await run(() => storage.getItem(item.id));
     check("after first purchase: qty = 10", after1!.quantityOnHand === 10, `got ${after1!.quantityOnHand}`);
     check("after first purchase: avg cost = 200¢ ($2.00)", after1!.avgCostCents === 200, `got ${after1!.avgCostCents}`);
 
@@ -96,7 +96,7 @@ async function main() {
       vendorId, date: "2026-02-05", dueDate: "2026-03-05", taxRate: 0,
       lines: [{ description: "Widgets batch 2", quantity: 10, rate: 3, itemId: item.id }],
     } as any));
-    let after2 = await run(() => storage.getItem(item.id));
+    const after2 = await run(() => storage.getItem(item.id));
     check("after second purchase: qty = 20", after2!.quantityOnHand === 20, `got ${after2!.quantityOnHand}`);
     check("WEIGHTED AVERAGE: avg cost = 250¢ ($2.50)", after2!.avgCostCents === 250, `got ${after2!.avgCostCents}`);
 
@@ -158,7 +158,7 @@ async function main() {
       } as any)),
       /allow_negative_stock/
     );
-    let stillFifteen = await run(() => storage.getItem(item.id));
+    const stillFifteen = await run(() => storage.getItem(item.id));
     check("blocked oversell did NOT change stock (rolled back)", stillFifteen!.quantityOnHand === 15, `got ${stillFifteen!.quantityOnHand}`);
 
     await pool.query(`UPDATE organizations SET allow_negative_stock = TRUE WHERE id = 1`);

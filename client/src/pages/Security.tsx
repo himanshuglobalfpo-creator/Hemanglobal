@@ -126,7 +126,7 @@ export function Attachments({ entityType, entityId }: { entityType: "invoice" | 
       setItems(await r.json());
     } catch { /* entity may not be persisted yet */ }
   };
-  useEffect(() => { refresh(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [entityType, entityId]);
+  useEffect(() => { refresh();   }, [entityType, entityId]);
 
   const upload = async (file: File) => {
     setBusy(true); setErr("");

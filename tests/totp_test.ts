@@ -1,6 +1,6 @@
 // TOTP verify window + base32 round-trip + HMAC signature determinism.
-import { generateTotpSecret, totpCode, verifyTotp, base32Encode, base32Decode, generateRecoveryCodes } from "../server/totp";
 import crypto from "node:crypto";
+import { generateTotpSecret, totpCode, verifyTotp, base32Encode, base32Decode, generateRecoveryCodes } from "../server/totp";
 let fail = 0;
 const check = (n: string, c: boolean) => { console.log(`  ${c ? "✅" : "❌"} ${n}`); if (!c) fail++; };
 console.log("Test: TOTP (RFC 6238)");

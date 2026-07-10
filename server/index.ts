@@ -1,11 +1,11 @@
 import "dotenv/config";
 import express, { Response, NextFunction } from 'express';
 import type { Request } from 'express';
+import { createServer } from "node:http";
+import crypto from "node:crypto";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { storage, initDatabase, closeDatabase } from "./storage";
-import { createServer } from "node:http";
-import crypto from "node:crypto";
 import { logger } from "./logger";
 import { mapDbError } from "./db-errors";
 
@@ -70,16 +70,28 @@ const CSP_POLICY = [
   "form-action 'self'",
 ].join("; ");
 
+// CSP enforcement policy:
+//   • Production defaults to ENFORCING (Content-Security-Policy) — the header is
+//     live for real users unless an operator explicitly opts out.
+//   • Set CSP_ENFORCE=false to fall back to report-only (e.g. while shaking out
+//     violations against the report log before a launch).
+//   • Outside production it stays report-only unless CSP_ENFORCE=true, so local
+//     dev / Vite HMR is never blocked by accident.
+function cspEnforced(): boolean {
+  const flag = process.env.CSP_ENFORCE;
+  if (flag === "true") return true;
+  if (flag === "false") return false;
+  return process.env.NODE_ENV === "production";
+}
+
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-  // Report-only by default; flip CSP_ENFORCE=true once the violation log is clean.
-  const cspHeader =
-    process.env.CSP_ENFORCE === "true"
-      ? "Content-Security-Policy"
-      : "Content-Security-Policy-Report-Only";
+  const cspHeader = cspEnforced()
+    ? "Content-Security-Policy"
+    : "Content-Security-Policy-Report-Only";
   res.setHeader(cspHeader, CSP_POLICY);
   if (process.env.NODE_ENV === "production" && req.secure) {
     res.setHeader("Strict-Transport-Security", "max-age=15552000; includeSubDomains");

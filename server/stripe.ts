@@ -19,11 +19,11 @@
 //   POST /api/stripe/webhook               — Stripe → us, marks invoice paid
 
 import type { Express, Request, Response } from "express";
-import { db, storage } from "./storage";
 import { accounts } from "@shared/schema";
 import { organizations } from "@shared/auth-schema";
 import { and, eq } from "drizzle-orm";
 import { formatMoney } from "@shared/money";
+import { db, storage } from "./storage";
 import { appBaseUrl } from "./email";
 import { withOrg } from "./org-scope";
 import { logger } from "./logger";
@@ -83,7 +83,7 @@ function getStripe(): any | null {
   }
   try {
     // Lazy require so the server boots even when stripe isn't installed yet.
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
+     
     const Stripe = require("stripe");
     _stripe = new Stripe(key, { apiVersion: "2024-06-20" });
     return _stripe;

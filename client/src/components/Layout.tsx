@@ -23,6 +23,7 @@ import {
   Building2,
   Settings as SettingsIcon,
 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
@@ -35,7 +36,6 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import { useQuery } from "@tanstack/react-query";
 import type { Me } from "@/App";
 import {
   Select,

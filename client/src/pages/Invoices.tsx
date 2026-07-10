@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { Plus, Trash2, DollarSign, FileDown, Send, Link as LinkIcon, Check, Paperclip } from "lucide-react";
+import type { Account, Customer, Invoice } from "@shared/schema";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -10,11 +12,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Attachments } from "@/pages/Security";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import { Plus, Trash2, DollarSign, FileDown, Send, Link as LinkIcon, Check, Paperclip } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { centsToDollars, fmtMoney, fmtDate, todayISO } from "@/lib/format";
-import type { Account, Customer, Invoice } from "@shared/schema";
 
 interface NewLine { description: string; quantity: number; rate: number; incomeAccountId: number | null; }
 

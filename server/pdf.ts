@@ -14,7 +14,7 @@ function fmtRate(dollars: number): string {
 function streamPdf(res: Response, doc: PDFKit.PDFDocument, filename: string) {
   // Sanitize filename: strip CR/LF (header injection), quotes, and any non-printable / path chars.
   const safe = filename
-    .replace(/[\r\n"\\\/]/g, "_")
+    .replace(/[\r\n"\\/]/g, "_")
     .replace(/[^\x20-\x7E]/g, "_")    // strip non-ASCII to keep the legacy header valid
     .slice(0, 120) || "document.pdf";
   res.setHeader("Content-Type", "application/pdf");

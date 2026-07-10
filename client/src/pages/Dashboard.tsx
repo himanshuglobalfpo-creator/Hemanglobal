@@ -1,7 +1,4 @@
 import { useQuery } from "@tanstack/react-query";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Layout, PageHeader } from "@/components/Layout";
-import { fmtMoney, startOfYearISO, todayISO } from "@/lib/format";
 import {
   Wallet,
   ArrowDownToLine,
@@ -10,7 +7,6 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { Link } from "wouter";
-import { Skeleton } from "@/components/ui/skeleton";
 import {
   ResponsiveContainer,
   BarChart,
@@ -21,6 +17,10 @@ import {
   Tooltip,
 } from "recharts";
 import type { Invoice, Bill } from "@shared/schema";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Layout, PageHeader } from "@/components/Layout";
+import { fmtMoney, startOfYearISO, todayISO } from "@/lib/format";
+import { Skeleton } from "@/components/ui/skeleton";
 
 interface DashboardStats {
   cashOnHand: number;

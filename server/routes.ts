@@ -1,7 +1,6 @@
 import type { Express, Request, Response } from "express";
 import { createServer } from "node:http";
 import type { Server } from "node:http";
-import { storage, dbHealthCheck, pool } from "./storage";
 import {
   insertAccountSchema,
   updateAccountSchema,
@@ -58,8 +57,12 @@ import {
   createWebhookSchema,
   updateWebhookSchema,
 } from "@shared/schema";
-import * as noteService from "./creditNoteService";
 import { toCents, formatMoney } from "@shared/money";
+import { z } from "zod";
+import crypto from "node:crypto";
+import express from "express";
+import { storage, dbHealthCheck, pool } from "./storage";
+import * as noteService from "./creditNoteService";
 import { plaidStatus, createLinkToken, exchangePublicToken, syncTransactions, handlePlaidWebhook } from "./plaid";
 import { streamInvoicePdf, streamBillPdf, streamCustomerStatementPdf, streamVendorStatementPdf, streamCreditNotePdf, streamDebitNotePdf } from "./pdf";
 import { sendEmail, smtpStatus, appBaseUrl } from "./email";
@@ -69,17 +72,14 @@ import { orgScopeMiddleware, currentOrgId } from "./org-scope";
 import { registerAuthRoutes } from "./auth-routes";
 import { registerStripeRoutes, stripeStatus, stripeOrgStatus } from "./stripe";
 import { calculateSalesTax, validateAddress, taxjarStatus } from "./taxjar";
-import { z } from "zod";
 import { publicLimiter, writeLimiter, importLimiter } from "./rate-limit";
 import { logger } from "./logger";
 import { mapDbError } from "./db-errors";
 import { metricsMiddleware, metricsHandler } from "./metrics";
-import crypto from "node:crypto";
 import { fileDriver, ATTACHMENT_MAX_BYTES, ATTACHMENT_MIME_WHITELIST } from "./files";
 import { toCsv, csvMoney, type CsvColumn } from "./csv";
 import * as importers from "./importers";
 import { assertSafeWebhookUrl, signWebhookPayload, startWebhookWorker } from "./webhooks";
-import express from "express";
 
 // Heuristic: any Error whose message looks like a business-rule violation
 // (rather than an unexpected crash) gets a 400 instead of 500.
