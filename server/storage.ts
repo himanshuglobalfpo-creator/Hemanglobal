@@ -137,8 +137,8 @@ const { Pool, types } = pg;
 // precision caveat). This ledger stores integer cents well inside 2^53, so we
 // parse both to Number globally — otherwise every SUM() in the report queries
 // would come back as a string and silently concatenate instead of add.
-types.setTypeParser(20, (v: string) => parseInt(v, 10));      // int8 / BIGINT (COUNT, SUM of int)
-types.setTypeParser(1700, (v: string) => parseFloat(v));      // NUMERIC
+types.setTypeParser(20, (v: string) => parseInt(v, 10));      // int8 / BIGINT (money columns, COUNT, SUM of int)
+types.setTypeParser(1700, (v: string) => parseFloat(v));      // NUMERIC (SUM of bigint money)
 
 // DATABASE_URL is required. Format: postgresql://user:pass@host:5432/dbname
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -1972,7 +1972,7 @@ export class DatabaseStorage {
     let extra = "";
     if (excludeRunId !== undefined) { params.push(excludeRunId); extra = ` AND pr.id <> $4`; }
     const row = (await pool.query(
-      `SELECT COALESCE(SUM(pi.gross_cents), 0)::int AS ytd
+      `SELECT COALESCE(SUM(pi.gross_cents), 0)::bigint AS ytd
        FROM payroll_items pi JOIN payroll_runs pr ON pr.id = pi.run_id
        WHERE pi.org_id = $1 AND pi.employee_id = $2 AND pr.status = 'posted' AND substr(pr.pay_date, 1, 4) = $3${extra}`,
       params
@@ -2171,9 +2171,9 @@ export class DatabaseStorage {
     // Inclusive YTD from POSTED runs in the pay year, up to this pay date.
     const year = run.payDate.slice(0, 4);
     const ytd = (await pool.query(
-      `SELECT COALESCE(SUM(pi.gross_cents),0)::int AS gross,
-              COALESCE(SUM(pi.employee_tax_cents),0)::int AS employee_tax,
-              COALESCE(SUM(pi.net_cents),0)::int AS net
+      `SELECT COALESCE(SUM(pi.gross_cents),0)::bigint AS gross,
+              COALESCE(SUM(pi.employee_tax_cents),0)::bigint AS employee_tax,
+              COALESCE(SUM(pi.net_cents),0)::bigint AS net
        FROM payroll_items pi JOIN payroll_runs pr ON pr.id = pi.run_id
        WHERE pi.org_id = $1 AND pi.employee_id = $2 AND pr.status = 'posted'
          AND substr(pr.pay_date,1,4) = $3 AND pr.pay_date <= $4`,
@@ -5839,11 +5839,11 @@ export class DatabaseStorage {
     // notes; paid = amount_paid on those invoices; balance = net - paid.
     const rows = (await pool.query(`
       SELECT c.id AS "customerId", c.name AS "customerName",
-             COALESCE(inv.invoiced, 0)::int AS invoiced,
-             COALESCE(cn.credited, 0)::int AS credited,
-             (COALESCE(inv.invoiced, 0) - COALESCE(cn.credited, 0))::int AS net,
-             COALESCE(inv.paid, 0)::int AS paid,
-             (COALESCE(inv.invoiced, 0) - COALESCE(cn.credited, 0) - COALESCE(inv.paid, 0))::int AS balance
+             COALESCE(inv.invoiced, 0)::bigint AS invoiced,
+             COALESCE(cn.credited, 0)::bigint AS credited,
+             (COALESCE(inv.invoiced, 0) - COALESCE(cn.credited, 0))::bigint AS net,
+             COALESCE(inv.paid, 0)::bigint AS paid,
+             (COALESCE(inv.invoiced, 0) - COALESCE(cn.credited, 0) - COALESCE(inv.paid, 0))::bigint AS balance
         FROM customers c
         LEFT JOIN (
           SELECT customer_id, SUM(total) AS invoiced, SUM(amount_paid) AS paid
@@ -5867,11 +5867,11 @@ export class DatabaseStorage {
   async expensesByVendor(fromDate: string, toDate: string) {
     const rows = (await pool.query(`
       SELECT v.id AS "vendorId", v.name AS "vendorName",
-             COALESCE(b.billed, 0)::int AS billed,
-             COALESCE(dn.debited, 0)::int AS debited,
-             (COALESCE(b.billed, 0) - COALESCE(dn.debited, 0))::int AS net,
-             COALESCE(b.paid, 0)::int AS paid,
-             (COALESCE(b.billed, 0) - COALESCE(dn.debited, 0) - COALESCE(b.paid, 0))::int AS balance
+             COALESCE(b.billed, 0)::bigint AS billed,
+             COALESCE(dn.debited, 0)::bigint AS debited,
+             (COALESCE(b.billed, 0) - COALESCE(dn.debited, 0))::bigint AS net,
+             COALESCE(b.paid, 0)::bigint AS paid,
+             (COALESCE(b.billed, 0) - COALESCE(dn.debited, 0) - COALESCE(b.paid, 0))::bigint AS balance
         FROM vendors v
         LEFT JOIN (
           SELECT vendor_id, SUM(total) AS billed, SUM(amount_paid) AS paid
@@ -5898,7 +5898,7 @@ export class DatabaseStorage {
     const rows = (await pool.query(`
       SELECT substr(je.date, 1, 7) AS month,
              a.id AS "accountId", a.code, a.name, a.type,
-             SUM(CASE WHEN a.type = 'income' THEN jl.credit - jl.debit ELSE jl.debit - jl.credit END)::int AS amount
+             SUM(CASE WHEN a.type = 'income' THEN jl.credit - jl.debit ELSE jl.debit - jl.credit END)::bigint AS amount
         FROM journal_lines jl
         JOIN journal_entries je ON je.id = jl.entry_id
         JOIN accounts a ON a.id = jl.account_id
@@ -6008,8 +6008,8 @@ export class DatabaseStorage {
     }
     const rows = (await pool.query(`
       SELECT a.id AS "accountId", a.code, a.name, a.type,
-             COALESCE(bl.budget, 0)::int AS budget,
-             COALESCE(act.actual, 0)::int AS actual
+             COALESCE(bl.budget, 0)::bigint AS budget,
+             COALESCE(act.actual, 0)::bigint AS actual
         FROM accounts a
         LEFT JOIN (
           SELECT account_id, SUM(amount) AS budget

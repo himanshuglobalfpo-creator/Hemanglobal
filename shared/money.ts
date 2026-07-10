@@ -9,10 +9,35 @@
 //
 // Shared by server (storage, PDFs, statements, audit strings) and client.
 
-/** Convert user-input dollars (possibly fractional/float) to integer cents. */
-export function toCents(dollars: number): number {
+// Upper bound for a single monetary amount, in INTEGER CENTS. Money columns are
+// BIGINT so the DB can hold very large values, but every value must still stay a
+// JS-safe integer (< 2^53) for exact server-side math, and an absurd amount is
+// almost always an input error. Default: $1 trillion. Configurable via the
+// MAX_TX_CENTS env var (server) — kept well below Number.MAX_SAFE_INTEGER so
+// sums of many amounts also stay exact.
+export const DEFAULT_MAX_TX_CENTS = 1_000_000_000_000_00; // $1,000,000,000,000.00
+
+export const MAX_TX_CENTS: number = (() => {
+  // `process` may be undefined in the browser bundle — guard the access.
+  const raw = typeof process !== "undefined" ? Number(process.env?.MAX_TX_CENTS) : NaN;
+  return Number.isSafeInteger(raw) && raw > 0 ? raw : DEFAULT_MAX_TX_CENTS;
+})();
+
+/**
+ * Convert user-input dollars (possibly fractional/float) to integer cents.
+ * Throws above `maxCents` (default MAX_TX_CENTS) so an out-of-range amount fails
+ * loudly at the API boundary instead of silently overflowing downstream math.
+ */
+export function toCents(dollars: number, maxCents: number = MAX_TX_CENTS): number {
   if (!Number.isFinite(dollars)) throw new Error(`Invalid money amount: ${dollars}`);
-  return Math.round(dollars * 100);
+  const cents = Math.round(dollars * 100);
+  if (Math.abs(cents) > maxCents) {
+    throw new Error(
+      `Amount ${dollars} exceeds the maximum allowed of ${maxCents / 100} ` +
+        `(${maxCents} cents). Raise MAX_TX_CENTS if this is intentional.`
+    );
+  }
+  return cents;
 }
 
 /** Format integer cents as "$X,XXX.XX" (negative → "-$X,XXX.XX").

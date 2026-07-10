@@ -1,4 +1,4 @@
-import { pgTable, text, integer, serial, boolean, doublePrecision, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, serial, boolean, doublePrecision, timestamp } from "drizzle-orm/pg-core";
 
 // Re-export auth/multi-tenancy schema (organizations, users, sessions, memberships)
 export * from "./auth-schema";
@@ -206,9 +206,9 @@ export const journalLines = pgTable("journal_lines", {
   entryId: integer("entry_id").notNull(),
   accountId: integer("account_id").notNull(),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  debit: integer("debit").notNull().default(0),
+  debit: bigint("debit", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  credit: integer("credit").notNull().default(0),
+  credit: bigint("credit", { mode: "number" }).notNull().default(0),
   description: text("description"),
 });
 
@@ -290,7 +290,7 @@ export const items = pgTable("items", {
   cogsAccountId: integer("cogs_account_id").notNull(),     // COGS debited when inventory is sold
   quantityOnHand: integer("quantity_on_hand").notNull().default(0), // whole units
   // Weighted-average unit cost. Stored in cents (integer). $2.50 = 250. Never REAL.
-  avgCostCents: integer("avg_cost_cents").notNull().default(0),
+  avgCostCents: bigint("avg_cost_cents", { mode: "number" }).notNull().default(0),
   isActive: boolean("is_active").notNull().default(true),
   updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
 });
@@ -349,7 +349,7 @@ export const inventoryMovements = pgTable("inventory_movements", {
   date: text("date").notNull(), // YYYY-MM-DD
   qtyDelta: integer("qty_delta").notNull(), // signed whole units
   // Stored in cents (integer). $2.50 = 250. Never use REAL for money.
-  unitCostCents: integer("unit_cost_cents").notNull(),
+  unitCostCents: bigint("unit_cost_cents", { mode: "number" }).notNull(),
   source: text("source").notNull(), // InventoryMovementSource
   sourceId: integer("source_id"), // FK to the bill/invoice/etc. that caused it
   entryId: integer("entry_id"), // FK to journal_entries (the GL effect)
@@ -369,13 +369,13 @@ export const invoices = pgTable("invoices", {
   dueDate: text("due_date").notNull(),
   status: text("status").notNull().default("open"), // open | paid | void
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  subtotal: integer("subtotal").notNull().default(0),
+  subtotal: bigint("subtotal", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  tax: integer("tax").notNull().default(0),
+  tax: bigint("tax", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  total: integer("total").notNull().default(0),
+  total: bigint("total", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amountPaid: integer("amount_paid").notNull().default(0),
+  amountPaid: bigint("amount_paid", { mode: "number" }).notNull().default(0),
   // Full tax-calculation audit record as JSON text (SQLite's JSONB equivalent):
   // { source, taxRate, taxAmountCents, breakdownCents, raw } — raw is the verbatim
   // TaxJar response when source is taxjar/taxjar_sandbox.
@@ -384,10 +384,10 @@ export const invoices = pgTable("invoices", {
   updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
   currency: text("currency").notNull().default(""),
   fxRate: doublePrecision("fx_rate").notNull().default(1),
-  foreignSubtotal: integer("foreign_subtotal").notNull().default(0),
-  foreignTax: integer("foreign_tax").notNull().default(0),
-  foreignTotal: integer("foreign_total").notNull().default(0),
-  foreignAmountPaid: integer("foreign_amount_paid").notNull().default(0),
+  foreignSubtotal: bigint("foreign_subtotal", { mode: "number" }).notNull().default(0),
+  foreignTax: bigint("foreign_tax", { mode: "number" }).notNull().default(0),
+  foreignTotal: bigint("foreign_total", { mode: "number" }).notNull().default(0),
+  foreignAmountPaid: bigint("foreign_amount_paid", { mode: "number" }).notNull().default(0),
   estimateId: integer("estimate_id"), // set when this invoice was created by converting an estimate
 });
 
@@ -408,7 +408,7 @@ export const invoiceLines = pgTable("invoice_lines", {
   quantity: doublePrecision("quantity").notNull().default(1),
   rate: doublePrecision("rate").notNull().default(0), // unit price in DOLLARS as entered (may be sub-cent, e.g. $0.0025/unit). All LEDGER money derived from it is integer cents: amount = Math.round(quantity * rate * 100).
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amount: integer("amount").notNull().default(0),
+  amount: bigint("amount", { mode: "number" }).notNull().default(0),
   incomeAccountId: integer("income_account_id").notNull(), // which income account this line credits
   itemId: integer("item_id"), // optional link to a catalog item (drives income account + COGS)
 });
@@ -475,9 +475,9 @@ export const estimates = pgTable("estimates", {
   currency: text("currency").notNull().default(""),
   fxRate: doublePrecision("fx_rate").notNull().default(1),
   // Snapshot totals in the DOCUMENT currency. Stored in cents (integer). Never REAL.
-  subtotalCents: integer("subtotal_cents").notNull().default(0),
-  taxCents: integer("tax_cents").notNull().default(0),
-  totalCents: integer("total_cents").notNull().default(0),
+  subtotalCents: bigint("subtotal_cents", { mode: "number" }).notNull().default(0),
+  taxCents: bigint("tax_cents", { mode: "number" }).notNull().default(0),
+  totalCents: bigint("total_cents", { mode: "number" }).notNull().default(0),
   notes: text("notes"),
   updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
 });
@@ -491,7 +491,7 @@ export const estimateLines = pgTable("estimate_lines", {
   quantity: doublePrecision("quantity").notNull().default(1),
   rate: doublePrecision("rate").notNull().default(0), // unit price in DOLLARS as entered
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amount: integer("amount").notNull().default(0),
+  amount: bigint("amount", { mode: "number" }).notNull().default(0),
   incomeAccountId: integer("income_account_id").notNull(),
   itemId: integer("item_id"), // optional catalog item (drives income account on convert)
 });
@@ -586,8 +586,8 @@ export const fixedAssets = pgTable("fixed_assets", {
   depreciationExpenseAccountId: integer("depreciation_expense_account_id").notNull(), // expense
   acquisitionDate: text("acquisition_date").notNull(), // YYYY-MM-DD
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  costCents: integer("cost_cents").notNull(),
-  salvageCents: integer("salvage_cents").notNull().default(0),
+  costCents: bigint("cost_cents", { mode: "number" }).notNull(),
+  salvageCents: bigint("salvage_cents", { mode: "number" }).notNull().default(0),
   usefulLifeMonths: integer("useful_life_months").notNull(),
   method: text("method").notNull(), // DepreciationMethod
   status: text("status").notNull().default("active"), // FixedAssetStatus
@@ -604,7 +604,7 @@ export const depreciationEntries = pgTable("depreciation_entries", {
   assetId: integer("asset_id").notNull(),
   period: text("period").notNull(), // YYYY-MM
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amountCents: integer("amount_cents").notNull(),
+  amountCents: bigint("amount_cents", { mode: "number" }).notNull(),
   entryId: integer("entry_id"), // FK to journal_entries (null for a recorded zero-amount period)
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
 });
@@ -676,8 +676,8 @@ export const fxRevaluations = pgTable("fx_revaluations", {
   reversalDate: text("reversal_date"),
   status: text("status").notNull().default("posted"), // FxRevaluationStatus
   // Stored in cents (integer). Never use REAL for money.
-  totalGainCents: integer("total_gain_cents").notNull().default(0),
-  totalLossCents: integer("total_loss_cents").notNull().default(0),
+  totalGainCents: bigint("total_gain_cents", { mode: "number" }).notNull().default(0),
+  totalLossCents: bigint("total_loss_cents", { mode: "number" }).notNull().default(0),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
 });
 export type FxRevaluation = typeof fxRevaluations.$inferSelect;
@@ -691,10 +691,10 @@ export const fxRevaluationLines = pgTable("fx_revaluation_lines", {
   docId: integer("doc_id").notNull(),
   currency: text("currency").notNull(),
   rate: doublePrecision("rate").notNull(), // as-of-date rate, base units per 1 foreign unit
-  foreignOutstandingCents: integer("foreign_outstanding_cents").notNull(),
-  bookingBaseCents: integer("booking_base_cents").notNull(),   // carrying value before revaluation
-  revaluedBaseCents: integer("revalued_base_cents").notNull(), // carrying value at the as-of rate
-  diffCents: integer("diff_cents").notNull(),                  // revalued - booking (signed)
+  foreignOutstandingCents: bigint("foreign_outstanding_cents", { mode: "number" }).notNull(),
+  bookingBaseCents: bigint("booking_base_cents", { mode: "number" }).notNull(),   // carrying value before revaluation
+  revaluedBaseCents: bigint("revalued_base_cents", { mode: "number" }).notNull(), // carrying value at the as-of rate
+  diffCents: bigint("diff_cents", { mode: "number" }).notNull(),                  // revalued - booking (signed)
 });
 export type FxRevaluationLine = typeof fxRevaluationLines.$inferSelect;
 
@@ -725,7 +725,7 @@ export const employees = pgTable("employees", {
   email: text("email"),
   payType: text("pay_type").notNull(), // salary | hourly
   // Salary: ANNUAL salary in cents. Hourly: hourly rate in cents. Never REAL.
-  payRateCents: integer("pay_rate_cents").notNull(),
+  payRateCents: bigint("pay_rate_cents", { mode: "number" }).notNull(),
   payFrequency: text("pay_frequency").notNull(), // PayFrequency
   federalWithholdingRate: doublePrecision("federal_withholding_rate").notNull().default(0),
   stateWithholdingRate: doublePrecision("state_withholding_rate").notNull().default(0),
@@ -746,11 +746,11 @@ export const payrollRuns = pgTable("payroll_runs", {
   bankAccountId: integer("bank_account_id").notNull(), // net pay is drawn from here
   entryId: integer("entry_id"), // FK to journal_entries once posted
   // All integer cents.
-  totalGrossCents: integer("total_gross_cents").notNull().default(0),
-  totalEmployeeTaxCents: integer("total_employee_tax_cents").notNull().default(0),
-  totalEmployerTaxCents: integer("total_employer_tax_cents").notNull().default(0),
-  totalDeductionsCents: integer("total_deductions_cents").notNull().default(0),
-  totalNetCents: integer("total_net_cents").notNull().default(0),
+  totalGrossCents: bigint("total_gross_cents", { mode: "number" }).notNull().default(0),
+  totalEmployeeTaxCents: bigint("total_employee_tax_cents", { mode: "number" }).notNull().default(0),
+  totalEmployerTaxCents: bigint("total_employer_tax_cents", { mode: "number" }).notNull().default(0),
+  totalDeductionsCents: bigint("total_deductions_cents", { mode: "number" }).notNull().default(0),
+  totalNetCents: bigint("total_net_cents", { mode: "number" }).notNull().default(0),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
 });
@@ -763,21 +763,21 @@ export const payrollItems = pgTable("payroll_items", {
   employeeId: integer("employee_id").notNull(),
   hours: doublePrecision("hours"), // hourly employees only
   // All integer cents.
-  grossCents: integer("gross_cents").notNull().default(0),
-  preTaxDeductionCents: integer("pretax_deduction_cents").notNull().default(0),
-  postTaxDeductionCents: integer("posttax_deduction_cents").notNull().default(0),
-  fedWithholdingCents: integer("fed_withholding_cents").notNull().default(0),
-  stateWithholdingCents: integer("state_withholding_cents").notNull().default(0),
-  ssEmployeeCents: integer("ss_employee_cents").notNull().default(0),
-  medicareEmployeeCents: integer("medicare_employee_cents").notNull().default(0),
-  additionalMedicareCents: integer("additional_medicare_cents").notNull().default(0),
-  ssEmployerCents: integer("ss_employer_cents").notNull().default(0),
-  medicareEmployerCents: integer("medicare_employer_cents").notNull().default(0),
-  futaCents: integer("futa_cents").notNull().default(0),
-  sutaCents: integer("suta_cents").notNull().default(0),
-  employeeTaxCents: integer("employee_tax_cents").notNull().default(0),
-  employerTaxCents: integer("employer_tax_cents").notNull().default(0),
-  netCents: integer("net_cents").notNull().default(0),
+  grossCents: bigint("gross_cents", { mode: "number" }).notNull().default(0),
+  preTaxDeductionCents: bigint("pretax_deduction_cents", { mode: "number" }).notNull().default(0),
+  postTaxDeductionCents: bigint("posttax_deduction_cents", { mode: "number" }).notNull().default(0),
+  fedWithholdingCents: bigint("fed_withholding_cents", { mode: "number" }).notNull().default(0),
+  stateWithholdingCents: bigint("state_withholding_cents", { mode: "number" }).notNull().default(0),
+  ssEmployeeCents: bigint("ss_employee_cents", { mode: "number" }).notNull().default(0),
+  medicareEmployeeCents: bigint("medicare_employee_cents", { mode: "number" }).notNull().default(0),
+  additionalMedicareCents: bigint("additional_medicare_cents", { mode: "number" }).notNull().default(0),
+  ssEmployerCents: bigint("ss_employer_cents", { mode: "number" }).notNull().default(0),
+  medicareEmployerCents: bigint("medicare_employer_cents", { mode: "number" }).notNull().default(0),
+  futaCents: bigint("futa_cents", { mode: "number" }).notNull().default(0),
+  sutaCents: bigint("suta_cents", { mode: "number" }).notNull().default(0),
+  employeeTaxCents: bigint("employee_tax_cents", { mode: "number" }).notNull().default(0),
+  employerTaxCents: bigint("employer_tax_cents", { mode: "number" }).notNull().default(0),
+  netCents: bigint("net_cents", { mode: "number" }).notNull().default(0),
 });
 export type PayrollItem = typeof payrollItems.$inferSelect;
 
@@ -826,7 +826,7 @@ export const payrollLiabilityPayments = pgTable("payroll_liability_payments", {
   bankAccountId: integer("bank_account_id").notNull(),
   entryId: integer("entry_id"), // the remittance JE
   memo: text("memo"),
-  totalCents: integer("total_cents").notNull().default(0),
+  totalCents: bigint("total_cents", { mode: "number" }).notNull().default(0),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
 });
 export type PayrollLiabilityPayment = typeof payrollLiabilityPayments.$inferSelect;
@@ -836,7 +836,7 @@ export const payrollLiabilityPaymentLines = pgTable("payroll_liability_payment_l
   orgId: integer("org_id").notNull(),
   paymentId: integer("payment_id").notNull(),
   accountId: integer("account_id").notNull(), // the payroll-liability account being remitted
-  amountCents: integer("amount_cents").notNull(),
+  amountCents: bigint("amount_cents", { mode: "number" }).notNull(),
 });
 export type PayrollLiabilityPaymentLine = typeof payrollLiabilityPaymentLines.$inferSelect;
 
@@ -864,21 +864,21 @@ export const bills = pgTable("bills", {
   dueDate: text("due_date").notNull(),
   status: text("status").notNull().default("open"), // open | paid | void
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  subtotal: integer("subtotal").notNull().default(0),
+  subtotal: bigint("subtotal", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  tax: integer("tax").notNull().default(0),
+  tax: bigint("tax", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  total: integer("total").notNull().default(0),
+  total: bigint("total", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amountPaid: integer("amount_paid").notNull().default(0),
+  amountPaid: bigint("amount_paid", { mode: "number" }).notNull().default(0),
   notes: text("notes"),
   updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
   currency: text("currency").notNull().default(""),
   fxRate: doublePrecision("fx_rate").notNull().default(1),
-  foreignSubtotal: integer("foreign_subtotal").notNull().default(0),
-  foreignTax: integer("foreign_tax").notNull().default(0),
-  foreignTotal: integer("foreign_total").notNull().default(0),
-  foreignAmountPaid: integer("foreign_amount_paid").notNull().default(0),
+  foreignSubtotal: bigint("foreign_subtotal", { mode: "number" }).notNull().default(0),
+  foreignTax: bigint("foreign_tax", { mode: "number" }).notNull().default(0),
+  foreignTotal: bigint("foreign_total", { mode: "number" }).notNull().default(0),
+  foreignAmountPaid: bigint("foreign_amount_paid", { mode: "number" }).notNull().default(0),
   poId: integer("po_id"), // set when this bill was generated by receiving a purchase order
 });
 
@@ -899,7 +899,7 @@ export const billLines = pgTable("bill_lines", {
   quantity: doublePrecision("quantity").notNull().default(1),
   rate: doublePrecision("rate").notNull().default(0), // unit price in DOLLARS as entered (may be sub-cent, e.g. $0.0025/unit). All LEDGER money derived from it is integer cents: amount = Math.round(quantity * rate * 100).
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amount: integer("amount").notNull().default(0),
+  amount: bigint("amount", { mode: "number" }).notNull().default(0),
   expenseAccountId: integer("expense_account_id").notNull(),
   itemId: integer("item_id"), // optional link to a catalog item (drives GL account + stock)
 });
@@ -977,7 +977,7 @@ export const purchaseOrderLines = pgTable("purchase_order_lines", {
   quantity: doublePrecision("quantity").notNull().default(1), // ordered quantity
   rate: doublePrecision("rate").notNull().default(0), // unit price in DOLLARS (sub-cent allowed)
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amountCents: integer("amount_cents").notNull().default(0), // round(quantity * rate * 100)
+  amountCents: bigint("amount_cents", { mode: "number" }).notNull().default(0), // round(quantity * rate * 100)
   expenseAccountId: integer("expense_account_id").notNull(),
   itemId: integer("item_id"), // optional link to a catalog item (drives GL account + stock on receipt)
   qtyReceived: integer("qty_received").notNull().default(0), // whole units received so far
@@ -1095,7 +1095,7 @@ export const bankTransactions = pgTable("bank_transactions", {
   description: text("description").notNull(),
   // amount is signed: positive = money in (deposit), negative = money out (withdrawal)
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amount: integer("amount").notNull(),
+  amount: bigint("amount", { mode: "number" }).notNull(),
   status: text("status").notNull().default("unmatched"), // unmatched | matched | ignored
   entryId: integer("entry_id"), // FK to journal_entries when matched
   externalId: text("external_id"), // e.g. Plaid transaction_id for dedupe
@@ -1176,9 +1176,9 @@ export const bankRules = pgTable("bank_rules", {
   descriptionContains: text("description_contains"), // case-insensitive substring
   amountComparator: text("amount_comparator"), // 'eq' | 'gt' | 'lt' | 'gte' | 'lte' | 'between'
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amountMin: integer("amount_min"),
+  amountMin: bigint("amount_min", { mode: "number" }),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amountMax: integer("amount_max"),
+  amountMax: bigint("amount_max", { mode: "number" }),
   direction: text("direction"), // 'in' (deposits) | 'out' (withdrawals) | null = either
   // Action: how to post it
   actionType: text("action_type").notNull(), // 'categorize' | 'transfer' | 'ignore'
@@ -1251,9 +1251,9 @@ export const reconciliations = pgTable("reconciliations", {
   bankAccountId: integer("bank_account_id").notNull(),
   statementDate: text("statement_date").notNull(), // YYYY-MM-DD
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  beginningBalance: integer("beginning_balance").notNull().default(0),
+  beginningBalance: bigint("beginning_balance", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  endingBalance: integer("ending_balance").notNull(),
+  endingBalance: bigint("ending_balance", { mode: "number" }).notNull(),
   status: text("status").notNull().default("in_progress"), // in_progress | completed
   completedAt: text("completed_at"),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
@@ -1528,15 +1528,15 @@ export const creditNotes = pgTable("credit_notes", {
   status: text("status").notNull().default("draft"), // draft | issued | applied | void
   reason: text("reason").notNull(),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  subtotal: integer("subtotal").notNull().default(0),
+  subtotal: bigint("subtotal", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  tax: integer("tax").notNull().default(0),
+  tax: bigint("tax", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  total: integer("total").notNull().default(0),
+  total: bigint("total", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  appliedAmount: integer("applied_amount").notNull().default(0),
+  appliedAmount: bigint("applied_amount", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  remainingCredit: integer("remaining_credit").notNull().default(0), // total - appliedAmount
+  remainingCredit: bigint("remaining_credit", { mode: "number" }).notNull().default(0), // total - appliedAmount
   notes: text("notes"),
   createdBy: integer("created_by"),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
@@ -1552,7 +1552,7 @@ export const creditNoteLines = pgTable("credit_note_lines", {
   quantity: doublePrecision("quantity").notNull().default(1),
   rate: doublePrecision("rate").notNull().default(0), // unit price in DOLLARS as entered (may be sub-cent, e.g. $0.0025/unit). All LEDGER money derived from it is integer cents: amount = Math.round(quantity * rate * 100).
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amount: integer("amount").notNull().default(0),
+  amount: bigint("amount", { mode: "number" }).notNull().default(0),
   revenueAccountId: integer("revenue_account_id").notNull(), // income (or expense for returns)
 });
 export type CreditNoteLine = typeof creditNoteLines.$inferSelect;
@@ -1563,7 +1563,7 @@ export const creditNoteApplications = pgTable("credit_note_applications", {
   creditNoteId: integer("credit_note_id").notNull(),
   invoiceId: integer("invoice_id").notNull(),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amountApplied: integer("amount_applied").notNull(),
+  amountApplied: bigint("amount_applied", { mode: "number" }).notNull(),
   appliedAt: timestamp("applied_at", { mode: "string" }).notNull().defaultNow(),
   appliedBy: integer("applied_by"),
 });
@@ -1579,15 +1579,15 @@ export const debitNotes = pgTable("debit_notes", {
   status: text("status").notNull().default("draft"), // draft | sent | accepted | void
   reason: text("reason").notNull(),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  subtotal: integer("subtotal").notNull().default(0),
+  subtotal: bigint("subtotal", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  tax: integer("tax").notNull().default(0),
+  tax: bigint("tax", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  total: integer("total").notNull().default(0),
+  total: bigint("total", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  appliedAmount: integer("applied_amount").notNull().default(0),
+  appliedAmount: bigint("applied_amount", { mode: "number" }).notNull().default(0),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  remainingDebit: integer("remaining_debit").notNull().default(0),
+  remainingDebit: bigint("remaining_debit", { mode: "number" }).notNull().default(0),
   notes: text("notes"),
   createdBy: integer("created_by"),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
@@ -1603,7 +1603,7 @@ export const debitNoteLines = pgTable("debit_note_lines", {
   quantity: doublePrecision("quantity").notNull().default(1),
   rate: doublePrecision("rate").notNull().default(0), // unit price in DOLLARS as entered (may be sub-cent, e.g. $0.0025/unit). All LEDGER money derived from it is integer cents: amount = Math.round(quantity * rate * 100).
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amount: integer("amount").notNull().default(0),
+  amount: bigint("amount", { mode: "number" }).notNull().default(0),
   expenseAccountId: integer("expense_account_id").notNull(), // must be type expense
 });
 export type DebitNoteLine = typeof debitNoteLines.$inferSelect;
@@ -1614,7 +1614,7 @@ export const debitNoteApplications = pgTable("debit_note_applications", {
   debitNoteId: integer("debit_note_id").notNull(),
   billId: integer("bill_id").notNull(),
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
-  amountApplied: integer("amount_applied").notNull(),
+  amountApplied: bigint("amount_applied", { mode: "number" }).notNull(),
   appliedAt: timestamp("applied_at", { mode: "string" }).notNull().defaultNow(),
   appliedBy: integer("applied_by"),
 });
