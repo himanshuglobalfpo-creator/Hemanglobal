@@ -824,6 +824,60 @@ export class DatabaseStorage {
   }
 
   // ============================================================================
+  // 1099 SUMMARY — cash paid to 1099-tracked vendors in a calendar year
+  // ============================================================================
+  // 1099s are CASH-basis: we sum actual payments (A/P debits on payment journal
+  // entries) dated within the year, grouped by vendor via the bill number the
+  // payment references — the exact linkage the vendor statement uses. Only
+  // vendors flagged track_1099 are considered; `rows` lists those at or above
+  // the reporting threshold (default $600 for 1099-NEC), and `belowThreshold`
+  // reports tracked vendors that fell short so the UI can still show them.
+  async report1099Summary(
+    year: number,
+    thresholdCents = 60000,
+  ): Promise<{
+    year: number;
+    thresholdCents: number;
+    rows: Array<{ vendorId: number; name: string; taxId: string | null; paidCents: number; missingTaxId: boolean }>;
+    belowThreshold: Array<{ vendorId: number; name: string; taxId: string | null; paidCents: number }>;
+  }> {
+    const org = currentOrgId();
+    const start = `${year}-01-01`;
+    const end = `${year}-12-31`;
+    const { rows } = await pool.query(
+      `SELECT v.id AS vendor_id, v.name, v.tax_id,
+              COALESCE(SUM(jl.debit), 0)::bigint AS paid_cents
+         FROM journal_entries je
+         JOIN journal_lines jl ON jl.entry_id = je.id
+         JOIN accounts ap      ON ap.id = jl.account_id AND ap.code = '2000' AND ap.org_id = $1
+         JOIN bills b          ON b.number = je.reference AND b.org_id = $1
+         JOIN vendors v        ON v.id = b.vendor_id AND v.org_id = $1
+        WHERE je.org_id = $1
+          AND je.source IN ('payment', 'bill_payment')
+          AND je.date >= $2 AND je.date <= $3
+          AND v.track_1099 = true
+          AND jl.debit > 0
+        GROUP BY v.id, v.name, v.tax_id
+        ORDER BY paid_cents DESC`,
+      [org, start, end],
+    );
+    const all = rows.map((r: any) => ({
+      vendorId: r.vendor_id as number,
+      name: r.name as string,
+      taxId: (r.tax_id ?? null) as string | null,
+      paidCents: Number(r.paid_cents),
+    }));
+    return {
+      year,
+      thresholdCents,
+      rows: all
+        .filter((r) => r.paidCents >= thresholdCents)
+        .map((r) => ({ ...r, missingTaxId: !r.taxId })),
+      belowThreshold: all.filter((r) => r.paidCents < thresholdCents),
+    };
+  }
+
+  // ============================================================================
   // SPRINT C: GLOBAL SEARCH
   // ============================================================================
   async globalSearch(q: string, limit = 30) {

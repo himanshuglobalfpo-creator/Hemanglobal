@@ -1744,6 +1744,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     handle(res, () => storage.taxLiabilityReport((req.query.asOf as string) || undefined))
   );
 
+  // 1099 Summary — cash paid to 1099-tracked vendors in a calendar year.
+  // ?year=YYYY (default: current year), ?threshold=<dollars> (default 600).
+  app.get("/api/reports/1099-summary", (req, res) =>
+    handle(res, () => {
+      const { year, threshold } = z
+        .object({
+          year: z.coerce.number().int().min(2000).max(2100).default(new Date().getFullYear()),
+          threshold: z.coerce.number().min(0).default(600),
+        })
+        .parse(req.query);
+      return storage.report1099Summary(year, Math.round(threshold * 100));
+    })
+  );
+
   // ============================================================================
   // Sprint C: Period Close / Year-End Close
   // ============================================================================

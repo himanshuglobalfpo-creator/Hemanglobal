@@ -134,6 +134,11 @@ export const vendors = pgTable("vendors", {
   phone: text("phone"),
   address: text("address"),
   notes: text("notes"),
+  // 1099 tracking: when true, cash paid to this vendor during a calendar year is
+  // accumulated for the 1099 Summary report. taxId holds the vendor's EIN/SSN
+  // (from their W-9). Both optional — most vendors are not 1099-reportable.
+  track1099: boolean("track_1099").notNull().default(false),
+  taxId: text("tax_id"),
   updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
   currency: text("currency"),
 });
@@ -145,6 +150,8 @@ export const insertVendorSchema = createInsertSchema(vendors)
     email: z.string().email("Invalid email address").or(z.literal("")).nullable().optional(),
     phone: z.string().max(40).nullable().optional(),
     currency: z.string().regex(/^[A-Z]{3}$/, "Use a 3-letter ISO currency code, e.g. EUR").nullable().optional(),
+    track1099: z.boolean().optional(),
+    taxId: z.string().max(40).nullable().optional(),
   });
 export type InsertVendor = z.infer<typeof insertVendorSchema>;
 export type Vendor = typeof vendors.$inferSelect;
