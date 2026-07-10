@@ -19,6 +19,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { setupTestDb } from "./harness";
 
 let failures = 0;
 function check(label: string, cond: boolean, detail?: string) {
@@ -28,27 +29,6 @@ function check(label: string, cond: boolean, detail?: string) {
 const money = (n: number) => `$${(n / 100).toFixed(2)}`; // cents → display
 
 async function main() {
-  let shutdown: () => Promise<void> = async () => {};
-  if (!process.env.DATABASE_URL) {
-    let EmbeddedPostgres: any;
-    try {
-      EmbeddedPostgres = (await import("embedded-postgres")).default;
-    } catch {
-      console.error("This test needs Postgres. Set DATABASE_URL to a THROWAWAY database, or `npm i -D embedded-postgres`.");
-      process.exit(1);
-    }
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ledgerlite-cn-pg-"));
-    const epg = new EmbeddedPostgres({
-      databaseDir: dataDir, user: "postgres", password: "password", port: 55445,
-      persistent: false, createPostgresUser: (process.getuid?.() ?? 1000) === 0,
-    });
-    await epg.initialise();
-    await epg.start();
-    await epg.createDatabase("ledgerlite_cn_test");
-    process.env.DATABASE_URL = "postgresql://postgres:password@localhost:55445/ledgerlite_cn_test";
-    shutdown = async () => { await epg.stop(); fs.rmSync(dataDir, { recursive: true, force: true }); };
-  }
-
   async function expectReject(label: string, fn: () => Promise<unknown>, pattern: RegExp) {
     try {
       await fn();
@@ -59,11 +39,9 @@ async function main() {
     }
   }
 
+  const { pool, storage, seedOrgDefaults, withOrg, cleanup } = await setupTestDb("credit_debit_note");
   try {
-    const { pool, runMigrations, storage, seedOrgDefaults } = await import("../server/storage");
     const noteSvc = await import("../server/creditNoteService");
-    const { withOrg } = await import("../server/org-scope");
-    await runMigrations();
     await pool.query(`INSERT INTO organizations (name, slug) VALUES ('Notes Co', 'notes-co')`);
     await pool.query(`INSERT INTO users (email, password_hash, name) VALUES ('n@n.test', 'x', 'Notes Tester')`);
     await seedOrgDefaults(1);
@@ -246,7 +224,7 @@ async function main() {
 
     await pool.end();
   } finally {
-    await shutdown();
+    await cleanup();
   }
 
   console.log("");

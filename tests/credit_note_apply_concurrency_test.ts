@@ -28,6 +28,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setupTestDb } from "./harness";
 
 let failures = 0;
 function check(label: string, cond: boolean, detail?: string) {
@@ -40,44 +41,8 @@ async function main() {
   // 1. Database bootstrap — BEFORE importing server/storage (it reads the env
   //    at module load).
   // --------------------------------------------------------------------------
-  let shutdown: () => Promise<void> = async () => {};
-  if (!process.env.DATABASE_URL) {
-    let EmbeddedPostgres: any;
-    try {
-      EmbeddedPostgres = (await import("embedded-postgres")).default;
-    } catch {
-      console.error(
-        "This test needs a real Postgres (it exercises SELECT ... FOR UPDATE).\n" +
-        "Either set DATABASE_URL to a THROWAWAY database, or `npm i -D embedded-postgres`."
-      );
-      process.exit(1);
-    }
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ledgerlite-pg-"));
-    const epg = new EmbeddedPostgres({
-      databaseDir: dataDir,
-      user: "postgres",
-      password: "password",
-      port: 55439,
-      persistent: false,
-      // Some CI containers run as root; Postgres refuses to. This makes
-      // embedded-postgres create and switch to an unprivileged user.
-      createPostgresUser: (process.getuid?.() ?? 1000) === 0,
-    });
-    await epg.initialise();
-    await epg.start();
-    await epg.createDatabase("ledgerlite_concurrency_test");
-    process.env.DATABASE_URL =
-      "postgresql://postgres:password@localhost:55439/ledgerlite_concurrency_test";
-    shutdown = async () => {
-      await epg.stop();
-      fs.rmSync(dataDir, { recursive: true, force: true });
-    };
-  }
-
+  const { pool, withOrg, cleanup } = await setupTestDb("credit_note_apply_concurrency");
   try {
-    const { pool, runMigrations } = await import("../server/storage");
-    const { withOrg } = await import("../server/org-scope");
-    await runMigrations();
     const noteSvc = await import("../server/creditNoteService");
 
     // ------------------------------------------------------------------------
@@ -222,7 +187,7 @@ async function main() {
 
     await pool.end();
   } finally {
-    await shutdown();
+    await cleanup();
   }
 
   if (failures) {

@@ -27,6 +27,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setupTestDb } from "./harness";
 
 let failures = 0;
 function check(label: string, cond: boolean, detail?: string) {
@@ -44,40 +45,8 @@ async function expectReject(label: string, fn: () => Promise<unknown>, pattern: 
 }
 
 async function main() {
-  let shutdown: () => Promise<void> = async () => {};
-  if (!process.env.DATABASE_URL) {
-    let EmbeddedPostgres: any;
-    try {
-      EmbeddedPostgres = (await import("embedded-postgres")).default;
-    } catch {
-      console.error(
-        "This test needs Postgres. Set DATABASE_URL to a THROWAWAY database, or `npm i -D embedded-postgres`."
-      );
-      process.exit(1);
-    }
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ledgerlite-pg-"));
-    const epg = new EmbeddedPostgres({
-      databaseDir: dataDir,
-      user: "postgres",
-      password: "password",
-      port: 55440,
-      persistent: false,
-      createPostgresUser: (process.getuid?.() ?? 1000) === 0,
-    });
-    await epg.initialise();
-    await epg.start();
-    await epg.createDatabase("ledgerlite_stripe_test");
-    process.env.DATABASE_URL =
-      "postgresql://postgres:password@localhost:55440/ledgerlite_stripe_test";
-    shutdown = async () => {
-      await epg.stop();
-      fs.rmSync(dataDir, { recursive: true, force: true });
-    };
-  }
-
+  const { pool, withOrg, cleanup } = await setupTestDb("stripe_clearing_account");
   try {
-    const { pool, runMigrations } = await import("../server/storage");
-    await runMigrations();
     const { getConfiguredClearingAccount, CLEARING_ACCOUNT_NOT_CONFIGURED } = await import("../server/stripe");
 
     // ------------------------------------------------------------------------
@@ -183,7 +152,7 @@ async function main() {
 
     await pool.end();
   } finally {
-    await shutdown();
+    await cleanup();
   }
 
   if (failures) {

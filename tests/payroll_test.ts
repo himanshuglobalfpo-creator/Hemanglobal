@@ -23,6 +23,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { computeEmployeePayroll, salaryGrossForPeriod } from "../shared/payroll";
+import { setupTestDb } from "./harness";
 
 let failures = 0;
 function check(label: string, cond: boolean, detail?: string) {
@@ -61,31 +62,8 @@ async function main() {
   const capped = computeEmployeePayroll({ grossCents: 1_000_000, ytdGrossCents: 16_000_000, federalWithholdingRate: 0, stateWithholdingRate: 0 });
   check("SS caps at the annual wage base via YTD (5332¢)", capped.ssEmployeeCents === 53_320, String(capped.ssEmployeeCents));
 
-  let shutdown: () => Promise<void> = async () => {};
-  if (!process.env.DATABASE_URL) {
-    let EmbeddedPostgres: any;
-    try {
-      EmbeddedPostgres = (await import("embedded-postgres")).default;
-    } catch {
-      console.error("This test needs Postgres. Set DATABASE_URL to a THROWAWAY database, or `npm i -D embedded-postgres`.");
-      process.exit(1);
-    }
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ledgerlite-pay-pg-"));
-    const epg = new EmbeddedPostgres({
-      databaseDir: dataDir, user: "postgres", password: "password", port: 55451,
-      persistent: false, createPostgresUser: (process.getuid?.() ?? 1000) === 0,
-    });
-    await epg.initialise();
-    await epg.start();
-    await epg.createDatabase("ledgerlite_payroll_test");
-    process.env.DATABASE_URL = "postgresql://postgres:password@localhost:55451/ledgerlite_payroll_test";
-    shutdown = async () => { await epg.stop(); fs.rmSync(dataDir, { recursive: true, force: true }); };
-  }
-
+  const { pool, storage, seedOrgDefaults, withOrg, cleanup } = await setupTestDb("payroll");
   try {
-    const { pool, runMigrations, storage, seedOrgDefaults } = await import("../server/storage");
-    const { withOrg } = await import("../server/org-scope");
-    await runMigrations();
     await pool.query(`INSERT INTO organizations (name, slug) VALUES ('Payroll Co', 'payroll-co')`);
     await pool.query(`INSERT INTO users (email, password_hash, name) VALUES ('p@p.test', 'x', 'Payroll Tester')`);
     await seedOrgDefaults(1);
@@ -165,7 +143,7 @@ async function main() {
 
     await pool.end();
   } finally {
-    await shutdown();
+    await cleanup();
   }
 
   if (failures) {

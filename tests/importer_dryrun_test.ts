@@ -6,37 +6,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setupTestDb } from "./harness";
 
 let fail = 0;
 const check = (n: string, c: boolean) => { console.log(`  ${c ? "✅" : "❌"} ${n}`); if (!c) fail++; };
 
 (async () => {
-  let shutdown: () => Promise<void> = async () => {};
-  if (!process.env.DATABASE_URL) {
-    let EmbeddedPostgres: any;
-    try {
-      EmbeddedPostgres = (await import("embedded-postgres")).default;
-    } catch {
-      console.error("This test needs Postgres. Set DATABASE_URL to a THROWAWAY database, or `npm i -D embedded-postgres`.");
-      process.exit(1);
-    }
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ledgerlite-imp-pg-"));
-    const epg = new EmbeddedPostgres({
-      databaseDir: dataDir, user: "postgres", password: "password", port: 55446,
-      persistent: false, createPostgresUser: (process.getuid?.() ?? 1000) === 0,
-    });
-    await epg.initialise();
-    await epg.start();
-    await epg.createDatabase("ledgerlite_importer_test");
-    process.env.DATABASE_URL = "postgresql://postgres:password@localhost:55446/ledgerlite_importer_test";
-    shutdown = async () => { await epg.stop(); fs.rmSync(dataDir, { recursive: true, force: true }); };
-  }
-
+  const { pool, seedOrgDefaults, withOrg, cleanup } = await setupTestDb("importer_dryrun");
   try {
-    const { pool, runMigrations, seedOrgDefaults } = await import("../server/storage");
-    const { withOrg } = await import("../server/org-scope");
     const { importCustomers, importOpeningBalances } = await import("../server/importers");
-    await runMigrations();
     await pool.query(`INSERT INTO organizations (name, slug) VALUES ('Import Co', 'import-co')`);
     await pool.query(`INSERT INTO users (email, password_hash, name) VALUES ('imp@i.test', 'x', 'Import Tester')`);
     await seedOrgDefaults(1);
@@ -63,7 +41,7 @@ const check = (n: string, c: boolean) => { console.log(`  ${c ? "✅" : "❌"} $
 
     await pool.end();
   } finally {
-    await shutdown();
+    await cleanup();
   }
 
   if (fail) { console.log(`\n❌ ${fail} failed`); process.exit(1); }

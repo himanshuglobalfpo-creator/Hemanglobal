@@ -25,6 +25,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setupTestDb } from "./harness";
 
 delete process.env.TAXJAR_API_KEY; // manual-tax path: this test is about ledger effects
 
@@ -38,31 +39,8 @@ const eq2 = (a: number, b: number) => a === b;
 const $ = (dollars: number) => Math.round(dollars * 100);
 
 async function main() {
-  let shutdown: () => Promise<void> = async () => {};
-  if (!process.env.DATABASE_URL) {
-    let EmbeddedPostgres: any;
-    try {
-      EmbeddedPostgres = (await import("embedded-postgres")).default;
-    } catch {
-      console.error("This test needs Postgres. Set DATABASE_URL to a THROWAWAY database, or `npm i -D embedded-postgres`.");
-      process.exit(1);
-    }
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ledgerlite-stmt-pg-"));
-    const epg = new EmbeddedPostgres({
-      databaseDir: dataDir, user: "postgres", password: "password", port: 55444,
-      persistent: false, createPostgresUser: (process.getuid?.() ?? 1000) === 0,
-    });
-    await epg.initialise();
-    await epg.start();
-    await epg.createDatabase("ledgerlite_stmt_test");
-    process.env.DATABASE_URL = "postgresql://postgres:password@localhost:55444/ledgerlite_stmt_test";
-    shutdown = async () => { await epg.stop(); fs.rmSync(dataDir, { recursive: true, force: true }); };
-  }
-
+  const { pool, storage, seedOrgDefaults, withOrg, cleanup } = await setupTestDb("invoice_statement_effect");
   try {
-    const { pool, runMigrations, storage, seedOrgDefaults } = await import("../server/storage");
-    const { withOrg } = await import("../server/org-scope");
-    await runMigrations();
     await pool.query(`INSERT INTO organizations (name, slug) VALUES ('Stmt Co', 'stmt-co')`);
     await pool.query(`INSERT INTO users (email, password_hash, name) VALUES ('s@s.test', 'x', 'Stmt Tester')`);
     await seedOrgDefaults(1); // full default chart of accounts, exactly like production
@@ -162,7 +140,7 @@ async function main() {
 
     await pool.end();
   } finally {
-    await shutdown();
+    await cleanup();
   }
 
   if (failures > 0) {
