@@ -22,6 +22,7 @@ import {
   debitNotes,
   items,
   inventoryMovements,
+  inventoryLayers,
   purchaseOrders,
   purchaseOrderLines,
   estimates,
@@ -46,7 +47,7 @@ import {
   type InsertLocation,
 } from "@shared/schema";
 import { organizations } from "@shared/auth-schema";
-import { applyPurchase, costOfSale, buildCogsJournalLines, type CogsComponent } from "@shared/inventory";
+import { applyPurchase, costOfSale, buildCogsJournalLines, relieveLayers, layerValuation, type CogsComponent } from "@shared/inventory";
 import { computeDepreciationSchedule, lastDayOfPeriod, periodOf, addMonthsToPeriod, type DepreciationPeriod } from "@shared/depreciation";
 import { computeEmployeePayroll, salaryGrossForPeriod, hourlyGross, type EmployeePayrollResult } from "@shared/payroll";
 import type {
@@ -1307,6 +1308,17 @@ export class DatabaseStorage {
     return !!row?.v;
   }
 
+  // Internal: this org's inventory costing method. FIFO/LIFO maintain cost
+  // layers; anything else (default) uses the weighted average.
+  private async orgCostingMethod(): Promise<"average" | "fifo" | "lifo"> {
+    const row = await db
+      .select({ v: organizations.costingMethod })
+      .from(organizations)
+      .where(eq(organizations.id, currentOrgId()))
+      .then((r: any[]) => r[0]);
+    return row?.v === "fifo" || row?.v === "lifo" ? row.v : "average";
+  }
+
   // Internal: validate that the GL accounts an item points at exist in this org
   // and have the expected normal type (income/expense/asset).
   private async assertItemAccounts(data: {
@@ -1421,6 +1433,22 @@ export class DatabaseStorage {
         isActive: it.isActive,
       }))
       .sort((a, b) => b.valuationCents - a.valuationCents);
+    // FIFO/LIFO: value each item from its remaining cost layers (sum of
+    // cost_remaining_cents), which ties to the Inventory Asset GL exactly.
+    const costingMethod = await this.orgCostingMethod();
+    if (costingMethod !== "average") {
+      const layerSums = await db
+        .select({ itemId: inventoryLayers.itemId, cost: sql<number>`COALESCE(SUM(${inventoryLayers.costRemainingCents}), 0)` })
+        .from(inventoryLayers)
+        .where(eq(inventoryLayers.orgId, currentOrgId()))
+        .groupBy(inventoryLayers.itemId);
+      const byItem = new Map(layerSums.map((r: any) => [r.itemId, Number(r.cost)]));
+      for (const r of rows) {
+        r.valuationCents = byItem.get(r.id) ?? 0;
+        r.avgCostCents = r.quantityOnHand > 0 ? Math.round(r.valuationCents / r.quantityOnHand) : 0;
+      }
+      rows.sort((a, b) => b.valuationCents - a.valuationCents);
+    }
     const totalValuationCents = rows.reduce((s, r) => s + r.valuationCents, 0);
 
     // Tie-out: sum the GL balances of the DISTINCT inventory asset accounts these
@@ -2719,12 +2747,30 @@ export class DatabaseStorage {
       }, { _tx: tx });
       await this.audit("create", "invoice", inv.id, `Created invoice ${invNumber} (${formatMoney(total)})`);
 
-      // ---- Inventory: relieve stock at weighted-average cost + post COGS ----
+      // ---- Inventory: relieve stock + post COGS ----
       // Sales of inventory items decrement quantity_on_hand and book their own
       // balanced entry (Dr COGS / Cr Inventory Asset) in THIS SAME transaction,
       // so a rolled-back invoice never leaves an orphaned COGS entry or stray
-      // stock change. The COGS entry goes through postJournalEntry, which
-      // enforces the period lock just like the sale entry above.
+      // stock change. COGS is costed by the org's method: weighted AVERAGE, or
+      // FIFO/LIFO by consuming cost layers (oldest/newest first).
+      const costingMethod = await this.orgCostingMethod();
+      // Working per-item layer arrays (loaded lazily, ordered per method). We
+      // mutate them across lines via relieveLayers, then persist below.
+      const layerCache = new Map<number, Array<{ id: number; qtyRemaining: number; costRemainingCents: number }>>();
+      const loadLayers = async (itemId: number): Promise<Array<{ id: number; qtyRemaining: number; costRemainingCents: number }>> => {
+        const existing = layerCache.get(itemId);
+        if (existing) return existing;
+        const rows = await tx.select().from(inventoryLayers)
+          .where(and(eq(inventoryLayers.itemId, itemId), eq(inventoryLayers.orgId, currentOrgId()), gt(inventoryLayers.qtyRemaining, 0)))
+          .orderBy(
+            costingMethod === "lifo" ? desc(inventoryLayers.date) : inventoryLayers.date,
+            costingMethod === "lifo" ? desc(inventoryLayers.id) : inventoryLayers.id,
+          );
+        const arr = rows.map((r: any) => ({ id: r.id, qtyRemaining: r.qtyRemaining, costRemainingCents: Number(r.costRemainingCents) }));
+        layerCache.set(itemId, arr);
+        return arr;
+      };
+
       const cogsComponents: CogsComponent[] = [];
       const saleMovements: { itemId: number; qty: number; avgCostCents: number }[] = [];
       const workingQty = new Map<number, number>(); // item id -> running on-hand
@@ -2737,17 +2783,29 @@ export class DatabaseStorage {
           throw new Error(`Inventory item "${item.sku}" must be sold in whole units (got ${l.quantity}).`);
         }
         const startQty = workingQty.get(item.id) ?? item.quantityOnHand;
-        const sale = costOfSale({ qtyOnHand: startQty, avgCostCents: item.avgCostCents }, l.quantity);
-        if (sale.qtyOnHand < 0 && !allowNegative) {
+        const newQty = startQty - l.quantity;
+        if (newQty < 0 && !allowNegative) {
           throw new Error(
-            `Selling ${l.quantity} of "${item.sku}" would drive stock to ${sale.qtyOnHand} (on hand ${startQty}). ` +
+            `Selling ${l.quantity} of "${item.sku}" would drive stock to ${newQty} (on hand ${startQty}). ` +
             `Enable allow_negative_stock for this organization to permit overselling.`
           );
         }
-        workingQty.set(item.id, sale.qtyOnHand);
+        workingQty.set(item.id, newQty);
+        // Cost the sale. FIFO/LIFO consume layers (fallback to avg cost for any
+        // shortfall past the layers, i.e. oversold negative stock).
+        let cogsCents: number;
+        let movementUnitCost: number;
+        if (costingMethod === "average") {
+          cogsCents = l.quantity * item.avgCostCents;
+          movementUnitCost = item.avgCostCents;
+        } else {
+          const layers = await loadLayers(item.id);
+          cogsCents = relieveLayers(layers, l.quantity, item.avgCostCents);
+          movementUnitCost = l.quantity > 0 ? Math.round(cogsCents / l.quantity) : 0;
+        }
         // inventoryAssetAccountId is guaranteed non-null for type 'inventory' (schema refine + createItem).
-        cogsComponents.push({ cogsAccountId: item.cogsAccountId, inventoryAssetAccountId: item.inventoryAssetAccountId!, cogsCents: sale.cogsCents });
-        saleMovements.push({ itemId: item.id, qty: l.quantity, avgCostCents: item.avgCostCents });
+        cogsComponents.push({ cogsAccountId: item.cogsAccountId, inventoryAssetAccountId: item.inventoryAssetAccountId!, cogsCents });
+        saleMovements.push({ itemId: item.id, qty: l.quantity, avgCostCents: movementUnitCost });
       }
       const cogsLines = buildCogsJournalLines(cogsComponents, `COGS for ${invNumber}`);
       if (cogsLines.length > 0) {
@@ -2774,6 +2832,16 @@ export class DatabaseStorage {
         for (const [itemId, qtyOnHand] of workingQty) {
           await tx.update(items).set({ quantityOnHand: qtyOnHand, updatedAt: nowIso() })
             .where(and(eq(items.id, itemId), eq(items.orgId, currentOrgId())));
+        }
+        // FIFO/LIFO: persist the consumed cost layers.
+        if (costingMethod !== "average") {
+          for (const layers of layerCache.values()) {
+            for (const layer of layers) {
+              await tx.update(inventoryLayers)
+                .set({ qtyRemaining: layer.qtyRemaining, costRemainingCents: layer.costRemainingCents })
+                .where(and(eq(inventoryLayers.id, layer.id), eq(inventoryLayers.orgId, currentOrgId())));
+            }
+          }
         }
         const totalCogs = cogsComponents.reduce((s, c) => s + c.cogsCents, 0);
         await this.audit("post", "inventory_cogs", inv.id, `Relieved inventory for invoice ${invNumber} (COGS ${formatMoney(totalCogs)})`);
@@ -3156,11 +3224,13 @@ export class DatabaseStorage {
       }, { _tx: tx });
       await this.audit("create", "bill", b.id, `Created bill ${billNumber} (${formatMoney(total)})`);
 
-      // ---- Inventory: raise stock at WEIGHTED-AVERAGE cost for item lines ----
+      // ---- Inventory: raise stock for item lines ----
       // The purchase was already capitalized to the Inventory Asset account by
       // the bill entry above (its debit is `lineAmounts[idx]` base cents). Here
       // we mirror that into quantity_on_hand and recompute the running average
-      // in the SAME transaction. Same-item lines are folded sequentially.
+      // (always, so it's available for the average method), AND — under FIFO/LIFO
+      // — record a cost LAYER for this lot. Same-item lines fold sequentially.
+      const costingMethod = await this.orgCostingMethod();
       const working = new Map<number, { qtyOnHand: number; avgCostCents: number }>();
       let touchedInventory = false;
       for (let idx = 0; idx < input.lines.length; idx++) {
@@ -3186,6 +3256,20 @@ export class DatabaseStorage {
           sourceId: b.id,
           entryId: billEntry.entry.id,
         });
+        // FIFO/LIFO: record the purchase lot as a cost layer (remaining qty +
+        // remaining cost = the exact base cents capitalized for this line).
+        if (costingMethod !== "average") {
+          await tx.insert(inventoryLayers).values({
+            orgId: currentOrgId(),
+            itemId: item.id,
+            date: input.date,
+            qtyRemaining: l.quantity,
+            costRemainingCents: valueCents,
+            unitCostCents: res.unitCostCents,
+            source: "bill",
+            sourceId: b.id,
+          });
+        }
       }
       if (touchedInventory) {
         for (const [itemId, st] of working) {

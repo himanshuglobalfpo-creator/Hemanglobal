@@ -327,6 +327,8 @@ export function registerAuthRoutes(app: Express) {
               addressState: (req.org as any).addressState ?? null,
               addressZip: (req.org as any).addressZip ?? null,
               stripeClearingAccountId: (req.org as any).stripeClearingAccountId ?? null,
+              costingMethod: (req.org as any).costingMethod ?? "average",
+              allowNegativeStock: (req.org as any).allowNegativeStock ?? false,
             }
           : null,
         role: req.role ?? null,
@@ -474,9 +476,23 @@ export function registerAuthRoutes(app: Express) {
         // the setting (which DISABLES online payments; the webhook refuses to
         // guess an account).
         stripeClearingAccountId: z.number().int().positive().nullable().optional(),
+        // Inventory settings.
+        costingMethod: z.enum(["average", "fifo", "lifo"]).optional(),
+        allowNegativeStock: z.boolean().optional(),
       });
       const data = schema.parse(req.body);
       const updates: Record<string, unknown> = {};
+      if (data.allowNegativeStock !== undefined) updates.allowNegativeStock = data.allowNegativeStock;
+      if (data.costingMethod !== undefined) {
+        // Switching costing method mid-stream would make existing layers/average
+        // inconsistent — only allow it before any inventory has moved.
+        const cur = await db.select({ v: organizations.costingMethod }).from(organizations).where(eq(organizations.id, orgId)).then((r: any[]) => r[0]);
+        if (cur?.v !== data.costingMethod) {
+          const moved = (await pool.query(`SELECT COUNT(*)::int AS c FROM inventory_movements WHERE org_id = $1`, [orgId])).rows[0].c as number;
+          if (moved > 0) throw new Error("Cannot change the inventory costing method after inventory transactions exist. Set it before recording purchases or sales.");
+        }
+        updates.costingMethod = data.costingMethod;
+      }
       if (data.name !== undefined) updates.name = data.name;
       if (data.addressCity !== undefined) updates.addressCity = data.addressCity;
       if (data.addressState !== undefined) updates.addressState = data.addressState ? data.addressState.toUpperCase() : data.addressState;

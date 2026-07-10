@@ -60,6 +60,61 @@ export function costOfSale(state: ItemCostState, qty: number): SaleResult {
   return { cogsCents: qty * state.avgCostCents, qtyOnHand: state.qtyOnHand - qty };
 }
 
+// ============================================================================
+// FIFO / LIFO LAYER COSTING (pure)
+// ============================================================================
+// A "layer" is one purchase lot with a remaining quantity and the remaining
+// integer-cents cost of that quantity. FIFO relieves the oldest layers first,
+// LIFO the newest — the CALLER passes `layers` already in the order to consume.
+// Costing stays exact in integer cents: fully consuming a layer takes ALL its
+// remaining cost (so rounding never strands a fraction), and a partial take
+// rounds its share. The sum of every layer's costRemainingCents always ties to
+// the Inventory Asset GL balance.
+
+export interface CostLayerState {
+  qtyRemaining: number;
+  costRemainingCents: number;
+}
+
+/**
+ * Relieve `qty` whole units from `layers` (already ordered oldest-first for
+ * FIFO or newest-first for LIFO). MUTATES each consumed layer's qtyRemaining /
+ * costRemainingCents in place and returns the COGS in integer cents. Any
+ * shortfall past the available layers (only possible when negative stock is
+ * allowed) is costed at `fallbackUnitCents`.
+ */
+export function relieveLayers(
+  layers: CostLayerState[],
+  qty: number,
+  fallbackUnitCents: number,
+): number {
+  if (!Number.isInteger(qty) || qty <= 0) {
+    throw new Error("relieveLayers: qty must be a positive whole number of units");
+  }
+  let remaining = qty;
+  let cogs = 0;
+  for (const layer of layers) {
+    if (remaining <= 0) break;
+    if (layer.qtyRemaining <= 0) continue;
+    const take = Math.min(remaining, layer.qtyRemaining);
+    const costTake =
+      take === layer.qtyRemaining
+        ? layer.costRemainingCents // take the whole layer's remaining cost — exact
+        : Math.round((layer.costRemainingCents * take) / layer.qtyRemaining);
+    cogs += costTake;
+    layer.qtyRemaining -= take;
+    layer.costRemainingCents -= costTake;
+    remaining -= take;
+  }
+  if (remaining > 0) cogs += remaining * Math.max(0, fallbackUnitCents);
+  return cogs;
+}
+
+/** Total inventory value from layers = sum of remaining costs (ties to GL). */
+export function layerValuation(layers: Array<{ costRemainingCents: number }>): number {
+  return layers.reduce((s, l) => s + l.costRemainingCents, 0);
+}
+
 export interface CogsComponent {
   cogsAccountId: number;
   inventoryAssetAccountId: number;

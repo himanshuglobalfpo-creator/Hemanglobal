@@ -402,6 +402,27 @@ export const inventoryMovements = pgTable("inventory_movements", {
 });
 export type InventoryMovement = typeof inventoryMovements.$inferSelect;
 
+// ---------------------------------------------------------------------------
+// INVENTORY COST LAYERS (FIFO / LIFO)
+// ---------------------------------------------------------------------------
+// One row per purchase lot with remaining quantity + remaining cost (integer
+// cents). FIFO consumes oldest layers first (ORDER BY date, id ASC), LIFO the
+// newest (DESC). Sum(cost_remaining_cents) per item ties to the Inventory Asset
+// GL balance. Only maintained for orgs whose costing_method is fifo/lifo.
+export const inventoryLayers = pgTable("inventory_layers", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(),
+  itemId: integer("item_id").notNull(),
+  date: text("date").notNull(), // acquisition date, YYYY-MM-DD
+  qtyRemaining: integer("qty_remaining").notNull(),
+  costRemainingCents: bigint("cost_remaining_cents", { mode: "number" }).notNull(),
+  unitCostCents: bigint("unit_cost_cents", { mode: "number" }).notNull(), // original per-unit, for reference
+  source: text("source").notNull(), // "bill" | "opening" | ...
+  sourceId: integer("source_id"),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type InventoryLayer = typeof inventoryLayers.$inferSelect;
+
 // ============================================================================
 // INVOICES (sales / accounts receivable)
 // ============================================================================

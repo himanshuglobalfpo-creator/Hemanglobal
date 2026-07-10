@@ -32,6 +32,9 @@ export const organizations = pgTable("organizations", {
   // on-hand is BLOCKED. When true, the sale is allowed and the resulting
   // negative stock surfaces as a warning on the inventory-valuation report.
   allowNegativeStock: boolean("allow_negative_stock").notNull().default(false),
+  // Inventory costing method: "average" (default), "fifo", or "lifo". FIFO/LIFO
+  // maintain per-lot cost layers; average uses the running weighted average.
+  costingMethod: text("costing_method").notNull().default("average"),
   // Future-dated document policy (BUG-005). A document (invoice/bill/journal
   // entry) dated more than `futureDatedGraceDays` beyond today is flagged.
   // strictFutureDates=false → the API returns a `warnings` array the client can

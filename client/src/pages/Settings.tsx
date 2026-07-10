@@ -10,7 +10,7 @@
 
 import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { CheckCircle2, XCircle, CreditCard, MapPin, Tags } from "lucide-react";
+import { CheckCircle2, XCircle, CreditCard, MapPin, Tags, Boxes } from "lucide-react";
 import type { Account } from "@shared/schema";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -102,6 +102,59 @@ function DimensionManager({ kind, title, canEdit }: { kind: "classes" | "locatio
   );
 }
 
+// Inventory costing method + negative-stock policy. Costing method can only be
+// changed before any inventory has moved — the server enforces this and surfaces
+// the error here.
+function InventorySettings({ org, canEdit }: {
+  org: { id: number; costingMethod?: "average" | "fifo" | "lifo"; allowNegativeStock?: boolean } | null;
+  canEdit: boolean;
+}) {
+  const { toast } = useToast();
+  const [method, setMethod] = useState<"average" | "fifo" | "lifo">(org?.costingMethod ?? "average");
+  const [allowNeg, setAllowNeg] = useState<boolean>(!!org?.allowNegativeStock);
+  useEffect(() => {
+    setMethod(org?.costingMethod ?? "average");
+    setAllowNeg(!!org?.allowNegativeStock);
+  }, [org?.costingMethod, org?.allowNegativeStock]);
+
+  const saveMut = useMutation({
+    mutationFn: async () => (await apiRequest("PATCH", `/api/orgs/${org!.id}`, { costingMethod: method, allowNegativeStock: allowNeg })).json(),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["/api/auth/me"] }); toast({ title: "Saved", description: "Inventory settings updated." }); },
+    onError: (e: any) => toast({ title: "Error", description: String(e?.message || e), variant: "destructive" }),
+  });
+
+  return (
+    <Card data-testid="card-inventory-settings">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2"><Boxes className="h-5 w-5" /> Inventory</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-1">
+          <Label htmlFor="costing-method">Costing method</Label>
+          <Select value={method} onValueChange={(v) => setMethod(v as any)} disabled={!canEdit}>
+            <SelectTrigger id="costing-method" data-testid="select-costing-method"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="average">Weighted average</SelectItem>
+              <SelectItem value="fifo">FIFO (first-in, first-out)</SelectItem>
+              <SelectItem value="lifo">LIFO (last-in, first-out)</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">Can only be changed before any inventory purchase or sale is recorded.</p>
+        </div>
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={allowNeg} disabled={!canEdit} onChange={(e) => setAllowNeg(e.target.checked)} data-testid="checkbox-allow-negative-stock" className="h-4 w-4" />
+          Allow selling below zero on-hand (negative stock)
+        </label>
+        {canEdit && (
+          <Button onClick={() => saveMut.mutate()} disabled={saveMut.isPending} data-testid="button-save-inventory">
+            {saveMut.isPending ? "Saving…" : "Save inventory settings"}
+          </Button>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function Settings() {
   const { toast } = useToast();
 
@@ -110,6 +163,8 @@ export default function Settings() {
     addressState?: string | null;
     addressZip?: string | null;
     stripeClearingAccountId?: number | null;
+    costingMethod?: "average" | "fifo" | "lifo";
+    allowNegativeStock?: boolean;
   }) | null }>({ queryKey: ["/api/auth/me"] });
   const { data: accounts = [] } = useQuery<Account[]>({ queryKey: ["/api/accounts"] });
   const { data: stripe } = useQuery<StripeStatus>({ queryKey: ["/api/stripe/status"] });
@@ -320,6 +375,7 @@ export default function Settings() {
           </CardContent>
         </Card>
 
+        <InventorySettings org={org} canEdit={canEdit} />
         <DimensionManager kind="classes" title="Classes" canEdit={canEdit} />
         <DimensionManager kind="locations" title="Locations" canEdit={canEdit} />
       </div>
