@@ -131,6 +131,8 @@ export type Me = {
     enableClassTracking?: boolean;
     enableLocationTracking?: boolean;
     enableProjectTracking?: boolean;
+    // Invoice form (Manage panel) preferences — served fully defaulted.
+    invoiceSettings?: import("@shared/schema").InvoiceSettings;
   } | null;
   role: string | null;
   orgs: Array<{ id: number; name: string; slug: string; role: string }>;

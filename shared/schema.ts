@@ -490,6 +490,14 @@ export const invoices = pgTable("invoices", {
   // TaxJar response when source is taxjar/taxjar_sandbox.
   taxBreakdown: text("tax_breakdown"),
   notes: text("notes"),
+  // QBO-style optional header fields, revealed by the org's invoice-form
+  // Customization toggles (invoiceSettings). shipTo = free-text shipping
+  // address; terms = payment terms label ("Net 30"); customFields = JSON text
+  // of {label: value} for org-defined custom fields (TEXT-JSON like
+  // taxBreakdown above).
+  shipTo: text("ship_to"),
+  terms: text("terms"),
+  customFields: text("custom_fields"),
   updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
   currency: text("currency").notNull().default(""),
   fxRate: doublePrecision("fx_rate").notNull().default(1),
@@ -521,6 +529,7 @@ export const invoiceLines = pgTable("invoice_lines", {
   amount: bigint("amount", { mode: "number" }).notNull().default(0),
   incomeAccountId: integer("income_account_id").notNull(), // which income account this line credits
   itemId: integer("item_id"), // optional link to a catalog item (drives income account + COGS)
+  serviceDate: text("service_date"), // optional per-line service date (QBO table column)
   // Optional dimensions (class/location/project) — propagated onto the GL income line.
   classId: integer("class_id"),
   locationId: integer("location_id"),
@@ -544,6 +553,11 @@ export const createInvoiceSchema = z.object({
   date: isoDate,
   dueDate: isoDate,
   notes: z.string().max(2000).optional(),
+  // QBO-style optional header fields (see invoiceSettingsSchema below).
+  shipTo: z.string().max(500).optional(),
+  terms: z.string().max(50).optional(),
+  // Org-defined custom fields: {label: value}. Bounded on both axes.
+  customFields: z.record(z.string().min(1).max(30), z.string().max(200)).optional(),
   taxRate: z.number().min(0).max(100).default(0),
   taxCodeId: z.number().int().positive().optional(),
   lines: z
@@ -552,6 +566,7 @@ export const createInvoiceSchema = z.object({
         description: z.string().min(1).max(500),
         quantity: z.number().positive("Quantity must be greater than 0"),
         rate: z.number().min(0),
+        serviceDate: isoDate.optional(),
         // Reference a catalog item (income account + COGS are derived from it)
         // OR name the income account directly. At least one is required.
         itemId: z.number().int().positive().optional(),
@@ -570,6 +585,73 @@ export const createInvoiceSchema = z.object({
   path: ["dueDate"],
 });
 export type CreateInvoiceInput = z.infer<typeof createInvoiceSchema>;
+
+// ============================================================================
+// INVOICE FORM SETTINGS (QBO "Manage" panel) — stored per org
+// ============================================================================
+// organizations.invoice_settings holds this object. Every leaf has a default,
+// so `invoiceSettingsSchema.parse({})` yields the full default settings and an
+// org that never opened the panel behaves exactly like today. The client sends
+// the COMPLETE object on save; the server re-validates before storing.
+// NOTE ON HONESTY: these are form/display preferences. Toggles for features
+// whose accounting isn't implemented yet (tips, deposit, discount, shipping
+// fee, late fees) persist the preference but do not change ledger math — the
+// panel labels them accordingly.
+const invoiceColumn = (show: boolean, label: string) =>
+  z.object({
+    show: z.boolean().default(show),
+    label: z.string().min(1).max(30).default(label),
+  }).default({ show, label });
+
+export const invoiceSettingsSchema = z.object({
+  customization: z.object({
+    shipTo: z.boolean().default(false),
+    invoiceNo: z.boolean().default(true),
+    invoiceDate: z.boolean().default(true),
+    dueDate: z.boolean().default(true),
+    terms: z.boolean().default(true),
+    customerEmail: z.boolean().default(false),
+    customerContactInfo: z.boolean().default(false),
+  }).default({}),
+  tableColumns: z.object({
+    rowNumber: invoiceColumn(true, "#"),
+    serviceDate: invoiceColumn(false, "Service date"),
+    productService: invoiceColumn(false, "Product/service"),
+    sku: invoiceColumn(false, "SKU"),
+    description: invoiceColumn(true, "Description"),
+    qty: invoiceColumn(true, "Qty"),
+    rate: invoiceColumn(true, "Rate"),
+    amount: invoiceColumn(true, "Amount"),
+  }).default({}),
+  // Up to 3 org-defined custom fields shown on the invoice header when active.
+  customFields: z.array(z.object({
+    name: z.string().min(1).max(30),
+    active: z.boolean().default(true),
+  })).max(3).default([]),
+  paymentMethods: z.object({
+    cards: z.boolean().default(true),
+    bankTransfer: z.boolean().default(true),
+    paypalVenmo: z.boolean().default(true),
+    buyNowPayLater: z.boolean().default(false),
+  }).default({}),
+  paymentOptions: z.object({
+    tips: z.boolean().default(false),
+    invoiceTotal: z.boolean().default(true),
+    deposit: z.boolean().default(false),
+    discount: z.boolean().default(false),
+    shippingFee: z.boolean().default(false),
+    lateFees: z.boolean().default(false),
+  }).default({}),
+  design: z.object({
+    accentColor: z.string().regex(/^#[0-9a-fA-F]{6}$/, "Use a hex color like #16a34a").default("#16a34a"),
+  }).default({}),
+  scheduling: z.object({
+    // Default terms applied to new invoices ("Net N"); 0 = due on receipt.
+    defaultTermsDays: z.number().int().min(0).max(365).default(30),
+  }).default({}),
+}).default({});
+export type InvoiceSettings = z.infer<typeof invoiceSettingsSchema>;
+export const defaultInvoiceSettings: InvoiceSettings = invoiceSettingsSchema.parse({});
 
 // ============================================================================
 // ESTIMATES (quotes) — a sales pre-document that converts into an invoice

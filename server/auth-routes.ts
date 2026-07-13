@@ -21,7 +21,7 @@ import { z } from "zod";
 import {
   signupSchema, loginSchema, inviteUserSchema,
   requestPasswordResetSchema, resetPasswordSchema,
-  insertOrgSchema, type OrgRole,
+  insertOrgSchema, invoiceSettingsSchema, type OrgRole,
 } from "@shared/schema";
 import crypto from "node:crypto";
 import { eq, and } from "drizzle-orm";
@@ -332,6 +332,9 @@ export function registerAuthRoutes(app: Express) {
               enableClassTracking: (req.org as any).enableClassTracking ?? false,
               enableLocationTracking: (req.org as any).enableLocationTracking ?? false,
               enableProjectTracking: (req.org as any).enableProjectTracking ?? false,
+              // Always serve the FULL settings object (defaults merged) so the
+              // client never re-implements defaulting logic.
+              invoiceSettings: invoiceSettingsSchema.parse((req.org as any).invoiceSettings ?? {}),
             }
           : null,
         role: req.role ?? null,
@@ -486,6 +489,11 @@ export function registerAuthRoutes(app: Express) {
         enableClassTracking: z.boolean().optional(),
         enableLocationTracking: z.boolean().optional(),
         enableProjectTracking: z.boolean().optional(),
+        // Invoice form (Manage panel) preferences. The client sends the whole
+        // object; parsing fills defaults for anything omitted, so a stale
+        // client can never strip settings it doesn't know about into limbo —
+        // unknown keys are dropped, known ones defaulted.
+        invoiceSettings: invoiceSettingsSchema.optional(),
       });
       const data = schema.parse(req.body);
       const updates: Record<string, unknown> = {};
@@ -493,6 +501,7 @@ export function registerAuthRoutes(app: Express) {
       if (data.enableClassTracking !== undefined) updates.enableClassTracking = data.enableClassTracking;
       if (data.enableLocationTracking !== undefined) updates.enableLocationTracking = data.enableLocationTracking;
       if (data.enableProjectTracking !== undefined) updates.enableProjectTracking = data.enableProjectTracking;
+      if (data.invoiceSettings !== undefined) updates.invoiceSettings = data.invoiceSettings;
       if (data.costingMethod !== undefined) {
         // Switching costing method mid-stream would make existing layers/average
         // inconsistent — only allow it before any inventory has moved.

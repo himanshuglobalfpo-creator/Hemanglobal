@@ -122,6 +122,7 @@ export async function listOrgsForUser(userId: number): Promise<Array<Organizatio
     enableClassTracking: r.enable_class_tracking ?? false,
     enableLocationTracking: r.enable_location_tracking ?? false,
     enableProjectTracking: r.enable_project_tracking ?? false,
+    invoiceSettings: r.invoice_settings ?? {},
     addressCity: r.address_city ?? null,
     addressState: r.address_state ?? null,
     addressZip: r.address_zip ?? null,

@@ -5,7 +5,7 @@
 // before the existing exports begin (after the imports), and `export *` from
 // the main schema file.
 
-import { pgTable, text, integer, serial, boolean, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, serial, boolean, timestamp, jsonb } from "drizzle-orm/pg-core";
 import { z } from "zod";
 import { createInsertSchema } from "drizzle-zod";
 
@@ -48,6 +48,11 @@ export const organizations = pgTable("organizations", {
   enableClassTracking: boolean("enable_class_tracking").notNull().default(false),
   enableLocationTracking: boolean("enable_location_tracking").notNull().default(false),
   enableProjectTracking: boolean("enable_project_tracking").notNull().default(false),
+  // Invoice form (Manage panel) preferences — QBO-style Customization / table
+  // columns / payment methods / payment options / design / scheduling. Shape is
+  // validated by invoiceSettingsSchema (shared/schema.ts); defaults live in
+  // code, so {} means "all defaults".
+  invoiceSettings: jsonb("invoice_settings").notNull().default({}),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
 });
 export type Organization = typeof organizations.$inferSelect;

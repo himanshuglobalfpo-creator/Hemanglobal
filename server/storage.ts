@@ -2835,6 +2835,9 @@ export class DatabaseStorage {
           amountPaid: 0,
           taxBreakdown: opts.taxOverride?.breakdownJson ?? null,
           notes: input.notes,
+          shipTo: input.shipTo ?? null,
+          terms: input.terms ?? null,
+          customFields: input.customFields ? JSON.stringify(input.customFields) : null,
         })
         .returning().then((r: any[]) => r[0]);
       for (let idx = 0; idx < input.lines.length; idx++) {
@@ -2851,6 +2854,7 @@ export class DatabaseStorage {
             amount: fx ? lineAmountsRaw[idx] : lineAmounts[idx],
             incomeAccountId: resolvedIncomeAccountIds[idx],
             itemId: l.itemId ?? null,
+            serviceDate: l.serviceDate ?? null,
             classId: (l as any).classId ?? null,
             locationId: (l as any).locationId ?? null,
             projectId: (l as any).projectId ?? null,
