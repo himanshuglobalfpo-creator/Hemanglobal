@@ -1506,11 +1506,33 @@ export class DatabaseStorage {
     }
     return {
       asOfDate: asOfDate ?? new Date().toISOString().slice(0, 10),
+      costingMethod,
       rows,
       totalValuationCents,
       glAccounts,
       glTotal,
       warning,
+    };
+  }
+
+  // Open FIFO/LIFO cost layers for one item (empty under the average method),
+  // in consumption order — oldest-first for FIFO, newest-first for LIFO — so the
+  // UI can show which lots will be relieved on the next sale.
+  async listItemCostLayers(itemId: number): Promise<{ costingMethod: string; layers: Array<{ id: number; date: string; qtyRemaining: number; costRemainingCents: number; unitCostCents: number }> }> {
+    const method = await this.orgCostingMethod();
+    if (method === "average") return { costingMethod: method, layers: [] };
+    const rows = await db.select().from(inventoryLayers)
+      .where(and(eq(inventoryLayers.itemId, itemId), eq(inventoryLayers.orgId, currentOrgId()), gt(inventoryLayers.qtyRemaining, 0)))
+      .orderBy(
+        method === "lifo" ? desc(inventoryLayers.date) : inventoryLayers.date,
+        method === "lifo" ? desc(inventoryLayers.id) : inventoryLayers.id,
+      );
+    return {
+      costingMethod: method,
+      layers: rows.map((r: any) => ({
+        id: r.id, date: r.date, qtyRemaining: r.qtyRemaining,
+        costRemainingCents: Number(r.costRemainingCents), unitCostCents: Number(r.unitCostCents),
+      })),
     };
   }
 

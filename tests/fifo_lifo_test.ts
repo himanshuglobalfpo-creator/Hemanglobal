@@ -104,6 +104,16 @@ async function main() {
       const val = await run(() => storage.inventoryValuation("2026-03-01"));
       check(`${m.method}: valuation = ${m.expectLeft}¢`, val.totalValuationCents === m.expectLeft, String(val.totalValuationCents));
       check(`${m.method}: valuation ties to GL (no warning)`, !val.warning, val.warning);
+      check(`${m.method}: valuation report exposes the costing method`, (val as any).costingMethod === m.method, String((val as any).costingMethod));
+      // Cost layers surfaced for the item UI (empty for average).
+      const cl = await run(() => storage.listItemCostLayers(item.id));
+      check(`${m.method}: cost-layers endpoint reports the method`, cl.costingMethod === m.method);
+      if (m.method === "average") {
+        check(`${m.method}: no cost layers under average`, cl.layers.length === 0, String(cl.layers.length));
+      } else {
+        check(`${m.method}: one open layer, 5 units, ${m.expectLeft}¢ remaining`,
+          cl.layers.length === 1 && cl.layers[0].qtyRemaining === 5 && cl.layers[0].costRemainingCents === m.expectLeft, JSON.stringify(cl.layers));
+      }
       const invGlAfterSale = (await run(() => storage.accountBalances("2026-03-01"))).get(invAsset.id)!.balance;
       check(`${m.method}: inventory GL = ${m.expectLeft}¢ after sale`, invGlAfterSale === m.expectLeft, String(invGlAfterSale));
       const finalItem = await run(() => storage.getItem(item.id));

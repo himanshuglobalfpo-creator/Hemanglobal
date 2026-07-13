@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { Account } from "@shared/schema";
 import { Layout, PageHeader } from "@/components/Layout";
@@ -64,6 +64,7 @@ export default function Reports() {
           <TabsTrigger value="gl" data-testid="tab-gl">General Ledger</TabsTrigger>
           <TabsTrigger value="ar" data-testid="tab-ar">A/R Aging</TabsTrigger>
           <TabsTrigger value="ap" data-testid="tab-ap">A/P Aging</TabsTrigger>
+          <TabsTrigger value="inv" data-testid="tab-inv">Inventory</TabsTrigger>
         </TabsList>
         <TabsContent value="pl" className="mt-4"><ProfitLoss /></TabsContent>
         <TabsContent value="ppl" className="mt-4"><ProjectPL /></TabsContent>
@@ -73,6 +74,7 @@ export default function Reports() {
         <TabsContent value="gl" className="mt-4"><GeneralLedger /></TabsContent>
         <TabsContent value="ar" className="mt-4"><ARAging /></TabsContent>
         <TabsContent value="ap" className="mt-4"><APAging /></TabsContent>
+        <TabsContent value="inv" className="mt-4"><InventoryReport /></TabsContent>
       </Tabs>
     </Layout>
   );
@@ -559,4 +561,113 @@ function Loader({ inline = false }: { inline?: boolean }) {
   );
   if (inline) return inner;
   return <Card><CardContent className="p-0">{inner}</CardContent></Card>;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Inventory valuation — surfaces the org's costing method + per-item value,
+// with expandable FIFO/LIFO cost layers.
+// ────────────────────────────────────────────────────────────────────────────
+const METHOD_LABEL: Record<string, string> = { average: "Weighted average", fifo: "FIFO", lifo: "LIFO" };
+
+function ItemCostLayers({ itemId }: { itemId: number }) {
+  const { data } = useQuery<any>({
+    queryKey: ["/api/items", itemId, "cost-layers"],
+    queryFn: async () => (await apiRequest("GET", `/api/items/${itemId}/cost-layers`)).json(),
+  });
+  if (!data) return <div className="px-6 py-2 text-xs text-muted-foreground">Loading layers…</div>;
+  if (!data.layers.length) return <div className="px-6 py-2 text-xs text-muted-foreground">No open cost layers.</div>;
+  return (
+    <table className="w-full text-xs">
+      <thead className="text-muted-foreground">
+        <tr><th className="px-6 py-1 text-left font-medium">Acquired</th><th className="px-3 py-1 text-right font-medium">Qty left</th><th className="px-3 py-1 text-right font-medium">Unit cost</th><th className="px-3 py-1 text-right font-medium">Value</th></tr>
+      </thead>
+      <tbody>
+        {data.layers.map((l: any) => (
+          <tr key={l.id} className="border-t border-border/40">
+            <td className="px-6 py-1">{fmtDate(l.date)}</td>
+            <td className="px-3 py-1 text-right tabular-nums">{l.qtyRemaining}</td>
+            <td className="px-3 py-1 text-right tabular-nums">{fmtMoney(l.unitCostCents)}</td>
+            <td className="px-3 py-1 text-right tabular-nums">{fmtMoney(l.costRemainingCents)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function InventoryReport() {
+  const [expanded, setExpanded] = useState<number | null>(null);
+  const { data } = useQuery<any>({
+    queryKey: ["/api/reports/inventory-valuation"],
+    queryFn: async () => (await apiRequest("GET", "/api/reports/inventory-valuation")).json(),
+  });
+  if (!data) return <Loader />;
+  const method: string = data.costingMethod || "average";
+  const layered = method !== "average";
+
+  return (
+    <Card>
+      <CardContent className="p-6">
+        <div className="flex items-center justify-between mb-6 flex-wrap gap-2">
+          <div>
+            <h2 className="text-base font-semibold">Inventory valuation</h2>
+            <p className="text-xs text-muted-foreground">As of {fmtDate(data.asOfDate)}</p>
+          </div>
+          <span className="rounded-full border px-3 py-1 text-xs font-medium bg-muted/50" data-testid="badge-costing-method">
+            Costing method: {METHOD_LABEL[method] ?? method}
+          </span>
+        </div>
+        {data.warning && (
+          <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 text-amber-800 text-xs px-3 py-2">{data.warning}</div>
+        )}
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground">
+                <th className="px-3 py-2 text-left">SKU</th>
+                <th className="px-3 py-2 text-left">Item</th>
+                <th className="px-3 py-2 text-right">On hand</th>
+                <th className="px-3 py-2 text-right">Unit cost</th>
+                <th className="px-3 py-2 text-right">Value</th>
+                {layered && <th className="w-8"></th>}
+              </tr>
+            </thead>
+            <tbody>
+              {data.rows.length === 0 && (
+                <tr><td colSpan={layered ? 6 : 5} className="px-3 py-8 text-center text-muted-foreground">No inventory items.</td></tr>
+              )}
+              {data.rows.map((r: any) => (
+                <Fragment key={r.id}>
+                  <tr className="border-b border-border/40" data-testid={`row-inv-item-${r.id}`}>
+                    <td className="px-3 py-1.5 font-medium">{r.sku}</td>
+                    <td className="px-3 py-1.5">{r.name}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">{r.quantityOnHand}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.avgCostCents)}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.valuationCents)}</td>
+                    {layered && (
+                      <td className="px-3 py-1.5 text-right">
+                        <button className="text-xs underline text-muted-foreground hover:text-foreground" data-testid={`button-layers-${r.id}`} onClick={() => setExpanded(expanded === r.id ? null : r.id)}>
+                          {expanded === r.id ? "Hide" : "Layers"}
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                  {layered && expanded === r.id && (
+                    <tr className="bg-muted/20"><td colSpan={6} className="p-0"><ItemCostLayers itemId={r.id} /></td></tr>
+                  )}
+                </Fragment>
+              ))}
+              {data.rows.length > 0 && (
+                <tr className="border-t-2 border-foreground font-semibold">
+                  <td className="px-3 py-3" colSpan={4}>Total inventory value</td>
+                  <td className="px-3 py-3 text-right tabular-nums" data-testid="text-inv-total">{fmtMoney(data.totalValuationCents)}</td>
+                  {layered && <td></td>}
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
 }

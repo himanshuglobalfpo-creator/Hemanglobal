@@ -756,6 +756,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return item;
     })
   );
+  // FIFO/LIFO cost layers for an item (empty under weighted-average costing).
+  app.get("/api/items/:id/cost-layers", (req, res) =>
+    handle(res, () => storage.listItemCostLayers(parseId(req.params.id)))
+  );
   app.post("/api/items", requireRole("owner", "admin", "accountant"), (req, res) =>
     handle(res, async () => {
       const data = insertItemSchema.parse(req.body);
