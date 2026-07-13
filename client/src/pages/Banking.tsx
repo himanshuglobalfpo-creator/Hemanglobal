@@ -12,6 +12,7 @@ import {
   CheckCircle2,
   XCircle,
   Banknote,
+  Undo2,
 } from "lucide-react";
 import type { Account } from "@shared/schema";
 import { Layout, PageHeader } from "@/components/Layout";
@@ -113,6 +114,20 @@ type BankTx = {
   source: "manual" | "csv" | "plaid";
   payee?: string | null;
   vendorId?: number | null;
+  categoryName?: string | null;
+};
+
+// Per-account summary powering the Banking page cards.
+type BankAccountSummary = {
+  accountId: number;
+  code: string;
+  name: string;
+  subtype: string | null;
+  ledgerBalanceCents: number;
+  reviewCount: number;
+  lastImportedAt: string | null;
+  feedBalanceCents: number | null;
+  feedBalanceAt: string | null;
 };
 
 type Suggestion = {
@@ -173,7 +188,6 @@ function parseCSV(text: string): string[][] {
 }
 
 export default function Banking() {
-  const { toast } = useToast();
   const [activeBankId, setActiveBankId] = useState<number | null>(null);
   const [tab, setTab] = useState("review");
   const [manualOpen, setManualOpen] = useState(false);
@@ -185,6 +199,9 @@ export default function Banking() {
     () => accounts.filter((a) => a.subtype === "bank" || a.subtype === "credit_card"),
     [accounts]
   );
+
+  // Per-account cards: ledger balance, review count, last import, feed balance.
+  const { data: summaries = [] } = useQuery<BankAccountSummary[]>({ queryKey: ["/api/accounts/balances"] });
 
   // Auto-select first bank account
   useEffect(() => {
@@ -207,8 +224,10 @@ export default function Banking() {
 
   const { data: plaid } = useQuery<PlaidStatus>({ queryKey: ["/api/plaid/status"] });
 
+  // Three QBO tabs, all scoped to the selected account.
   const unmatched = txAll.filter((t) => t.status === "unmatched");
   const matched = txAll.filter((t) => t.status === "matched");
+  const ignored = txAll.filter((t) => t.status === "ignored");
 
   return (
     <Layout>
@@ -229,57 +248,83 @@ export default function Banking() {
         }
       />
 
-      {/* Bank account selector + Plaid card */}
-      <div className="grid md:grid-cols-3 gap-4 mb-6">
-        <Card className="md:col-span-2">
+      {/* Horizontally scrollable account cards (QBO-style) */}
+      {bankAccts.length === 0 ? (
+        <Card className="mb-6">
           <CardContent className="p-4">
-            <Label className="text-xs uppercase tracking-wide text-muted-foreground">
-              Bank account
-            </Label>
-            <div className="flex flex-wrap gap-2 mt-2">
-              {bankAccts.length === 0 && (
-                <p className="text-sm text-muted-foreground">
-                  No bank or credit card accounts. Add one in Chart of Accounts (subtype = bank or credit_card).
-                </p>
-              )}
-              {bankAccts.map((a) => (
-                <button
-                  key={a.id}
-                  onClick={() => setActiveBankId(a.id)}
-                  data-testid={`button-bank-${a.id}`}
-                  className={`px-3 py-2 rounded-md border text-sm hover-elevate active-elevate-2 flex items-center gap-2 ${
-                    activeBankId === a.id
-                      ? "border-primary bg-primary/5 text-foreground"
-                      : "border-border text-muted-foreground"
-                  }`}
-                >
-                  <Banknote className="h-4 w-4" />
-                  <span className="font-medium">{a.name}</span>
-                  <span className="text-xs text-muted-foreground">{a.code}</span>
-                </button>
-              ))}
-            </div>
+            <p className="text-sm text-muted-foreground">
+              No bank or credit card accounts. Add one in Chart of Accounts (subtype = bank or credit_card).
+            </p>
           </CardContent>
         </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-start gap-3">
-              <Building2 className="h-5 w-5 text-primary mt-0.5" />
-              <div className="flex-1">
-                <p className="text-sm font-medium">Connect a bank</p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  {plaid?.message || "Checking Plaid status..."}
-                </p>
-                <PlaidConnectButton
-                  configured={!!plaid?.configured}
-                  activeBankId={activeBankId}
-                  activeBankName={bankAccts.find((a) => a.id === activeBankId)?.name}
-                />
-              </div>
+      ) : (
+        <div className="flex gap-3 overflow-x-auto pb-2 mb-6" data-testid="row-account-cards">
+          {bankAccts.map((a) => {
+            const s = summaries.find((x) => x.accountId === a.id);
+            const reviewCount = s?.reviewCount ?? txAll.filter((t) => t.bankAccountId === a.id && t.status === "unmatched").length;
+            const selected = activeBankId === a.id;
+            return (
+              <button
+                key={a.id}
+                onClick={() => setActiveBankId(a.id)}
+                data-testid={`card-bank-${a.id}`}
+                className={`shrink-0 w-60 text-left rounded-lg border p-4 hover-elevate active-elevate-2 ${
+                  selected ? "border-primary bg-primary/5 ring-1 ring-primary" : "border-border"
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <Banknote className="h-4 w-4 text-primary" />
+                  <span className="font-medium truncate">{a.name}</span>
+                </div>
+                <div className="mt-2 text-2xl font-semibold tabular-nums" data-testid={`text-ledger-balance-${a.id}`}>
+                  {fmtMoney(s?.ledgerBalanceCents ?? 0)}
+                </div>
+                <div className="text-xs text-muted-foreground">In LedgerLite · {a.code}</div>
+                {s?.feedBalanceCents != null && (
+                  <div className="mt-1 text-xs text-muted-foreground" data-testid={`text-feed-balance-${a.id}`}>
+                    Bank feed: <span className="tabular-nums">{fmtMoney(s.feedBalanceCents)}</span>
+                    {s.feedBalanceAt ? ` · ${fmtDate(s.feedBalanceAt)}` : ""}
+                  </div>
+                )}
+                {s?.lastImportedAt && (
+                  <div className="text-xs text-muted-foreground" data-testid={`text-last-import-${a.id}`}>
+                    Last import {fmtDate(s.lastImportedAt)}
+                  </div>
+                )}
+                <div className="mt-2">
+                  {reviewCount > 0 ? (
+                    <Badge variant="secondary" className="text-xs" data-testid={`badge-review-${a.id}`}>
+                      {reviewCount} to review
+                    </Badge>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">All caught up</span>
+                  )}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Connect a bank (Plaid) */}
+      <Card className="mb-6">
+        <CardContent className="p-4">
+          <div className="flex items-start gap-3">
+            <Building2 className="h-5 w-5 text-primary mt-0.5" />
+            <div className="flex-1">
+              <p className="text-sm font-medium">Connect a bank</p>
+              <p className="text-xs text-muted-foreground mt-1">
+                {plaid?.message || "Checking Plaid status..."}
+              </p>
+              <PlaidConnectButton
+                configured={!!plaid?.configured}
+                activeBankId={activeBankId}
+                activeBankName={bankAccts.find((a) => a.id === activeBankId)?.name}
+              />
             </div>
-          </CardContent>
-        </Card>
-      </div>
+          </div>
+        </CardContent>
+      </Card>
 
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
@@ -291,21 +336,32 @@ export default function Banking() {
               </Badge>
             )}
           </TabsTrigger>
-          <TabsTrigger value="all" data-testid="tab-all">
-            All transactions
+          <TabsTrigger value="categorized" data-testid="tab-categorized">
+            Categorized
+            {matched.length > 0 && (
+              <Badge variant="secondary" className="ml-2 h-5 px-1.5 text-xs">
+                {matched.length}
+              </Badge>
+            )}
+          </TabsTrigger>
+          <TabsTrigger value="excluded" data-testid="tab-excluded">
+            Excluded
+            {ignored.length > 0 && (
+              <Badge variant="secondary" className="ml-2 h-5 px-1.5 text-xs">
+                {ignored.length}
+              </Badge>
+            )}
           </TabsTrigger>
         </TabsList>
 
         <TabsContent value="review" className="mt-4">
-          <TxTable
-            rows={unmatched}
-            emptyText="No transactions waiting for review."
-            onMatch={(t) => setMatchOpen(t)}
-            showActions
-          />
+          <TxTable variant="review" rows={unmatched} emptyText="No transactions waiting for review." onMatch={(t) => setMatchOpen(t)} />
         </TabsContent>
-        <TabsContent value="all" className="mt-4">
-          <TxTable rows={txAll} emptyText="No transactions yet." onMatch={(t) => setMatchOpen(t)} />
+        <TabsContent value="categorized" className="mt-4">
+          <TxTable variant="categorized" rows={matched} emptyText="Nothing categorized yet." onMatch={(t) => setMatchOpen(t)} />
+        </TabsContent>
+        <TabsContent value="excluded" className="mt-4">
+          <TxTable variant="excluded" rows={ignored} emptyText="Nothing excluded." onMatch={(t) => setMatchOpen(t)} />
         </TabsContent>
       </Tabs>
 
@@ -333,17 +389,24 @@ export default function Banking() {
   );
 }
 
+// One table, three variants:
+//   review      → Match button + inline suggestion rows (unmatched)
+//   categorized → Category column + Undo (matched)
+//   excluded    → Undo (ignored)
 function TxTable({
+  variant,
   rows,
   emptyText,
   onMatch,
-  showActions = false,
 }: {
+  variant: "review" | "categorized" | "excluded";
   rows: BankTx[];
   emptyText: string;
   onMatch: (t: BankTx) => void;
-  showActions?: boolean;
 }) {
+  const isReview = variant === "review";
+  const isCategorized = variant === "categorized";
+  const colCount = 5 + (isCategorized ? 1 : 0) + 1; // date, desc, payee, source, amount [+category] + actions
   return (
     <Card>
       <CardContent className="p-0">
@@ -353,16 +416,16 @@ function TxTable({
               <th className="px-4 py-3 font-medium">Date</th>
               <th className="px-4 py-3 font-medium">Description</th>
               <th className="px-4 py-3 font-medium">Payee</th>
+              {isCategorized && <th className="px-4 py-3 font-medium">Category</th>}
               <th className="px-4 py-3 font-medium">Source</th>
-              <th className="px-4 py-3 font-medium">Status</th>
               <th className="px-4 py-3 font-medium text-right">Amount</th>
-              {showActions && <th className="px-4 py-3 w-32"></th>}
+              <th className="px-4 py-3 w-32"></th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 && (
               <tr>
-                <td colSpan={showActions ? 7 : 6} className="px-4 py-12 text-center text-muted-foreground">
+                <td colSpan={colCount} className="px-4 py-12 text-center text-muted-foreground">
                   {emptyText}
                 </td>
               </tr>
@@ -378,23 +441,14 @@ function TxTable({
                   <td className="px-4 py-3 text-muted-foreground">{fmtDate(t.date)}</td>
                   <td className="px-4 py-3">{t.description}</td>
                   <td className="px-4 py-3 text-muted-foreground" data-testid={`text-payee-${t.id}`}>{t.payee || ""}</td>
+                  {isCategorized && (
+                    <td className="px-4 py-3" data-testid={`text-category-${t.id}`}>
+                      {t.categoryName || <span className="text-muted-foreground">—</span>}
+                    </td>
+                  )}
                   <td className="px-4 py-3">
                     <Badge variant="outline" className="text-xs capitalize">
                       {t.source}
-                    </Badge>
-                  </td>
-                  <td className="px-4 py-3">
-                    <Badge
-                      variant={
-                        t.status === "matched"
-                          ? "default"
-                          : t.status === "ignored"
-                            ? "outline"
-                            : "secondary"
-                      }
-                      className="capitalize"
-                    >
-                      {t.status}
                     </Badge>
                   </td>
                   <td
@@ -405,17 +459,19 @@ function TxTable({
                     {isIn ? "+" : ""}
                     {fmtMoney(t.amount)}
                   </td>
-                  {showActions && (
-                    <td className="px-4 py-3 text-right">
+                  <td className="px-4 py-3 text-right">
+                    {isReview ? (
                       <Button size="sm" variant="outline" onClick={() => onMatch(t)} data-testid={`button-match-${t.id}`}>
                         <Sparkles className="h-3.5 w-3.5 mr-1" />
                         Match
                       </Button>
-                    </td>
-                  )}
+                    ) : (
+                      <UndoButton tx={t} />
+                    )}
+                  </td>
                 </tr>
               );
-              if (!showActions) return mainRow;
+              if (!isReview) return mainRow;
               return (
                 <Fragment key={t.id}>
                   {mainRow}
@@ -427,6 +483,35 @@ function TxTable({
         </table>
       </CardContent>
     </Card>
+  );
+}
+
+// Undo a categorization/exclusion — deletes the match's journal entry and
+// returns the row to For Review (server: /api/bank-transactions/:id/unmatch).
+function UndoButton({ tx }: { tx: BankTx }) {
+  const { toast } = useToast();
+  const undoMut = useMutation({
+    mutationFn: async () => {
+      const r = await apiRequest("POST", `/api/bank-transactions/${tx.id}/unmatch`);
+      return r.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/bank-transactions"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/accounts/balances"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/dashboard"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/journal"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/invoices"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/bills"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/reports/trial-balance"] });
+      toast({ title: "Undone", description: "Returned to For Review." });
+    },
+    onError: (e: any) => toast({ title: "Undo failed", description: e.message, variant: "destructive" }),
+  });
+  return (
+    <Button size="sm" variant="outline" onClick={() => undoMut.mutate()} disabled={undoMut.isPending} data-testid={`button-undo-${tx.id}`}>
+      <Undo2 className="h-3.5 w-3.5 mr-1" />
+      {undoMut.isPending ? "Undoing…" : "Undo"}
+    </Button>
   );
 }
 
@@ -453,6 +538,7 @@ function SuggestionRow({ tx, onMatch }: { tx: BankTx; onMatch: (t: BankTx) => vo
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/bank-transactions"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/accounts/balances"] });
       queryClient.invalidateQueries({ queryKey: ["/api/dashboard"] });
       queryClient.invalidateQueries({ queryKey: ["/api/journal"] });
       queryClient.invalidateQueries({ queryKey: ["/api/invoices"] });
@@ -468,7 +554,7 @@ function SuggestionRow({ tx, onMatch }: { tx: BankTx; onMatch: (t: BankTx) => vo
 
   return (
     <tr className="border-b border-border last:border-0 bg-muted/30">
-      <td colSpan={7} className="px-4 py-2">
+      <td colSpan={6} className="px-4 py-2">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs text-muted-foreground flex items-center gap-1">
             <Sparkles className="h-3 w-3 text-primary" />
@@ -562,6 +648,7 @@ function ManualEntryDialog({
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/bank-transactions"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/accounts/balances"] });
       queryClient.invalidateQueries({ queryKey: ["/api/dashboard"] });
       queryClient.invalidateQueries({ queryKey: ["/api/journal"] });
       queryClient.invalidateQueries({ queryKey: ["/api/reports/trial-balance"] });
@@ -1004,6 +1091,7 @@ function MatchDialog({
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/bank-transactions"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/accounts/balances"] });
       queryClient.invalidateQueries({ queryKey: ["/api/dashboard"] });
       queryClient.invalidateQueries({ queryKey: ["/api/journal"] });
       queryClient.invalidateQueries({ queryKey: ["/api/invoices"] });

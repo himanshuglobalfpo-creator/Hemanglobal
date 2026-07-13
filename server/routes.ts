@@ -730,6 +730,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   );
 
   app.get("/api/accounts", (_req, res) => handle(res, () => storage.listAccounts()));
+  // Per-cash-account summary for the Banking page cards. Optional ?subtype=bank
+  // (or credit_card) narrows the set; omitted returns both. Each row carries the
+  // in-books ledger balance (as of today), the For-Review count, the last import
+  // date, and — when a real bank feed reports it — the feed balance.
+  app.get("/api/accounts/balances", (req, res) =>
+    handle(res, async () => {
+      const subtype = typeof req.query.subtype === "string" ? req.query.subtype : undefined;
+      if (subtype && subtype !== "bank" && subtype !== "credit_card") {
+        throw new Error('subtype must be "bank" or "credit_card"');
+      }
+      return storage.bankAccountSummaries(subtype);
+    })
+  );
   app.post("/api/accounts", (req, res) =>
     handle(res, async () => {
       const data = insertAccountSchema.parse(req.body);

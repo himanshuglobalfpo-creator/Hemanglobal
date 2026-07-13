@@ -3551,7 +3551,7 @@ export class DatabaseStorage {
     status?: string,
     limit = 50,
     offset = 0
-  ): Promise<Paginated<BankTransaction>> {
+  ): Promise<Paginated<BankTransaction & { categoryName: string | null }>> {
     // Filters moved from post-load JS into the SQL WHERE clause (Task 1) —
     // previously every row for the org was loaded and filtered in memory.
     const conditions: any[] = [eq(bankTransactions.orgId, currentOrgId())];
@@ -3567,7 +3567,77 @@ export class DatabaseStorage {
       .limit(limit)
       .offset(offset)
       ;
-    return { rows, total, limit, offset };
+    // Enrich matched rows with the category (the account name of the matched
+    // journal entry's NON-bank line). One extra query for the whole page; the
+    // bank line is identified per-row by its own bankAccountId, so transfers
+    // correctly show the OTHER account's name.
+    const entryIds = rows.filter((r) => r.status === "matched" && r.entryId != null).map((r) => r.entryId as number);
+    const categoryByRow = new Map<number, string | null>();
+    if (entryIds.length > 0) {
+      const lines = (await pool.query(
+        `SELECT jl.entry_id AS "entryId", jl.account_id AS "accountId", a.name AS "name"
+           FROM journal_lines jl JOIN accounts a ON a.id = jl.account_id
+          WHERE jl.entry_id = ANY($1::int[]) AND a.org_id = $2
+          ORDER BY jl.id`,
+        [entryIds, currentOrgId()]
+      )).rows as Array<{ entryId: number; accountId: number; name: string }>;
+      const byEntry = new Map<number, Array<{ accountId: number; name: string }>>();
+      for (const l of lines) {
+        const arr = byEntry.get(l.entryId) ?? [];
+        arr.push({ accountId: l.accountId, name: l.name });
+        byEntry.set(l.entryId, arr);
+      }
+      for (const r of rows) {
+        if (r.status !== "matched" || r.entryId == null) continue;
+        const ls = byEntry.get(r.entryId) ?? [];
+        const other = ls.find((l) => l.accountId !== r.bankAccountId) ?? ls[0];
+        categoryByRow.set(r.id, other?.name ?? null);
+      }
+    }
+    const enriched = rows.map((r) => ({ ...r, categoryName: categoryByRow.get(r.id) ?? null }));
+    return { rows: enriched, total, limit, offset };
+  }
+
+  // Per-cash-account summary for the Banking page cards: in-books ledger
+  // balance (from journal lines as of today), count of transactions still in
+  // "For Review", the last bank-feed import date, and — WHEN AVAILABLE — the
+  // bank-reported feed balance. The feed balance comes only from a real
+  // aggregator (Plaid); we never fabricate one, so it is null until a feed
+  // reports it (last-import date, computed from imported rows, is always real).
+  async bankAccountSummaries(subtype?: string): Promise<Array<{
+    accountId: number; code: string; name: string; subtype: string | null;
+    ledgerBalanceCents: number; reviewCount: number;
+    lastImportedAt: string | null; feedBalanceCents: number | null; feedBalanceAt: string | null;
+  }>> {
+    const org = currentOrgId();
+    const today = new Date().toISOString().slice(0, 10);
+    const cashSubtypes = subtype ? [subtype] : ["bank", "credit_card"];
+    const accts = (await this.listAccounts()).filter((a) => a.subtype != null && cashSubtypes.includes(a.subtype));
+    if (accts.length === 0) return [];
+    const balances = await this.accountBalances(today);
+    const reviewRows = (await pool.query(
+      `SELECT bank_account_id AS "id", COUNT(*)::int AS c
+         FROM bank_transactions WHERE org_id = $1 AND status = 'unmatched' GROUP BY bank_account_id`,
+      [org]
+    )).rows as Array<{ id: number; c: number }>;
+    const reviewByAcct = new Map(reviewRows.map((r) => [r.id, r.c]));
+    const importRows = (await pool.query(
+      `SELECT bank_account_id AS "id", MAX(imported_at) AS "lastAt"
+         FROM bank_transactions WHERE org_id = $1 AND source IN ('csv','plaid') GROUP BY bank_account_id`,
+      [org]
+    )).rows as Array<{ id: number; lastAt: string | null }>;
+    const importByAcct = new Map(importRows.map((r) => [r.id, r.lastAt]));
+    return accts.map((a) => ({
+      accountId: a.id,
+      code: a.code,
+      name: a.name,
+      subtype: a.subtype ?? null,
+      ledgerBalanceCents: balances.get(a.id)?.balance ?? 0,
+      reviewCount: reviewByAcct.get(a.id) ?? 0,
+      lastImportedAt: importByAcct.get(a.id) ?? null,
+      feedBalanceCents: null, // populated only by a real bank feed (see note above)
+      feedBalanceAt: null,
+    }));
   }
 
   async getBankTransaction(id: number): Promise<BankTransaction | undefined> {
