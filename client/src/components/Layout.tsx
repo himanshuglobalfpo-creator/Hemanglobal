@@ -23,6 +23,8 @@ import {
   LogOut,
   Building2,
   Plus,
+  Package,
+  PiggyBank,
   Settings as SettingsIcon,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -59,6 +61,8 @@ const NAV = [
   { href: "/recurring", label: "Recurring", icon: Repeat },
   { href: "/customers", label: "Customers", icon: Users },
   { href: "/vendors", label: "Vendors", icon: Truck },
+  { href: "/items", label: "Products & Services", icon: Package },
+  { href: "/budgets", label: "Budgeting", icon: PiggyBank },
   { href: "/accounts", label: "Chart of Accounts", icon: Library },
   { href: "/journal", label: "Journal", icon: BookOpen },
   { href: "/reports", label: "Reports", icon: BarChart3 },
@@ -270,6 +274,7 @@ const CREATE_COLUMNS: CreateColumn[] = [
       { label: "Transfer", path: "/banking", create: true, testId: "create-transfer" },
       { label: "Journal entry", path: "/journal", create: true, testId: "create-journal" },
       { label: "Bank rule", path: "/rules", create: true, testId: "create-bank-rule" },
+      { label: "Add product/service", path: "/items", create: true, testId: "create-item" },
       { label: "Reconcile", path: "/reconciliation", testId: "create-reconcile" },
     ],
   },
@@ -339,6 +344,147 @@ function CreateMenu() {
                 </ul>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Settings menu (QBO gear). Grouped shortcuts to settings/tools/profile that
+// exist in this app. Real destinations only — QBO items with no counterpart
+// (Workers' comp, Order checks, Import desktop data, Subscriptions, Resolution
+// center, Share screen, …) are omitted rather than shipped as dead links.
+// ----------------------------------------------------------------------------
+type GearItem = { label: string; path?: string; testId: string };
+type GearColumn = { heading: string; items: GearItem[] };
+
+const GEAR_COLUMNS: GearColumn[] = [
+  {
+    heading: "Your Company",
+    items: [
+      { label: "Account and settings", path: "/settings", testId: "gear-settings" },
+      { label: "Chart of accounts", path: "/accounts", testId: "gear-accounts" },
+      { label: "Sales tax", path: "/tax-codes", testId: "gear-sales-tax" },
+    ],
+  },
+  {
+    heading: "Lists",
+    items: [
+      { label: "Products and services", path: "/items", testId: "gear-items" },
+      { label: "Recurring transactions", path: "/recurring", testId: "gear-recurring" },
+      { label: "Rules", path: "/rules", testId: "gear-rules" },
+    ],
+  },
+  {
+    heading: "Tools",
+    items: [
+      { label: "Reconcile", path: "/reconciliation", testId: "gear-reconcile" },
+      { label: "Budgeting", path: "/budgets", testId: "gear-budgeting" },
+      { label: "Audit log", path: "/audit", testId: "gear-audit" },
+      { label: "Period close", path: "/period-close", testId: "gear-period-close" },
+    ],
+  },
+];
+
+function SettingsMenu() {
+  const [, navigate] = useLocation();
+  const { toast } = useToast();
+  const { data: me } = useQuery<Me>({ queryKey: ["/api/auth/me"] });
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+
+  async function switchOrg(orgId: number) {
+    setOpen(false);
+    try {
+      await apiRequest("POST", "/api/auth/switch-org", { orgId });
+      queryClient.clear();
+      await queryClient.invalidateQueries();
+    } catch (e: any) {
+      toast({ title: "Could not switch company", description: e.message, variant: "destructive" });
+    }
+  }
+  async function logout() {
+    setOpen(false);
+    try { await apiRequest("POST", "/api/auth/logout"); }
+    finally { queryClient.clear(); window.location.hash = "#/"; window.location.reload(); }
+  }
+
+  const otherOrgs = (me?.orgs ?? []).filter((o) => o.id !== me?.org?.id);
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        data-testid="button-gear"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label="Settings"
+        className="p-2 rounded-md text-muted-foreground hover-elevate active-elevate-2"
+      >
+        <SettingsIcon className="h-5 w-5" />
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 mt-2 w-[44rem] max-w-[92vw] rounded-md border border-border bg-popover text-popover-foreground shadow-lg p-4 z-40"
+          data-testid="menu-gear"
+        >
+          <div className="grid grid-cols-4 gap-4">
+            {GEAR_COLUMNS.map((col) => (
+              <div key={col.heading}>
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-1.5">{col.heading}</div>
+                <ul className="space-y-0.5">
+                  {col.items.map((it) => (
+                    <li key={it.testId}>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => { setOpen(false); if (it.path) navigate(it.path); }}
+                        data-testid={`link-${it.testId}`}
+                        className="w-full text-left rounded px-2 py-1.5 text-sm hover-elevate active-elevate-2"
+                      >
+                        {it.label}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+            {/* PROFILE — real account actions. */}
+            <div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-1.5">Profile</div>
+              <ul className="space-y-0.5">
+                <li>
+                  <button type="button" role="menuitem" onClick={() => { setOpen(false); navigate("/security"); }} data-testid="link-gear-security"
+                    className="w-full text-left rounded px-2 py-1.5 text-sm hover-elevate active-elevate-2">Security</button>
+                </li>
+                <li>
+                  <button type="button" role="menuitem" onClick={logout} data-testid="link-gear-signout"
+                    className="w-full text-left rounded px-2 py-1.5 text-sm hover-elevate active-elevate-2">Sign out</button>
+                </li>
+                {otherOrgs.length > 0 && (
+                  <li className="pt-1.5 mt-1 border-t border-border">
+                    <div className="px-2 text-[11px] uppercase tracking-wide text-muted-foreground">Switch company</div>
+                    {otherOrgs.map((o) => (
+                      <button key={o.id} type="button" role="menuitem" onClick={() => switchOrg(o.id)} data-testid={`link-gear-switch-${o.id}`}
+                        className="w-full text-left rounded px-2 py-1.5 text-sm hover-elevate active-elevate-2 truncate">{o.name}</button>
+                    ))}
+                  </li>
+                )}
+              </ul>
+            </div>
           </div>
         </div>
       )}
@@ -519,6 +665,7 @@ export function Layout({ children }: { children: ReactNode }) {
               </kbd>
             </button>
             <CreateMenu />
+            <SettingsMenu />
           </div>
         </div>
         <EmailVerificationBanner />
