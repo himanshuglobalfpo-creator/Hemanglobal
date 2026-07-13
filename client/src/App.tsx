@@ -22,6 +22,7 @@ const Accounts = lazy(() => import("@/pages/Accounts"));
 const Invoices = lazy(() => import("@/pages/Invoices"));
 const Bills = lazy(() => import("@/pages/Bills"));
 const Banking = lazy(() => import("@/pages/Banking"));
+const Transactions = lazy(() => import("@/pages/Transactions"));
 const Journal = lazy(() => import("@/pages/Journal"));
 const Reports = lazy(() => import("@/pages/Reports"));
 const BankRules = lazy(() => import("@/pages/BankRules"));
@@ -102,6 +103,7 @@ function AppRouter() {
       <Route path="/invoices" component={Invoices} />
       <Route path="/bills" component={Bills} />
       <Route path="/banking" component={Banking} />
+      <Route path="/transactions" component={Transactions} />
       <Route path="/reconciliation" component={Reconciliation} />
       <Route path="/rules" component={BankRules} />
       <Route path="/recurring" component={Recurring} />

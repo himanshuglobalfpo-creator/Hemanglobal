@@ -231,6 +231,24 @@ export const paginationQuerySchema = z.object({
 });
 export type PaginationQuery = z.infer<typeof paginationQuerySchema>;
 
+// Advanced transactions search (QBO-style). Every filter is optional; query
+// params arrive as strings. A blank filter box must be a NO-OP, so empty
+// strings are normalized to undefined BEFORE parsing — otherwise a stray
+// `amount=` would coerce to 0 and wrongly filter, and a `dateFrom=` would fail
+// the ISO check.
+const emptyToUndef = (v: unknown) => (v === "" ? undefined : v);
+export const transactionSearchSchema = z.object({
+  dateFrom: z.preprocess(emptyToUndef, isoDate.optional()),
+  dateTo: z.preprocess(emptyToUndef, isoDate.optional()),
+  type: z.preprocess(emptyToUndef, z.enum(["invoice", "bill", "credit_note", "expense", "deposit", "journal"]).optional()),
+  referenceNumber: z.preprocess(emptyToUndef, z.string().max(120).optional()),
+  contact: z.preprocess(emptyToUndef, z.string().max(200).optional()),
+  amountOp: z.preprocess(emptyToUndef, z.enum(["eq", "gte", "lte", "gt", "lt"]).optional()),
+  amount: z.preprocess(emptyToUndef, z.coerce.number().optional()),
+  q: z.preprocess(emptyToUndef, z.string().max(200).optional()),
+});
+export type TransactionSearchQuery = z.infer<typeof transactionSearchSchema>;
+
 // Standard envelope every paginated list endpoint returns.
 export type Paginated<T> = { rows: T[]; total: number; limit: number; offset: number };
 

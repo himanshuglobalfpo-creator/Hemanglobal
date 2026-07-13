@@ -52,6 +52,7 @@ import {
   applyDebitNoteSchema,
   voidNoteSchema,
   paginationQuerySchema,
+  transactionSearchSchema,
   nextNumberQuerySchema,
   upsertFxRateSchema,
   createBudgetSchema,
@@ -1948,6 +1949,31 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const limit = req.query.limit ? Number(req.query.limit) : 30;
       if (!q.trim()) return [];
       return storage.globalSearch(q, limit);
+    })
+  );
+
+  // Advanced transactions search (QBO-style) — a unified, filterable view over
+  // every transaction type. All filters optional; paginated.
+  app.get("/api/transactions/search", (req, res) =>
+    handle(res, async () => {
+      const filters = transactionSearchSchema.parse(req.query);
+      const { limit, offset } = paginationQuerySchema.parse(req.query);
+      const amountCents = filters.amount !== undefined ? Math.round(filters.amount * 100) : undefined;
+      return storage.searchTransactions(
+        {
+          dateFrom: filters.dateFrom, dateTo: filters.dateTo, type: filters.type,
+          referenceNumber: filters.referenceNumber, contact: filters.contact,
+          amountOp: filters.amountOp, amountCents, q: filters.q,
+        },
+        limit, offset,
+      );
+    })
+  );
+  // Recent transactions across all types — the dropdown's "Recent" list.
+  app.get("/api/transactions/recent", (req, res) =>
+    handle(res, async () => {
+      const limit = req.query.limit ? Math.min(Number(req.query.limit), 50) : 10;
+      return storage.recentTransactions(limit);
     })
   );
 

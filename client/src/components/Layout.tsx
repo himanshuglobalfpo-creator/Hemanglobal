@@ -16,6 +16,7 @@ import {
   Repeat,
   Mail,
   Search,
+  ListFilter,
   Lock,
   History,
   Percent,
@@ -50,6 +51,7 @@ const NAV = [
   { href: "/invoices", label: "Invoices", icon: FileText },
   { href: "/bills", label: "Bills", icon: Receipt },
   { href: "/banking", label: "Banking", icon: Landmark },
+  { href: "/transactions", label: "Transactions", icon: ListFilter },
   { href: "/reconciliation", label: "Reconcile", icon: CheckSquare },
   { href: "/rules", label: "Bank Rules", icon: Filter },
   { href: "/recurring", label: "Recurring", icon: Repeat },
@@ -76,6 +78,15 @@ type SearchResult = {
   url: string;
 };
 
+type RecentTxn = {
+  type: string; id: number; date: string;
+  referenceNumber: string | null; contactName: string | null; amountCents: number; memo: string | null; url: string;
+};
+const TXN_TYPE_LABEL: Record<string, string> = {
+  invoice: "Invoice", bill: "Bill", credit_note: "Credit Note",
+  expense: "Expense", deposit: "Deposit", journal: "Journal Entry",
+};
+
 function GlobalSearch({ open, setOpen }: { open: boolean; setOpen: (v: boolean) => void }) {
   const [, navigate] = useLocation();
   const [q, setQ] = useState("");
@@ -88,6 +99,22 @@ function GlobalSearch({ open, setOpen }: { open: boolean; setOpen: (v: boolean) 
     },
     enabled: open && q.trim().length > 0,
   });
+
+  // Recent transactions across all types — shown when the box is empty, exactly
+  // like QBO's dropdown.
+  const { data: recent = [] } = useQuery<RecentTxn[]>({
+    queryKey: ["/api/transactions/recent"],
+    queryFn: async () => {
+      const r = await apiRequest("GET", "/api/transactions/recent?limit=10");
+      return r.json();
+    },
+    enabled: open,
+  });
+
+  function goAdvanced() {
+    setOpen(false);
+    navigate(q.trim() ? `/transactions?q=${encodeURIComponent(q.trim())}` : "/transactions");
+  }
 
   useEffect(() => {
     if (!open) setQ("");
@@ -119,7 +146,7 @@ function GlobalSearch({ open, setOpen }: { open: boolean; setOpen: (v: boolean) 
   return (
     <CommandDialog open={open} onOpenChange={setOpen}>
       <CommandInput
-        placeholder="Search customers, invoices, accounts, journal…"
+        placeholder="Navigate. Find transactions, contacts, reports, and more…"
         value={q}
         onValueChange={setQ}
         data-testid="input-global-search"
@@ -127,9 +154,6 @@ function GlobalSearch({ open, setOpen }: { open: boolean; setOpen: (v: boolean) 
       <CommandList>
         {q.trim() && !isFetching && results.length === 0 && (
           <CommandEmpty>No matches for “{q}”.</CommandEmpty>
-        )}
-        {!q.trim() && (
-          <CommandEmpty>Start typing to search the entire ledger.</CommandEmpty>
         )}
         {groupOrder
           .filter((k) => grouped[k]?.length)
@@ -162,6 +186,40 @@ function GlobalSearch({ open, setOpen }: { open: boolean; setOpen: (v: boolean) 
               ))}
             </CommandGroup>
           ))}
+
+        {/* Recent transactions — shown when the box is empty (QBO-style). */}
+        {!q.trim() && recent.length > 0 && (
+          <CommandGroup heading="Recent transactions">
+            {recent.map((t) => (
+              <CommandItem
+                key={`recent-${t.type}-${t.id}`}
+                value={`recent-${t.type}-${t.id}`}
+                onSelect={() => { setOpen(false); navigate(t.url); }}
+                data-testid={`recent-txn-${t.type}-${t.id}`}
+              >
+                <div className="flex items-center justify-between gap-2 w-full">
+                  <span className="flex items-center gap-2 min-w-0">
+                    <History className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                    <span className="text-xs text-muted-foreground shrink-0">{TXN_TYPE_LABEL[t.type] ?? t.type}</span>
+                    <span className="truncate">{t.contactName || t.referenceNumber || t.memo || "—"}</span>
+                  </span>
+                  <span className="text-xs tabular-nums text-muted-foreground shrink-0">
+                    {t.date} · ${(t.amountCents / 100).toFixed(2)}
+                  </span>
+                </div>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
+
+        {/* Footer: jump to the full Advanced transactions search (carries q). */}
+        <CommandGroup>
+          <CommandItem value="__advanced-search__" onSelect={goAdvanced} data-testid="link-advanced-search">
+            <Search className="h-4 w-4 mr-2 text-muted-foreground" />
+            <span className="font-medium">Advanced transactions search</span>
+            <span className="text-xs text-muted-foreground ml-2">for more results</span>
+          </CommandItem>
+        </CommandGroup>
       </CommandList>
     </CommandDialog>
   );

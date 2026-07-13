@@ -995,6 +995,89 @@ export class DatabaseStorage {
   }
 
   // ============================================================================
+  // ADVANCED TRANSACTION SEARCH (QBO-style)
+  // ============================================================================
+  // A unified, filterable view over BUSINESS DOCUMENTS — not raw GL postings —
+  // so nothing double-counts (a paid invoice and its payment JE are distinct
+  // events, and we never list the system JE behind an invoice/bill). Sources:
+  //   invoice      ← invoices        (contact = customer, ref = number)
+  //   bill         ← bills           (contact = vendor,   ref = number)
+  //   credit_note  ← credit_notes    (contact = customer, ref = number)
+  //   expense      ← bank_transactions, amount < 0 (contact = payee/vendor)
+  //   deposit      ← bank_transactions, amount > 0 (contact = payee/vendor)
+  //   journal      ← journal_entries, source = 'manual' (user-entered JEs only)
+  // Every amount is BASE-currency integer cents. All filters are optional.
+  async searchTransactions(
+    f: {
+      dateFrom?: string; dateTo?: string; type?: string; referenceNumber?: string;
+      contact?: string; amountOp?: "eq" | "gte" | "lte" | "gt" | "lt"; amountCents?: number; q?: string;
+    },
+    limit = 50,
+    offset = 0,
+  ): Promise<{ rows: Array<{ type: string; id: number; date: string; referenceNumber: string | null; contactName: string | null; amountCents: number; memo: string | null; url: string }>; total: number }> {
+    const org = currentOrgId();
+    const cte = `
+      WITH txns AS (
+        SELECT 'invoice'::text AS type, i.id, i.date, i.number AS ref, c.name AS contact, i.total::bigint AS amount, i.notes AS memo
+          FROM invoices i JOIN customers c ON c.id = i.customer_id WHERE i.org_id = $1
+        UNION ALL
+        SELECT 'bill', b.id, b.date, b.number, v.name, b.total::bigint, b.notes
+          FROM bills b JOIN vendors v ON v.id = b.vendor_id WHERE b.org_id = $1
+        UNION ALL
+        SELECT 'credit_note', cn.id, cn.date, cn.number, c.name, cn.total::bigint, cn.notes
+          FROM credit_notes cn JOIN customers c ON c.id = cn.customer_id WHERE cn.org_id = $1
+        UNION ALL
+        SELECT CASE WHEN bt.amount < 0 THEN 'expense' ELSE 'deposit' END, bt.id, bt.date, NULL, COALESCE(bt.payee, ven.name), ABS(bt.amount)::bigint, bt.description
+          FROM bank_transactions bt LEFT JOIN vendors ven ON ven.id = bt.vendor_id WHERE bt.org_id = $1
+        UNION ALL
+        SELECT 'journal', je.id, je.date, je.reference, NULL,
+               COALESCE((SELECT SUM(jl.debit) FROM journal_lines jl WHERE jl.entry_id = je.id), 0)::bigint, je.memo
+          FROM journal_entries je WHERE je.org_id = $1 AND je.source = 'manual'
+      )`;
+    const params: any[] = [org];
+    const conds: string[] = [];
+    if (f.dateFrom) { params.push(f.dateFrom); conds.push(`date >= $${params.length}`); }
+    if (f.dateTo) { params.push(f.dateTo); conds.push(`date <= $${params.length}`); }
+    const TYPES = ["invoice", "bill", "credit_note", "expense", "deposit", "journal"];
+    if (f.type && TYPES.includes(f.type)) { params.push(f.type); conds.push(`type = $${params.length}`); }
+    if (f.referenceNumber) { params.push(`%${f.referenceNumber.toLowerCase()}%`); conds.push(`LOWER(COALESCE(ref,'')) LIKE $${params.length}`); }
+    if (f.contact) { params.push(`%${f.contact.toLowerCase()}%`); conds.push(`LOWER(COALESCE(contact,'')) LIKE $${params.length}`); }
+    if (f.amountOp && typeof f.amountCents === "number") {
+      const OP: Record<string, string> = { eq: "=", gte: ">=", lte: "<=", gt: ">", lt: "<" };
+      const op = OP[f.amountOp];
+      if (op) { params.push(f.amountCents); conds.push(`amount ${op} $${params.length}`); }
+    }
+    if (f.q) {
+      params.push(`%${f.q.toLowerCase()}%`);
+      const n = params.length;
+      conds.push(`(LOWER(COALESCE(memo,'')) LIKE $${n} OR LOWER(COALESCE(ref,'')) LIKE $${n} OR LOWER(COALESCE(contact,'')) LIKE $${n})`);
+    }
+    const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+    const total = Number((await pool.query(`${cte} SELECT COUNT(*)::int AS total FROM txns ${where}`, params)).rows[0].total);
+    params.push(limit); const limIdx = params.length;
+    params.push(offset); const offIdx = params.length;
+    const rows = (await pool.query(
+      `${cte} SELECT type, id, date, ref AS "referenceNumber", contact AS "contactName", amount AS "amountCents", memo
+         FROM txns ${where} ORDER BY date DESC, id DESC LIMIT $${limIdx} OFFSET $${offIdx}`,
+      params,
+    )).rows as Array<{ type: string; id: number; date: string; referenceNumber: string | null; contactName: string | null; amountCents: string | number; memo: string | null }>;
+    const urlFor: Record<string, string> = {
+      invoice: "/invoices", bill: "/bills", credit_note: "/invoices",
+      expense: "/banking", deposit: "/banking", journal: "/journal",
+    };
+    return {
+      rows: rows.map((r) => ({ ...r, amountCents: Number(r.amountCents), url: urlFor[r.type] ?? "/" })),
+      total,
+    };
+  }
+
+  // Most recent transactions across all types — powers the "Recent transactions"
+  // list in the global search dropdown.
+  async recentTransactions(limit = 10) {
+    return (await this.searchTransactions({}, limit, 0)).rows;
+  }
+
+  // ============================================================================
   // SPRINT C: INVOICE SHARES
   // ============================================================================
   async listSharesForInvoice(invoiceId: number): Promise<InvoiceShare[]> {
