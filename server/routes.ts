@@ -80,6 +80,7 @@ import { logger } from "./logger";
 import { mapDbError } from "./db-errors";
 import { metricsMiddleware, metricsHandler } from "./metrics";
 import { fileDriver, ATTACHMENT_MAX_BYTES, ATTACHMENT_MIME_WHITELIST } from "./files";
+import { encryptBlob, decryptBlob } from "./crypto-vault";
 import { toCsv, csvMoney, type CsvColumn } from "./csv";
 import * as importers from "./importers";
 import { assertSafeWebhookUrl, signWebhookPayload, startWebhookWorker } from "./webhooks";
@@ -596,7 +597,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         // Entity must exist IN THIS ORG before we touch blob storage.
         await storage.assertAttachmentEntity(entityType, entityId);
         const storageKey = `${req.org!.id}/${crypto.randomUUID()}`;
-        await fileDriver().put(storageKey, body, mimeType);
+        // Encrypt the file bytes at rest (AES-256-GCM) before they touch disk
+        // or S3. size_bytes below records the PLAINTEXT length — the user-facing
+        // file size and the Content-Length served on download.
+        await fileDriver().put(storageKey, encryptBlob(body), mimeType);
         const { id } = await storage.createAttachment({
           entityType, entityId, filename, mimeType, sizeBytes: body.length, storageKey,
         });
@@ -615,7 +619,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const att = await storage.getAttachment(parseId(req.params.id));
       if (!att) { res.status(404).json({ error: "Attachment not found" }); return; }
-      const data = await fileDriver().get(att.storageKey);
+      const data = decryptBlob(await fileDriver().get(att.storageKey));
       res.setHeader("Content-Type", att.mimeType);
       res.setHeader("Content-Length", String(data.length));
       res.setHeader("Content-Disposition", `attachment; filename="${att.filename.replace(/"/g, "")}"`);

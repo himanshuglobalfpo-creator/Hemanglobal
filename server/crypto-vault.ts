@@ -1,24 +1,40 @@
 // ============================================================================
-// CRYPTO VAULT — AES-256-GCM encryption for secrets at rest (Plaid tokens)
+// CRYPTO VAULT — AES-256-GCM encryption at rest
 // ============================================================================
-// Key: env APP_ENCRYPTION_KEY, exactly 64 hex chars (32 bytes). In production
-// a missing/malformed key is a boot-time failure (validated from
-// initDatabase() via assertEncryptionKey()) — better to refuse to start than
-// to silently write plaintext secrets.
+// Two shapes share ONE key (env APP_ENCRYPTION_KEY, exactly 64 hex chars = 32
+// bytes):
+//   • encryptSecret/decryptSecret — short string secrets (TOTP secrets, Plaid
+//     access tokens) stored in text columns.
+//   • encryptBlob/decryptBlob — arbitrary binary payloads (attachment file
+//     bytes) stored on disk or in S3 by the file driver.
 //
-// Stored format:  "v1:" + base64(iv) + ":" + base64(ciphertext) + ":" + base64(authTag)
+// In production a missing/malformed key is a boot-time failure (validated from
+// initDatabase() via assertEncryptionKey()) — better to refuse to start than
+// to silently write plaintext secrets OR plaintext attachment blobs.
+//
+// String format:  "v1:" + base64(iv) + ":" + base64(ciphertext) + ":" + base64(authTag)
 // The "v1:" prefix does two jobs:
 //   1. Versioning — a future "v2:" (new KDF, key rotation, etc.) can coexist.
 //   2. Legacy detection — rows written before encryption shipped have no
 //      prefix; decryptSecret() passes them through unchanged so reads never
 //      break, and storage lazily re-encrypts them on first read.
+//
+// Blob format:  magic "LLE1" (4 bytes) + iv (12) + authTag (16) + ciphertext.
+// The magic header mirrors the "v1:" prefix: it versions the envelope AND lets
+// decryptBlob() pass legacy plaintext blobs (written before at-rest encryption
+// shipped, or in a keyless dev run) straight through, so existing attachments
+// keep downloading. Real attachment payloads never begin with these 4 bytes
+// (PDF="%PDF", PNG="\x89PNG", JPEG="\xFF\xD8", etc.), so the detection is
+// unambiguous in practice; production always has a key, so it always encrypts.
 
 import crypto from "node:crypto";
 import { logger } from "./logger";
 
 const ALGO = "aes-256-gcm";
 const IV_BYTES = 12; // 96-bit IV — the NIST-recommended size for GCM
+const TAG_BYTES = 16; // 128-bit GCM authentication tag
 const KEY_HEX_LEN = 64; // 32 bytes
+const BLOB_MAGIC = Buffer.from("LLE1", "ascii"); // LedgerLite Encrypted, envelope v1
 
 function loadKey(): Buffer | null {
   const hex = process.env.APP_ENCRYPTION_KEY;
@@ -84,4 +100,44 @@ export function decryptSecret(stored: string): string {
 // True when a stored value is a legacy (pre-encryption) plaintext row.
 export function isLegacyPlaintext(stored: string): boolean {
   return !stored.startsWith("v1:");
+}
+
+// ---------------------------------------------------------------------------
+// Binary blobs (attachment file bytes)
+// ---------------------------------------------------------------------------
+
+// Encrypts a binary blob for storage at rest. If no valid key is configured
+// (non-production only — production refuses to boot), returns the plaintext
+// buffer unchanged, matching encryptSecret()'s keyless fallback.
+export function encryptBlob(plain: Buffer): Buffer {
+  const key = loadKey();
+  if (!key) return plain;
+  const iv = crypto.randomBytes(IV_BYTES);
+  const cipher = crypto.createCipheriv(ALGO, key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([BLOB_MAGIC, iv, tag, ciphertext]);
+}
+
+// Decrypts a stored blob. Buffers NOT beginning with the magic header are
+// legacy plaintext (pre-encryption, or a keyless dev write) — returned
+// unchanged so existing attachments keep downloading during rollout.
+export function decryptBlob(stored: Buffer): Buffer {
+  if (stored.length < BLOB_MAGIC.length || !stored.subarray(0, BLOB_MAGIC.length).equals(BLOB_MAGIC)) {
+    return stored;
+  }
+  const key = loadKey();
+  if (!key) {
+    throw new Error("Cannot decrypt attachment: APP_ENCRYPTION_KEY is missing or malformed.");
+  }
+  let offset = BLOB_MAGIC.length;
+  const iv = stored.subarray(offset, offset + IV_BYTES); offset += IV_BYTES;
+  const tag = stored.subarray(offset, offset + TAG_BYTES); offset += TAG_BYTES;
+  if (iv.length !== IV_BYTES || tag.length !== TAG_BYTES) {
+    throw new Error("Corrupt encrypted attachment (truncated envelope).");
+  }
+  const ct = stored.subarray(offset);
+  const decipher = crypto.createDecipheriv(ALGO, key, iv);
+  decipher.setAuthTag(tag); // GCM: authenticates ciphertext — tampering throws
+  return Buffer.concat([decipher.update(ct), decipher.final()]);
 }

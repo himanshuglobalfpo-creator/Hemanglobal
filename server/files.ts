@@ -1,6 +1,11 @@
 // ============================================================================
 // FILE STORAGE — driver abstraction for attachments
 // ============================================================================
+// The driver is a dumb byte store: the attachment route encrypts payloads with
+// AES-256-GCM (crypto-vault encryptBlob) BEFORE calling put(), and decrypts
+// after get(), so every blob is encrypted at rest whether it lands on local
+// disk or in S3 — the driver never sees plaintext file bytes in production.
+//
 // FILE_STORAGE=local (default): blobs under FILE_DIR (default ./data/uploads)
 //   at <orgId>/<uuid> — org prefix keeps tenant blobs physically separated.
 // FILE_STORAGE=s3: S3-compatible store via plain fetch + AWS Signature V4
