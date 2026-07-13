@@ -3808,6 +3808,17 @@ export class DatabaseStorage {
       throw new Error(`Cannot match transaction dated ${bt.date}: that period is closed.`);
     }
 
+    // Resolve the optional payee tag. A vendorId must belong to this org; when
+    // supplied without free text, the payee name defaults to the vendor's name.
+    let payeeFields: { payee?: string | null; vendorId?: number | null } = {};
+    if (input.vendorId != null) {
+      const v = await this.getVendor(input.vendorId);
+      if (!v) throw new Error(`Vendor #${input.vendorId} not found in this organization`);
+      payeeFields = { vendorId: v.id, payee: input.payee ?? v.name };
+    } else if (input.payee !== undefined) {
+      payeeFields = { payee: input.payee, vendorId: null };
+    }
+
     const absAmt = Math.abs(bt.amount);
 
     return await db.transaction(async (tx) => {
@@ -3816,7 +3827,7 @@ export class DatabaseStorage {
       if (input.matchType === "ignore") {
         return tx
           .update(bankTransactions)
-          .set({ status: "ignored" })
+          .set({ status: "ignored", ...payeeFields })
           .where(eq(bankTransactions.id, bt.id))
           .returning().then((r) => r[0]);
       }
@@ -3916,7 +3927,7 @@ export class DatabaseStorage {
 
       return tx
         .update(bankTransactions)
-        .set({ status: "matched", entryId })
+        .set({ status: "matched", entryId, ...payeeFields })
         .where(eq(bankTransactions.id, bt.id))
         .returning().then((r) => r[0]);
     });
@@ -4069,6 +4080,7 @@ export class DatabaseStorage {
         actionType: input.actionType,
         categoryAccountId: input.categoryAccountId ?? null,
         transferAccountId: input.transferAccountId ?? null,
+        payeeVendorId: input.payeeVendorId ?? null,
         autoPost: input.autoPost ?? true,
       })
       .returning().then((r) => r[0]);
@@ -4110,6 +4122,11 @@ export class DatabaseStorage {
         const acct = await this.getAccount(v);
         if (!acct) throw new Error(`Account ${v} (${key}) not found`);
       }
+    }
+    // The payee vendor, when set, must be a vendor in this org.
+    if (input.payeeVendorId !== undefined && input.payeeVendorId !== null) {
+      const v = await this.getVendor(input.payeeVendorId);
+      if (!v) throw new Error(`Vendor #${input.payeeVendorId} (payeeVendorId) not found in this organization`);
     }
   }
 
@@ -4166,6 +4183,8 @@ export class DatabaseStorage {
         bankTransactionId: bt.id,
         matchType: "categorize",
         categoryAccountId: rule.categoryAccountId,
+        // Auto-tag the payee (vendor) if the rule specifies one.
+        vendorId: rule.payeeVendorId ?? undefined,
       });
       await db.update(bankRules).set({ hits: rule.hits + 1 }).where(eq(bankRules.id, rule.id));
       return updated;

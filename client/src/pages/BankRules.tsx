@@ -40,6 +40,7 @@ type RuleForm = {
   actionType: "categorize" | "transfer" | "ignore";
   categoryAccountId: string;
   transferAccountId: string;
+  payeeVendorId: string;
   autoPost: boolean;
 };
 
@@ -56,6 +57,7 @@ const blankForm: RuleForm = {
   actionType: "categorize",
   categoryAccountId: "",
   transferAccountId: "",
+  payeeVendorId: "",
   autoPost: true,
 };
 
@@ -67,6 +69,7 @@ export default function BankRules() {
 
   const { data: rules = [] } = useQuery<BankRule[]>({ queryKey: ["/api/bank-rules"] });
   const { data: accounts = [] } = useQuery<Account[]>({ queryKey: ["/api/accounts"] });
+  const { data: vendors = [] } = useQuery<{ id: number; name: string }[]>({ queryKey: ["/api/vendors"] });
 
   const bankAccts = accounts.filter((a) => a.subtype === "bank");
   const categoryAccts = accounts.filter((a) =>
@@ -94,6 +97,7 @@ export default function BankRules() {
       actionType: (r.actionType as any) ?? "categorize",
       categoryAccountId: r.categoryAccountId?.toString() ?? "",
       transferAccountId: r.transferAccountId?.toString() ?? "",
+      payeeVendorId: (r as any).payeeVendorId?.toString() ?? "",
       autoPost: r.autoPost,
     });
     setOpen(true);
@@ -114,6 +118,7 @@ export default function BankRules() {
         actionType: f.actionType,
         categoryAccountId: f.actionType === "categorize" && f.categoryAccountId ? Number(f.categoryAccountId) : null,
         transferAccountId: f.actionType === "transfer" && f.transferAccountId ? Number(f.transferAccountId) : null,
+        payeeVendorId: f.actionType === "categorize" && f.payeeVendorId ? Number(f.payeeVendorId) : null,
         autoPost: f.autoPost,
       };
       if (editingId) {
@@ -446,6 +451,20 @@ export default function BankRules() {
                         ))}
                       </SelectContent>
                     </Select>
+                    {vendors.length > 0 && (
+                      <div className="mt-3">
+                        <Label>Payee (vendor) <span className="text-muted-foreground font-normal">— optional</span></Label>
+                        <select
+                          className="flex h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                          data-testid="select-rule-payee"
+                          value={form.payeeVendorId}
+                          onChange={(e) => setForm({ ...form, payeeVendorId: e.target.value })}
+                        >
+                          <option value="">— None —</option>
+                          {vendors.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
+                        </select>
+                      </div>
+                    )}
                   </div>
                 )}
                 {form.actionType === "transfer" && (

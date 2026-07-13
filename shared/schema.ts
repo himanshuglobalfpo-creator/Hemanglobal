@@ -1206,6 +1206,10 @@ export const bankTransactions = pgTable("bank_transactions", {
   entryId: integer("entry_id"), // FK to journal_entries when matched
   externalId: text("external_id"), // e.g. Plaid transaction_id for dedupe
   source: text("source").notNull().default("manual"), // manual | csv | plaid
+  // Payee (QBO-style): free-text name and/or a link to a vendor entity, set when
+  // the transaction is categorized (manually or by a rule).
+  payee: text("payee"),
+  vendorId: integer("vendor_id"),
   importedAt: timestamp("imported_at", { mode: "string" }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
 });
@@ -1262,6 +1266,9 @@ export const matchBankTransactionSchema = z.object({
   billId: z.number().optional(),
   categoryAccountId: z.number().optional(),
   transferAccountId: z.number().optional(),
+  // Optional payee tag applied to the transaction row.
+  payee: z.string().max(200).nullable().optional(),
+  vendorId: z.number().int().positive().nullable().optional(),
 });
 export type MatchBankTransactionInput = z.infer<typeof matchBankTransactionSchema>;
 
@@ -1290,6 +1297,7 @@ export const bankRules = pgTable("bank_rules", {
   actionType: text("action_type").notNull(), // 'categorize' | 'transfer' | 'ignore'
   categoryAccountId: integer("category_account_id"),
   transferAccountId: integer("transfer_account_id"),
+  payeeVendorId: integer("payee_vendor_id"), // auto-tag the payee (vendor) on categorize
   autoPost: boolean("auto_post").notNull().default(true), // if false, just suggest
   hits: integer("hits").notNull().default(0), // counter
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
@@ -1309,6 +1317,7 @@ const bankRuleBaseSchema = z.object({
   actionType: z.enum(["categorize", "transfer", "ignore"]),
   categoryAccountId: z.number().int().positive().nullable().optional(),
   transferAccountId: z.number().int().positive().nullable().optional(),
+  payeeVendorId: z.number().int().positive().nullable().optional(),
   autoPost: z.boolean().default(true),
 });
 

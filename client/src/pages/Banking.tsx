@@ -50,6 +50,8 @@ type BankTx = {
   status: "unmatched" | "matched" | "ignored";
   entryId?: number | null;
   source: "manual" | "csv" | "plaid";
+  payee?: string | null;
+  vendorId?: number | null;
 };
 
 type Suggestion = {
@@ -289,6 +291,7 @@ function TxTable({
             <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
               <th className="px-4 py-3 font-medium">Date</th>
               <th className="px-4 py-3 font-medium">Description</th>
+              <th className="px-4 py-3 font-medium">Payee</th>
               <th className="px-4 py-3 font-medium">Source</th>
               <th className="px-4 py-3 font-medium">Status</th>
               <th className="px-4 py-3 font-medium text-right">Amount</th>
@@ -298,7 +301,7 @@ function TxTable({
           <tbody>
             {rows.length === 0 && (
               <tr>
-                <td colSpan={showActions ? 6 : 5} className="px-4 py-12 text-center text-muted-foreground">
+                <td colSpan={showActions ? 7 : 6} className="px-4 py-12 text-center text-muted-foreground">
                   {emptyText}
                 </td>
               </tr>
@@ -313,6 +316,7 @@ function TxTable({
                 >
                   <td className="px-4 py-3 text-muted-foreground">{fmtDate(t.date)}</td>
                   <td className="px-4 py-3">{t.description}</td>
+                  <td className="px-4 py-3 text-muted-foreground" data-testid={`text-payee-${t.id}`}>{t.payee || ""}</td>
                   <td className="px-4 py-3">
                     <Badge variant="outline" className="text-xs capitalize">
                       {t.source}
@@ -403,7 +407,7 @@ function SuggestionRow({ tx, onMatch }: { tx: BankTx; onMatch: (t: BankTx) => vo
 
   return (
     <tr className="border-b border-border last:border-0 bg-muted/30">
-      <td colSpan={6} className="px-4 py-2">
+      <td colSpan={7} className="px-4 py-2">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs text-muted-foreground flex items-center gap-1">
             <Sparkles className="h-3 w-3 text-primary" />
@@ -891,6 +895,9 @@ function MatchDialog({
   const [selectedSuggestion, setSelectedSuggestion] = useState<Suggestion | null>(null);
   const [categoryAccountId, setCategoryAccountId] = useState<number | null>(null);
   const [transferAccountId, setTransferAccountId] = useState<number | null>(null);
+  const [payeeVendorId, setPayeeVendorId] = useState<number | null>(tx.vendorId ?? null);
+
+  const { data: vendors = [] } = useQuery<{ id: number; name: string }[]>({ queryKey: ["/api/vendors"] });
 
   const { data: suggestions = [] } = useQuery<Suggestion[]>({
     queryKey: ["/api/bank-transactions", tx.id, "suggestions"],
@@ -911,7 +918,10 @@ function MatchDialog({
       const body: any = { matchType };
       if (matchType === "invoice_payment") body.invoiceId = selectedSuggestion?.id;
       if (matchType === "bill_payment") body.billId = selectedSuggestion?.id;
-      if (matchType === "categorize") body.categoryAccountId = categoryAccountId;
+      if (matchType === "categorize") {
+        body.categoryAccountId = categoryAccountId;
+        if (payeeVendorId) body.vendorId = payeeVendorId;
+      }
       if (matchType === "transfer") body.transferAccountId = transferAccountId;
       const r = await apiRequest("POST", `/api/bank-transactions/${tx.id}/match`, body);
       return r.json();
@@ -1035,6 +1045,20 @@ function MatchDialog({
                   ))}
                 </SelectContent>
               </Select>
+              {vendors.length > 0 && (
+                <div className="mt-3">
+                  <Label>Payee (vendor) <span className="text-muted-foreground font-normal">— optional</span></Label>
+                  <select
+                    className="flex h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                    data-testid="select-categorize-payee"
+                    value={payeeVendorId?.toString() ?? ""}
+                    onChange={(e) => setPayeeVendorId(e.target.value ? Number(e.target.value) : null)}
+                  >
+                    <option value="">— None —</option>
+                    {vendors.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
+                  </select>
+                </div>
+              )}
             </div>
           )}
 
