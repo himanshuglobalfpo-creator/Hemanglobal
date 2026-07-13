@@ -54,12 +54,11 @@ function StatusRow({ ok, label, detail }: { ok: boolean; label: string; detail?:
   );
 }
 
-// Manage a single dimension type (classes OR locations): list, add, and
-// activate/deactivate. Inactive entries stay on historical transactions but are
-// hidden from new-entry pickers.
-function DimensionManager({ kind, title, canEdit }: { kind: "classes" | "locations"; title: string; canEdit: boolean }) {
+// Manage a single dimension type (classes / locations / projects): list, add,
+// and activate/deactivate. Inactive entries stay on historical transactions but
+// are hidden from new-entry pickers.
+function DimensionManager({ kind, title, singular, canEdit }: { kind: "classes" | "locations" | "projects"; title: string; singular: string; canEdit: boolean }) {
   const { toast } = useToast();
-  const singular = kind === "classes" ? "class" : "location";
   const { data: items = [] } = useQuery<Array<{ id: number; name: string; isActive: boolean }>>({ queryKey: [`/api/${kind}`] });
   const [name, setName] = useState("");
   const createMut = useMutation({
@@ -376,8 +375,9 @@ export default function Settings() {
         </Card>
 
         <InventorySettings org={org} canEdit={canEdit} />
-        <DimensionManager kind="classes" title="Classes" canEdit={canEdit} />
-        <DimensionManager kind="locations" title="Locations" canEdit={canEdit} />
+        <DimensionManager kind="classes" title="Classes" singular="class" canEdit={canEdit} />
+        <DimensionManager kind="locations" title="Locations" singular="location" canEdit={canEdit} />
+        <DimensionManager kind="projects" title="Projects (jobs)" singular="project" canEdit={canEdit} />
       </div>
     </Layout>
   );

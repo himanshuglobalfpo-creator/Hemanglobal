@@ -189,6 +189,29 @@ export const insertLocationSchema = createInsertSchema(locations)
 export type InsertLocation = z.infer<typeof insertLocationSchema>;
 export type Location = typeof locations.$inferSelect;
 
+// Projects (QBO "customer:job"): a third dimension for job costing. Optionally
+// tied to a customer, so a project can roll up under the client it belongs to.
+// Drives per-project Profit & Loss.
+export const projects = pgTable("projects", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  name: text("name").notNull(),
+  customerId: integer("customer_id"), // optional link to the customer this job is for
+  status: text("status").notNull().default("active"), // active | completed | on_hold
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export const insertProjectSchema = createInsertSchema(projects)
+  .omit({ id: true, orgId: true, createdAt: true })
+  .extend({
+    name: z.string().min(1, "Project name is required").max(160),
+    customerId: z.number().int().positive().nullable().optional(),
+    status: z.enum(["active", "completed", "on_hold"]).optional(),
+    isActive: z.boolean().optional(),
+  });
+export type InsertProject = z.infer<typeof insertProjectSchema>;
+export type Project = typeof projects.$inferSelect;
+
 // ============================================================================
 // SHARED VALIDATORS
 // ============================================================================
@@ -250,9 +273,10 @@ export const journalLines = pgTable("journal_lines", {
   // Stored in cents (integer). $10.99 = 1099. Never use REAL for money.
   credit: bigint("credit", { mode: "number" }).notNull().default(0),
   description: text("description"),
-  // Optional dimensions (class/location). Reports filter on these.
+  // Optional dimensions (class/location/project). Reports filter on these.
   classId: integer("class_id"),
   locationId: integer("location_id"),
+  projectId: integer("project_id"),
 });
 
 export const insertJournalLineSchema = createInsertSchema(journalLines).omit({ id: true });
@@ -275,6 +299,7 @@ export const postJournalEntrySchema = z.object({
         description: z.string().max(500).optional(),
         classId: z.number().int().positive().nullable().optional(),
         locationId: z.number().int().positive().nullable().optional(),
+        projectId: z.number().int().positive().nullable().optional(),
       }).refine(
         (l) => !((l.debit || 0) > 0 && (l.credit || 0) > 0),
         { message: "A single line cannot have both a debit and a credit. Split into two lines." }
@@ -478,9 +503,10 @@ export const invoiceLines = pgTable("invoice_lines", {
   amount: bigint("amount", { mode: "number" }).notNull().default(0),
   incomeAccountId: integer("income_account_id").notNull(), // which income account this line credits
   itemId: integer("item_id"), // optional link to a catalog item (drives income account + COGS)
-  // Optional dimensions (class/location) — propagated onto the GL income line.
+  // Optional dimensions (class/location/project) — propagated onto the GL income line.
   classId: integer("class_id"),
   locationId: integer("location_id"),
+  projectId: integer("project_id"),
 });
 
 export const insertInvoiceLineSchema = createInsertSchema(invoiceLines).omit({ id: true });
@@ -514,6 +540,7 @@ export const createInvoiceSchema = z.object({
         incomeAccountId: z.number().int().positive().optional(),
         classId: z.number().int().positive().nullable().optional(),
         locationId: z.number().int().positive().nullable().optional(),
+        projectId: z.number().int().positive().nullable().optional(),
       }).refine((l) => l.itemId !== undefined || l.incomeAccountId !== undefined, {
         message: "Each line must reference an itemId or an incomeAccountId",
         path: ["incomeAccountId"],
@@ -974,9 +1001,10 @@ export const billLines = pgTable("bill_lines", {
   amount: bigint("amount", { mode: "number" }).notNull().default(0),
   expenseAccountId: integer("expense_account_id").notNull(),
   itemId: integer("item_id"), // optional link to a catalog item (drives GL account + stock)
-  // Optional dimensions (class/location) — propagated onto the GL expense line.
+  // Optional dimensions (class/location/project) — propagated onto the GL expense line.
   classId: integer("class_id"),
   locationId: integer("location_id"),
+  projectId: integer("project_id"),
 });
 
 export const insertBillLineSchema = createInsertSchema(billLines).omit({ id: true });
@@ -1008,6 +1036,7 @@ export const createBillSchema = z.object({
         expenseAccountId: z.number().int().positive().optional(),
         classId: z.number().int().positive().nullable().optional(),
         locationId: z.number().int().positive().nullable().optional(),
+        projectId: z.number().int().positive().nullable().optional(),
       }).refine((l) => l.itemId !== undefined || l.expenseAccountId !== undefined, {
         message: "Each line must reference an itemId or an expenseAccountId",
         path: ["expenseAccountId"],

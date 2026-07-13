@@ -39,12 +39,15 @@ import {
   payrollLiabilityPaymentLines,
   classes,
   locations,
+  projects,
   type OrgNexusState,
   type NexusStateInput,
   type Class,
   type InsertClass,
   type Location,
   type InsertLocation,
+  type Project,
+  type InsertProject,
 } from "@shared/schema";
 import { organizations } from "@shared/auth-schema";
 import { applyPurchase, costOfSale, buildCogsJournalLines, relieveLayers, layerValuation, type CogsComponent } from "@shared/inventory";
@@ -351,8 +354,8 @@ export async function closeDatabase(): Promise<void> {
   await pool.end();
 }
 
-// Optional dimensional filter for reports (class/location tracking).
-export type DimFilter = { classId?: number | null; locationId?: number | null };
+// Optional dimensional filter for reports (class/location/project tracking).
+export type DimFilter = { classId?: number | null; locationId?: number | null; projectId?: number | null };
 
 // ----------------------------------------------------------------------------
 // Storage
@@ -1264,11 +1267,39 @@ export class DatabaseStorage {
       .where(and(eq(locations.id, id), eq(locations.orgId, currentOrgId())))
       .returning().then((r) => r[0]);
   }
-  // Validate that every referenced class/location id exists in THIS org. Nulls
-  // and undefineds are ignored (dimensions are optional). Cheap: at most two
-  // membership queries, only when dimensions are actually used.
-  private async assertDimensions(classIds: Array<number | null | undefined>, locationIds: Array<number | null | undefined>): Promise<void> {
-    const check = async (ids: Array<number | null | undefined>, table: typeof classes | typeof locations, label: string) => {
+  // ---------- Dimensions: projects (jobs) ----------
+  async listProjects(includeInactive = true): Promise<Project[]> {
+    const where = includeInactive
+      ? eq(projects.orgId, currentOrgId())
+      : and(eq(projects.orgId, currentOrgId()), eq(projects.isActive, true));
+    return await db.select().from(projects).where(where).orderBy(projects.name);
+  }
+  async createProject(data: InsertProject): Promise<Project> {
+    // If tied to a customer, the customer must belong to this org.
+    if (data.customerId != null) {
+      const cust = await this.getCustomer(data.customerId);
+      if (!cust) throw new Error(`Customer #${data.customerId} not found in this organization`);
+    }
+    return await db.insert(projects).values({ ...data, orgId: currentOrgId() }).returning().then((r) => r[0]);
+  }
+  async updateProject(id: number, data: Partial<InsertProject>): Promise<Project | undefined> {
+    if (data.customerId != null) {
+      const cust = await this.getCustomer(data.customerId);
+      if (!cust) throw new Error(`Customer #${data.customerId} not found in this organization`);
+    }
+    return db.update(projects).set(data)
+      .where(and(eq(projects.id, id), eq(projects.orgId, currentOrgId())))
+      .returning().then((r) => r[0]);
+  }
+  // Validate that every referenced class/location/project id exists in THIS org.
+  // Nulls and undefineds are ignored (dimensions are optional). Cheap: at most
+  // three membership queries, only when dimensions are actually used.
+  private async assertDimensions(
+    classIds: Array<number | null | undefined>,
+    locationIds: Array<number | null | undefined>,
+    projectIds: Array<number | null | undefined> = [],
+  ): Promise<void> {
+    const check = async (ids: Array<number | null | undefined>, table: typeof classes | typeof locations | typeof projects, label: string) => {
       const uniq = [...new Set(ids.filter((v): v is number => typeof v === "number"))];
       if (uniq.length === 0) return;
       const found = await db.select({ id: table.id }).from(table)
@@ -1279,6 +1310,7 @@ export class DatabaseStorage {
     };
     await check(classIds, classes, "class");
     await check(locationIds, locations, "location");
+    await check(projectIds, projects, "project");
   }
 
   // ---------- Items / Inventory ----------
@@ -2486,6 +2518,7 @@ export class DatabaseStorage {
     await this.assertDimensions(
       input.lines.map((l) => (l as any).classId),
       input.lines.map((l) => (l as any).locationId),
+      input.lines.map((l) => (l as any).projectId),
     );
 
     // FIX #15: All inserts inside the transaction callback must use `txOrDb`, not `db`.
@@ -2516,6 +2549,7 @@ export class DatabaseStorage {
             description: l.description,
             classId: (l as any).classId ?? null,
             locationId: (l as any).locationId ?? null,
+            projectId: (l as any).projectId ?? null,
           })
           .returning().then((r: any[]) => r[0]);
         insertedLines.push(line);
@@ -2714,25 +2748,27 @@ export class DatabaseStorage {
             itemId: l.itemId ?? null,
             classId: (l as any).classId ?? null,
             locationId: (l as any).locationId ?? null,
+            projectId: (l as any).projectId ?? null,
           });
       }
       // Post journal entry: Dr A/R, Cr each Income account, Cr Sales Tax Payable.
-      // Group income by (account, class, location) so each dimension combination
-      // lands on its own GL credit line — this is what makes a dimension-filtered
-      // P&L accurate.
+      // Group income by (account, class, location, project) so each dimension
+      // combination lands on its own GL credit line — this is what makes a
+      // dimension-filtered P&L accurate.
       const lines: any[] = [{ accountId: ar.id, debit: total, credit: 0, description: `Invoice ${invNumber}` }];
-      const incomeMap = new Map<string, { accountId: number; classId: number | null; locationId: number | null; amt: number }>();
+      const incomeMap = new Map<string, { accountId: number; classId: number | null; locationId: number | null; projectId: number | null; amt: number }>();
       input.lines.forEach((l, idx) => {
         const acctId = resolvedIncomeAccountIds[idx];
         const classId = (l as any).classId ?? null;
         const locationId = (l as any).locationId ?? null;
-        const key = `${acctId}|${classId}|${locationId}`;
+        const projectId = (l as any).projectId ?? null;
+        const key = `${acctId}|${classId}|${locationId}|${projectId}`;
         const cur = incomeMap.get(key);
         if (cur) cur.amt += lineAmounts[idx];
-        else incomeMap.set(key, { accountId: acctId, classId, locationId, amt: lineAmounts[idx] });
+        else incomeMap.set(key, { accountId: acctId, classId, locationId, projectId, amt: lineAmounts[idx] });
       });
       for (const g of incomeMap.values()) {
-        lines.push({ accountId: g.accountId, debit: 0, credit: g.amt, description: `Invoice ${invNumber}`, classId: g.classId, locationId: g.locationId });
+        lines.push({ accountId: g.accountId, debit: 0, credit: g.amt, description: `Invoice ${invNumber}`, classId: g.classId, locationId: g.locationId, projectId: g.projectId });
       }
       if (tax > 0 && taxLiabAccountId) {
         lines.push({ accountId: taxLiabAccountId, debit: 0, credit: tax, description: `Sales tax on ${invNumber}` });
@@ -3189,24 +3225,26 @@ export class DatabaseStorage {
             itemId: l.itemId ?? null,
             classId: (l as any).classId ?? null,
             locationId: (l as any).locationId ?? null,
+            projectId: (l as any).projectId ?? null,
           });
       }
       // Dr each Expense/Inventory account (rounded line amounts), Dr Sales Tax
       // Receivable (or first debit acct as fallback), Cr A/P. Group the debits by
-      // (account, class, location) so dimensions land on the GL for filtering.
+      // (account, class, location, project) so dimensions land on the GL.
       const lines: any[] = [];
-      const expMap = new Map<string, { accountId: number; classId: number | null; locationId: number | null; amt: number }>();
+      const expMap = new Map<string, { accountId: number; classId: number | null; locationId: number | null; projectId: number | null; amt: number }>();
       input.lines.forEach((l, idx) => {
         const acctId = resolvedDebitAccountIds[idx];
         const classId = (l as any).classId ?? null;
         const locationId = (l as any).locationId ?? null;
-        const key = `${acctId}|${classId}|${locationId}`;
+        const projectId = (l as any).projectId ?? null;
+        const key = `${acctId}|${classId}|${locationId}|${projectId}`;
         const cur = expMap.get(key);
         if (cur) cur.amt += lineAmounts[idx];
-        else expMap.set(key, { accountId: acctId, classId, locationId, amt: lineAmounts[idx] });
+        else expMap.set(key, { accountId: acctId, classId, locationId, projectId, amt: lineAmounts[idx] });
       });
       for (const g of expMap.values()) {
-        lines.push({ accountId: g.accountId, debit: g.amt, credit: 0, description: `Bill ${billNumber}`, classId: g.classId, locationId: g.locationId });
+        lines.push({ accountId: g.accountId, debit: g.amt, credit: 0, description: `Bill ${billNumber}`, classId: g.classId, locationId: g.locationId, projectId: g.projectId });
       }
       if (tax > 0) {
         const taxAcctId = taxAsset?.id ?? [...expMap.keys()][0];
@@ -5172,6 +5210,7 @@ export class DatabaseStorage {
     if (asOfDate) { params.push(asOfDate); conds.push(`je.date <= $${params.length}`); }
     if (filter?.classId != null) { params.push(filter.classId); conds.push(`jl.class_id = $${params.length}`); }
     if (filter?.locationId != null) { params.push(filter.locationId); conds.push(`jl.location_id = $${params.length}`); }
+    if (filter?.projectId != null) { params.push(filter.projectId); conds.push(`jl.project_id = $${params.length}`); }
     const q = `
       SELECT jl.account_id as "accountId",
              COALESCE(SUM(jl.debit), 0) as debit,
@@ -5241,6 +5280,7 @@ export class DatabaseStorage {
     let dimPred = "";
     if (filter?.classId != null) { params.push(filter.classId); dimPred += ` AND jl.class_id = $${params.length}`; }
     if (filter?.locationId != null) { params.push(filter.locationId); dimPred += ` AND jl.location_id = $${params.length}`; }
+    if (filter?.projectId != null) { params.push(filter.projectId); dimPred += ` AND jl.project_id = $${params.length}`; }
     const q = `
       SELECT a.id as "accountId", a.code, a.name, a.type, a.subtype,
              COALESCE(SUM(jl.debit), 0) as debit,
@@ -5266,6 +5306,56 @@ export class DatabaseStorage {
     const totalExpenses = expenses.reduce((s, r) => s + r.amount, 0);
     const netIncome = (totalIncome - totalExpenses);
     return { fromDate, toDate, income, expenses, totalIncome, totalExpenses, netIncome };
+  }
+
+  // Profit & Loss BY PROJECT (QBO "P&L by Job"): one income/expense/net rollup
+  // per project over a date range, plus an "Unassigned" bucket for lines with no
+  // project. Sums are exact integer cents; net = income − expenses per project.
+  async projectProfitAndLoss(fromDate: string, toDate: string): Promise<{
+    fromDate: string;
+    toDate: string;
+    rows: Array<{ projectId: number | null; name: string; income: number; expenses: number; net: number }>;
+    totalIncome: number;
+    totalExpenses: number;
+    netIncome: number;
+  }> {
+    const orgId = currentOrgId();
+    const raw = (await pool.query(
+      `SELECT jl.project_id AS "projectId", a.type,
+              COALESCE(SUM(jl.debit), 0)  AS debit,
+              COALESCE(SUM(jl.credit), 0) AS credit
+         FROM journal_lines jl
+         JOIN journal_entries je ON je.id = jl.entry_id
+         JOIN accounts a        ON a.id = jl.account_id
+        WHERE je.org_id = $1 AND a.type IN ('income','expense')
+          AND je.date BETWEEN $2 AND $3
+        GROUP BY jl.project_id, a.type`,
+      [orgId, fromDate, toDate],
+    )).rows as Array<{ projectId: number | null; type: string; debit: number; credit: number }>;
+
+    const projList = await this.listProjects();
+    const nameById = new Map(projList.map((p) => [p.id, p.name]));
+    const agg = new Map<number | null, { income: number; expenses: number }>();
+    for (const r of raw) {
+      const key = r.projectId ?? null;
+      const cur = agg.get(key) ?? { income: 0, expenses: 0 };
+      if (r.type === "income") cur.income += Number(r.credit) - Number(r.debit);
+      else cur.expenses += Number(r.debit) - Number(r.credit);
+      agg.set(key, cur);
+    }
+    const rows = [...agg.entries()]
+      .map(([projectId, v]) => ({
+        projectId,
+        name: projectId === null ? "Unassigned" : (nameById.get(projectId) ?? `Project #${projectId}`),
+        income: v.income,
+        expenses: v.expenses,
+        net: v.income - v.expenses,
+      }))
+      .filter((r) => r.income !== 0 || r.expenses !== 0)
+      .sort((a, b) => b.net - a.net);
+    const totalIncome = rows.reduce((s, r) => s + r.income, 0);
+    const totalExpenses = rows.reduce((s, r) => s + r.expenses, 0);
+    return { fromDate, toDate, rows, totalIncome, totalExpenses, netIncome: totalIncome - totalExpenses };
   }
 
   // Balance Sheet as of date (optionally filtered by class/location).

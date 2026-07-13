@@ -16,7 +16,7 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { fmtMoney, fmtDate, todayISO } from "@/lib/format";
 
-interface Line { accountId: number | null; debit: number; credit: number; description: string; }
+interface Line { accountId: number | null; debit: number; credit: number; description: string; projectId?: number | null; }
 
 type EntryWithLines = JournalEntry & { lines: (JournalLine & { account?: Account })[] };
 
@@ -30,6 +30,8 @@ export default function Journal() {
 
   const { data: entries = [] } = useQuery<EntryWithLines[]>({ queryKey: ["/api/journal"] });
   const { data: accounts = [] } = useQuery<Account[]>({ queryKey: ["/api/accounts"] });
+  const { data: projects = [] } = useQuery<{ id: number; name: string; isActive: boolean }[]>({ queryKey: ["/api/projects"] });
+  const showProject = projects.length > 0;
 
   function toggleLine(id: number) {
     const next = new Set(selectedLineIds);
@@ -88,7 +90,7 @@ export default function Journal() {
         memo: form.memo || undefined,
         reference: form.reference || undefined,
         source: "manual",
-        lines: form.lines.map((l) => ({ accountId: l.accountId, debit: l.debit || 0, credit: l.credit || 0, description: l.description || undefined })),
+        lines: form.lines.map((l) => ({ accountId: l.accountId, debit: l.debit || 0, credit: l.credit || 0, description: l.description || undefined, projectId: l.projectId ?? undefined })),
       });
       return r.json();
     },
@@ -247,6 +249,7 @@ export default function Journal() {
                   <tr>
                     <th className="text-left px-3 py-2 font-medium">Account</th>
                     <th className="text-left px-3 py-2 font-medium">Description</th>
+                    {showProject && <th className="text-left px-3 py-2 font-medium w-32">Project</th>}
                     <th className="text-right px-3 py-2 font-medium w-28">Debit</th>
                     <th className="text-right px-3 py-2 font-medium w-28">Credit</th>
                     <th className="w-10"></th>
@@ -266,6 +269,19 @@ export default function Journal() {
                       <td className="px-2 py-1">
                         <Input data-testid={`input-journal-line-desc-${idx}`} value={l.description} onChange={(e) => { const lines = [...form.lines]; lines[idx].description = e.target.value; setForm({ ...form, lines }); }} />
                       </td>
+                      {showProject && (
+                        <td className="px-2 py-1">
+                          <select
+                            className="flex h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                            data-testid={`select-journal-line-project-${idx}`}
+                            value={l.projectId?.toString() ?? ""}
+                            onChange={(e) => { const lines = [...form.lines]; lines[idx].projectId = e.target.value ? Number(e.target.value) : null; setForm({ ...form, lines }); }}
+                          >
+                            <option value="">—</option>
+                            {projects.filter((p) => p.isActive || p.id === l.projectId).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                          </select>
+                        </td>
+                      )}
                       <td className="px-2 py-1">
                         <Input type="number" step="0.01" className="text-right" data-testid={`input-journal-debit-${idx}`} value={l.debit || ""} onChange={(e) => { const lines = [...form.lines]; lines[idx].debit = Number(e.target.value); if (lines[idx].debit > 0) lines[idx].credit = 0; setForm({ ...form, lines }); }} />
                       </td>
@@ -282,7 +298,7 @@ export default function Journal() {
                     </tr>
                   ))}
                   <tr className="border-t border-border bg-muted/30 font-medium">
-                    <td colSpan={2} className="px-3 py-2 text-xs uppercase tracking-wide text-muted-foreground">Totals</td>
+                    <td colSpan={showProject ? 3 : 2} className="px-3 py-2 text-xs uppercase tracking-wide text-muted-foreground">Totals</td>
                     <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(totalDebit)}</td>
                     <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(totalCredit)}</td>
                     <td></td>

@@ -16,7 +16,7 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { centsToDollars, fmtMoney, fmtDate, todayISO } from "@/lib/format";
 
-interface NewLine { description: string; quantity: number; rate: number; incomeAccountId: number | null; }
+interface NewLine { description: string; quantity: number; rate: number; incomeAccountId: number | null; projectId?: number | null; }
 
 export default function Invoices() {
   const { toast } = useToast();
@@ -32,8 +32,10 @@ export default function Invoices() {
     queryKey: ["/api/tax-codes"],
   });
 
+  const { data: projects = [] } = useQuery<{ id: number; name: string; isActive: boolean }[]>({ queryKey: ["/api/projects"] });
   const incomeAccts = accounts.filter((a) => a.type === "income");
   const bankAccts = accounts.filter((a) => a.subtype === "bank");
+  const showProject = projects.length > 0;
 
   const today = todayISO();
   const due30 = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
@@ -79,6 +81,7 @@ export default function Invoices() {
           quantity: l.quantity,
           rate: l.rate,
           incomeAccountId: l.incomeAccountId,
+          projectId: l.projectId ?? undefined,
         })),
       };
       const r = await apiRequest("POST", "/api/invoices", body);
@@ -228,6 +231,7 @@ export default function Invoices() {
                     <tr>
                       <th className="text-left px-3 py-2 font-medium">Description</th>
                       <th className="text-left px-3 py-2 font-medium w-32">Income account</th>
+                      {showProject && <th className="text-left px-3 py-2 font-medium w-32">Project</th>}
                       <th className="text-right px-3 py-2 font-medium w-20">Qty</th>
                       <th className="text-right px-3 py-2 font-medium w-24">Rate</th>
                       <th className="text-right px-3 py-2 font-medium w-28">Amount</th>
@@ -248,6 +252,19 @@ export default function Invoices() {
                             </SelectContent>
                           </Select>
                         </td>
+                        {showProject && (
+                          <td className="px-2 py-1">
+                            <select
+                              className="flex h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                              data-testid={`select-line-project-${idx}`}
+                              value={l.projectId?.toString() ?? ""}
+                              onChange={(e) => { const lines = [...form.lines]; lines[idx].projectId = e.target.value ? Number(e.target.value) : null; setForm({ ...form, lines }); }}
+                            >
+                              <option value="">—</option>
+                              {projects.filter((p) => p.isActive || p.id === l.projectId).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                            </select>
+                          </td>
+                        )}
                         <td className="px-2 py-1">
                           <Input type="number" step="0.01" data-testid={`input-line-qty-${idx}`} className="text-right" value={l.quantity} onChange={(e) => { const lines = [...form.lines]; lines[idx].quantity = Number(e.target.value); setForm({ ...form, lines }); }} />
                         </td>

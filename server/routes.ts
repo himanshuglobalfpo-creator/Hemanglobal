@@ -25,6 +25,7 @@ import {
   insertVendorSchema,
   insertClassSchema,
   insertLocationSchema,
+  insertProjectSchema,
   postJournalEntrySchema,
   createInvoiceSchema,
   createBillSchema,
@@ -110,11 +111,12 @@ function parseId(raw: unknown, label = "id"): number {
   return n;
 }
 
-// Parse optional ?classId=&locationId= into a DimFilter for report filtering.
-function dimFilterFromQuery(req: Request): { classId?: number; locationId?: number } {
-  const f: { classId?: number; locationId?: number } = {};
+// Parse optional ?classId=&locationId=&projectId= into a DimFilter for reports.
+function dimFilterFromQuery(req: Request): { classId?: number; locationId?: number; projectId?: number } {
+  const f: { classId?: number; locationId?: number; projectId?: number } = {};
   if (req.query.classId !== undefined) f.classId = parseId(req.query.classId, "classId");
   if (req.query.locationId !== undefined) f.locationId = parseId(req.query.locationId, "locationId");
+  if (req.query.projectId !== undefined) f.projectId = parseId(req.query.projectId, "projectId");
   return f;
 }
 
@@ -986,6 +988,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return updated;
     })
   );
+  app.get("/api/projects", (req, res) =>
+    handle(res, () => storage.listProjects(req.query.includeInactive !== "false"))
+  );
+  app.post("/api/projects", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => storage.createProject(insertProjectSchema.parse(req.body)))
+  );
+  app.patch("/api/projects/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const updated = await storage.updateProject(parseId(req.params.id), insertProjectSchema.partial().parse(req.body));
+      if (!updated) throw new Error("Project not found");
+      return updated;
+    })
+  );
 
   // ---------- Journal ----------
   app.get("/api/journal", (req, res) =>
@@ -1080,6 +1095,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     handle(res, async () => {
       const asOf = (req.query.asOf as string) || new Date().toISOString().slice(0, 10);
       return storage.balanceSheet(asOf, dimFilterFromQuery(req));
+    })
+  );
+  // Profit & Loss BY PROJECT (per-job rollup over a date range).
+  app.get("/api/reports/project-pl", (req, res) =>
+    handle(res, async () => {
+      const from = (req.query.from as string) || `${new Date().getFullYear()}-01-01`;
+      const to = (req.query.to as string) || new Date().toISOString().slice(0, 10);
+      return storage.projectProfitAndLoss(from, to);
     })
   );
   app.get("/api/reports/general-ledger", (req, res) =>
