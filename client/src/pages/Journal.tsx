@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Plus, Trash2, ArrowRightLeft } from "lucide-react";
 import type { Account, JournalEntry, JournalLine } from "@shared/schema";
+import { useOpenOnCreateParam } from "@/lib/create-shortcut";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -23,6 +24,7 @@ type EntryWithLines = JournalEntry & { lines: (JournalLine & { account?: Account
 export default function Journal() {
   const { toast } = useToast();
   const [open, setOpen] = useState(false);
+  useOpenOnCreateParam(() => setOpen(true)); // global "+ Create → Journal entry"
   const [selectedLineIds, setSelectedLineIds] = useState<Set<number>>(new Set());
   const [reclassOpen, setReclassOpen] = useState(false);
   const [reclassToAccount, setReclassToAccount] = useState<string>("");

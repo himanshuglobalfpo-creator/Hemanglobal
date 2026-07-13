@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Plus, Trash2, Repeat, Play, RefreshCw } from "lucide-react";
 import type { Account, Customer, Vendor, RecurringTemplate } from "@shared/schema";
+import { useOpenOnCreateParam } from "@/lib/create-shortcut";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -73,6 +74,7 @@ const blankForm: Form = {
 export default function Recurring() {
   const { toast } = useToast();
   const [open, setOpen] = useState(false);
+  useOpenOnCreateParam(() => setOpen(true)); // global "+ Create → Recurring payment"
   const [form, setForm] = useState<Form>(blankForm);
 
   const { data: templates = [] } = useQuery<RecurringTemplate[]>({ queryKey: ["/api/recurring"] });

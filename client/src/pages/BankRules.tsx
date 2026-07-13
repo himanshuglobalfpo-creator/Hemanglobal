@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Plus, Trash2, Filter, Pencil, Zap } from "lucide-react";
 import type { Account, BankRule } from "@shared/schema";
+import { useOpenOnCreateParam } from "@/lib/create-shortcut";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -81,6 +82,7 @@ export default function BankRules() {
     setForm(blankForm);
     setOpen(true);
   }
+  useOpenOnCreateParam(openNew); // global "+ Create → Bank rule"
   function openEdit(r: BankRule) {
     setEditingId(r.id);
     setForm({

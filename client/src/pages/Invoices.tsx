@@ -3,6 +3,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { Plus, Trash2, DollarSign, FileDown, Send, Link as LinkIcon, Check, Paperclip, Settings2, ChevronDown } from "lucide-react";
 import type { Account, Customer, Invoice, Item, InvoiceSettings } from "@shared/schema";
 import { defaultInvoiceSettings } from "@shared/schema";
+import { useOpenOnCreateParam } from "@/lib/create-shortcut";
 import type { Me } from "@/App";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent } from "@/components/ui/card";
@@ -104,6 +105,8 @@ export default function Invoices() {
     resetForm();
     setOpen(true);
   }
+  // Opened from the global "+ Create → Invoice" shortcut.
+  useOpenOnCreateParam(openCreate);
 
   const selectedCustomer = customers.find((c) => c.id === form.customerId);
 

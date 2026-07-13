@@ -1,4 +1,4 @@
-import { ReactNode, useEffect, useState } from "react";
+import { ReactNode, useEffect, useRef, useState } from "react";
 import { Link, useLocation } from "wouter";
 import {
   LayoutDashboard,
@@ -22,10 +22,12 @@ import {
   Percent,
   LogOut,
   Building2,
+  Plus,
   Settings as SettingsIcon,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
+import { requestCreate } from "@/lib/create-shortcut";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
@@ -225,6 +227,125 @@ function GlobalSearch({ open, setOpen }: { open: boolean; setOpen: (v: boolean) 
   );
 }
 
+// ----------------------------------------------------------------------------
+// Create menu (QBO "+ Create"). Grouped columns of shortcuts that jump to the
+// relevant page — and, where a create dialog exists, open it directly via the
+// ?new=1 marker (see lib/create-shortcut). Only REAL destinations are listed:
+// items whose feature has no page are intentionally omitted rather than shipped
+// as dead links. (QBO's "Team" column — time activity, timesheets, contractors
+// — has no counterpart in this app yet, so it isn't shown.)
+// ----------------------------------------------------------------------------
+// `create: true` opens that page's create dialog on arrival (via the
+// sessionStorage handoff); otherwise the item just navigates to the page where
+// that action lives. Only real destinations are listed — no dead links. (QBO's
+// "Team" column — time activity, timesheets, contractors — has no counterpart
+// in this app yet, so it is intentionally omitted.)
+type CreateItem = { label: string; path: string; create?: boolean; testId: string };
+type CreateColumn = { heading: string; items: CreateItem[] };
+
+const CREATE_COLUMNS: CreateColumn[] = [
+  {
+    heading: "Customers",
+    items: [
+      { label: "Invoice", path: "/invoices", create: true, testId: "create-invoice" },
+      { label: "Receive payment", path: "/invoices", testId: "create-receive-payment" },
+      { label: "Recurring payment", path: "/recurring", create: true, testId: "create-recurring" },
+      { label: "Statement", path: "/statements", testId: "create-statement" },
+      { label: "Add customer", path: "/customers", create: true, testId: "create-customer" },
+    ],
+  },
+  {
+    heading: "Vendors",
+    items: [
+      { label: "Bill", path: "/bills", create: true, testId: "create-bill" },
+      { label: "Expense", path: "/banking", create: true, testId: "create-expense" },
+      { label: "Pay bills", path: "/bills", testId: "create-pay-bills" },
+      { label: "Add vendor", path: "/vendors", create: true, testId: "create-vendor" },
+    ],
+  },
+  {
+    heading: "Other",
+    items: [
+      { label: "Bank deposit", path: "/banking", create: true, testId: "create-bank-deposit" },
+      { label: "Transfer", path: "/banking", create: true, testId: "create-transfer" },
+      { label: "Journal entry", path: "/journal", create: true, testId: "create-journal" },
+      { label: "Bank rule", path: "/rules", create: true, testId: "create-bank-rule" },
+      { label: "Reconcile", path: "/reconciliation", testId: "create-reconcile" },
+    ],
+  },
+];
+
+function CreateMenu() {
+  const [, navigate] = useLocation();
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Close on outside click or Escape.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+
+  const go = (item: CreateItem) => {
+    setOpen(false);
+    if (item.create) requestCreate(item.path); // open the page's create dialog on arrival
+    navigate(item.path);
+  };
+
+  return (
+    <div className="relative" ref={ref}>
+      <Button
+        size="sm"
+        onClick={() => setOpen((v) => !v)}
+        data-testid="button-create"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <Plus className="h-4 w-4 mr-1.5" />
+        Create
+      </Button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 mt-2 w-[34rem] max-w-[90vw] rounded-md border border-border bg-popover text-popover-foreground shadow-lg p-4 z-40"
+          data-testid="menu-create"
+        >
+          <div className="grid grid-cols-3 gap-4">
+            {CREATE_COLUMNS.map((col) => (
+              <div key={col.heading}>
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-1.5">
+                  {col.heading}
+                </div>
+                <ul className="space-y-0.5">
+                  {col.items.map((it) => (
+                    <li key={it.testId}>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => go(it)}
+                        data-testid={`link-${it.testId}`}
+                        className="w-full text-left rounded px-2 py-1.5 text-sm hover-elevate active-elevate-2"
+                      >
+                        {it.label}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Logo({ className }: { className?: string }) {
   return (
     <div className={cn("flex items-center gap-2", className)}>
@@ -397,6 +518,7 @@ export function Layout({ children }: { children: ReactNode }) {
                 ⌘K
               </kbd>
             </button>
+            <CreateMenu />
           </div>
         </div>
         <EmailVerificationBanner />

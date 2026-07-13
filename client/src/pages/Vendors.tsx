@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Plus, Trash2 } from "lucide-react";
 import type { Vendor } from "@shared/schema";
+import { useOpenOnCreateParam } from "@/lib/create-shortcut";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -22,6 +23,7 @@ import { useToast } from "@/hooks/use-toast";
 export default function Vendors() {
   const { toast } = useToast();
   const [open, setOpen] = useState(false);
+  useOpenOnCreateParam(() => setOpen(true)); // global "+ Create → Add vendor"
   const [form, setForm] = useState({ name: "", email: "", phone: "", address: "", notes: "" });
 
   const { data = [] } = useQuery<Vendor[]>({ queryKey: ["/api/vendors"] });

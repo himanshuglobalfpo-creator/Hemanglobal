@@ -15,6 +15,7 @@ import {
   Undo2,
 } from "lucide-react";
 import type { Account } from "@shared/schema";
+import { useOpenOnCreateParam } from "@/lib/create-shortcut";
 import { Layout, PageHeader } from "@/components/Layout";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -191,6 +192,7 @@ export default function Banking() {
   const [activeBankId, setActiveBankId] = useState<number | null>(null);
   const [tab, setTab] = useState("review");
   const [manualOpen, setManualOpen] = useState(false);
+  useOpenOnCreateParam(() => setManualOpen(true)); // global "+ Create → Expense / Bank deposit / Transfer"
   const [importOpen, setImportOpen] = useState(false);
   const [matchOpen, setMatchOpen] = useState<BankTx | null>(null);
 
