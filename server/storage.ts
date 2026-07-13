@@ -3602,8 +3602,9 @@ export class DatabaseStorage {
   // balance (from journal lines as of today), count of transactions still in
   // "For Review", the last bank-feed import date, and — WHEN AVAILABLE — the
   // bank-reported feed balance. The feed balance comes only from a real
-  // aggregator (Plaid); we never fabricate one, so it is null until a feed
-  // reports it (last-import date, computed from imported rows, is always real).
+  // aggregator (Plaid, captured at link/sync into plaid_items); we never
+  // fabricate one, so it is null until a feed reports it (last-import date,
+  // computed from imported rows, is always real).
   async bankAccountSummaries(subtype?: string): Promise<Array<{
     accountId: number; code: string; name: string; subtype: string | null;
     ledgerBalanceCents: number; reviewCount: number;
@@ -3627,6 +3628,17 @@ export class DatabaseStorage {
       [org]
     )).rows as Array<{ id: number; lastAt: string | null }>;
     const importByAcct = new Map(importRows.map((r) => [r.id, r.lastAt]));
+    // Latest bank-reported feed balance per GL account (most recent plaid_items
+    // row that actually carries one). Null for CSV-only / unlinked accounts.
+    const feedRows = (await pool.query(
+      `SELECT DISTINCT ON (bank_account_id)
+              bank_account_id AS "id", feed_balance_cents AS "cents", feed_balance_at AS "at"
+         FROM plaid_items
+        WHERE org_id = $1 AND feed_balance_cents IS NOT NULL
+        ORDER BY bank_account_id, feed_balance_at DESC NULLS LAST, id DESC`,
+      [org]
+    )).rows as Array<{ id: number; cents: number; at: string | null }>;
+    const feedByAcct = new Map(feedRows.map((r) => [r.id, { cents: Number(r.cents), at: r.at }]));
     return accts.map((a) => ({
       accountId: a.id,
       code: a.code,
@@ -3635,8 +3647,8 @@ export class DatabaseStorage {
       ledgerBalanceCents: balances.get(a.id)?.balance ?? 0,
       reviewCount: reviewByAcct.get(a.id) ?? 0,
       lastImportedAt: importByAcct.get(a.id) ?? null,
-      feedBalanceCents: null, // populated only by a real bank feed (see note above)
-      feedBalanceAt: null,
+      feedBalanceCents: feedByAcct.get(a.id)?.cents ?? null,
+      feedBalanceAt: feedByAcct.get(a.id)?.at ?? null,
     }));
   }
 
@@ -4662,6 +4674,7 @@ export class DatabaseStorage {
     accessToken: string;
     itemId: string;
     institutionName?: string;
+    plaidAccountId?: string | null;
   }): Promise<{ id: number }> {
     const orgId = currentOrgId();
     // Encrypt at rest (Task: AES-256-GCM vault). Plaintext never touches the DB
@@ -4670,11 +4683,20 @@ export class DatabaseStorage {
     // Idempotent on item_id: if Plaid returned the same item, just update the token.
     const existing = (await pool.query(`SELECT id FROM plaid_items WHERE item_id = $1 AND org_id = $2`, [input.itemId, orgId])).rows[0] as { id: number } | undefined;
     if (existing) {
-      await pool.query(`UPDATE plaid_items SET access_token = $1, bank_account_id = $2, institution_name = COALESCE($3, institution_name) WHERE id = $4 AND org_id = $5`, [storedToken, input.bankAccountId, input.institutionName ?? null, existing.id, orgId]);
+      await pool.query(`UPDATE plaid_items SET access_token = $1, bank_account_id = $2, institution_name = COALESCE($3, institution_name), plaid_account_id = COALESCE($4, plaid_account_id) WHERE id = $5 AND org_id = $6`, [storedToken, input.bankAccountId, input.institutionName ?? null, input.plaidAccountId ?? null, existing.id, orgId]);
       return { id: existing.id };
     }
-    const r = await pool.query(`INSERT INTO plaid_items (org_id, bank_account_id, item_id, access_token, institution_name) VALUES ($1, $2, $3, $4, $5) RETURNING id`, [orgId, input.bankAccountId, input.itemId, storedToken, input.institutionName ?? null]);
+    const r = await pool.query(`INSERT INTO plaid_items (org_id, bank_account_id, item_id, access_token, institution_name, plaid_account_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`, [orgId, input.bankAccountId, input.itemId, storedToken, input.institutionName ?? null, input.plaidAccountId ?? null]);
     return { id: Number(r.rows[0].id) };
+  }
+
+  // Persist the latest bank-reported feed balance for an item (from Plaid's
+  // accountsBalanceGet). plaidAccountId is stored too when newly resolved.
+  async updatePlaidItemFeedBalance(id: number, input: { plaidAccountId?: string | null; feedBalanceCents: number; feedBalanceAt: string }): Promise<void> {
+    await pool.query(
+      `UPDATE plaid_items SET feed_balance_cents = $1, feed_balance_at = $2, plaid_account_id = COALESCE($3, plaid_account_id) WHERE id = $4 AND org_id = $5`,
+      [input.feedBalanceCents, input.feedBalanceAt, input.plaidAccountId ?? null, id, currentOrgId()]
+    );
   }
 
   async listPlaidItems(): Promise<Array<{
@@ -4694,8 +4716,8 @@ export class DatabaseStorage {
     return rows as any;
   }
 
-  async getPlaidItemAccessToken(id: number): Promise<{ accessToken: string; cursor: string | null; bankAccountId: number } | undefined> {
-    const r = (await pool.query(`SELECT access_token AS "accessToken", cursor, bank_account_id AS "bankAccountId" FROM plaid_items WHERE id = $1 AND org_id = $2`, [id, currentOrgId()])).rows[0] as any;
+  async getPlaidItemAccessToken(id: number): Promise<{ accessToken: string; cursor: string | null; bankAccountId: number; plaidAccountId: string | null } | undefined> {
+    const r = (await pool.query(`SELECT access_token AS "accessToken", cursor, bank_account_id AS "bankAccountId", plaid_account_id AS "plaidAccountId" FROM plaid_items WHERE id = $1 AND org_id = $2`, [id, currentOrgId()])).rows[0] as any;
     if (!r) return undefined;
     // LAZY MIGRATION (self-healing, no bulk script): rows written before the
     // encryption vault shipped hold plaintext tokens (no "v1:" prefix). On the

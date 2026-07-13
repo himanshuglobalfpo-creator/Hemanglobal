@@ -168,6 +168,60 @@ export async function syncTransactions(
   }
 }
 
+// A single bank-reported account balance, normalized to integer cents.
+export type PlaidAccountBalance = {
+  plaidAccountId: string;
+  name: string;
+  mask: string | null;
+  type: string | null;
+  subtype: string | null;
+  currentCents: number | null;
+  availableCents: number | null;
+  currency: string | null;
+};
+
+// Fetch the bank-reported balances for every account on an item.
+export async function getAccountBalances(
+  accessToken: string
+): Promise<{ accounts: PlaidAccountBalance[] } | { error: string }> {
+  if (!plaidConfigured()) return { error: "Plaid not configured." };
+  const sdk = loadPlaidSdk();
+  if ("error" in sdk) return { error: sdk.error };
+  try {
+    const res = await sdk.client.accountsBalanceGet({ access_token: accessToken });
+    const toCents = (v: number | null | undefined): number | null =>
+      v == null ? null : Math.round(v * 100); // Plaid balances are float dollars
+    const accounts: PlaidAccountBalance[] = (res.data.accounts || []).map((a: any) => ({
+      plaidAccountId: a.account_id,
+      name: a.name,
+      mask: a.mask ?? null,
+      type: a.type ?? null,
+      subtype: a.subtype ?? null,
+      currentCents: toCents(a.balances?.current),
+      availableCents: toCents(a.balances?.available),
+      currency: a.balances?.iso_currency_code ?? null,
+    }));
+    return { accounts };
+  } catch (e: any) {
+    logger.error("[plaid] accountsBalanceGet failed", { error: e?.response?.data || e?.message });
+    return { error: `Plaid error: ${e?.response?.data?.error_message || e?.message || e}` };
+  }
+}
+
+// Pick which account's balance maps to our single GL bank account. Pure and
+// deterministic (unit-tested): honor an explicit Plaid account id when we have
+// one, otherwise fall back to the sole account on the item. NEVER guess when
+// several accounts are present and no id pins the mapping — return null so the
+// card simply omits the feed balance rather than showing a wrong number.
+export function pickFeedBalance(
+  accounts: PlaidAccountBalance[],
+  plaidAccountId?: string | null
+): PlaidAccountBalance | null {
+  if (plaidAccountId) return accounts.find((a) => a.plaidAccountId === plaidAccountId) ?? null;
+  if (accounts.length === 1) return accounts[0];
+  return null;
+}
+
 // Webhook handler. Plaid POSTs us when new transactions are available.
 // We ack it; the next sync call picks up the data.
 export function handlePlaidWebhook(body: any): { ok: boolean; action?: string } {

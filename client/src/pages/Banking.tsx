@@ -1339,6 +1339,8 @@ function PlaidConnectButton({
           public_token: publicToken,
           bankAccountId: activeBankId,
           institutionName: metadata?.institution?.name,
+          // The account the user selected in Link — pins the feed-balance lookup.
+          plaidAccountId: metadata?.accounts?.[0]?.id,
         });
         const { plaidItemId } = await r.json();
         toast({

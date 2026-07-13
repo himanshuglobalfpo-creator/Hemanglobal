@@ -66,7 +66,7 @@ import crypto from "node:crypto";
 import express from "express";
 import { storage, dbHealthCheck, pool } from "./storage";
 import * as noteService from "./creditNoteService";
-import { plaidStatus, createLinkToken, exchangePublicToken, syncTransactions, handlePlaidWebhook } from "./plaid";
+import { plaidStatus, createLinkToken, exchangePublicToken, syncTransactions, handlePlaidWebhook, getAccountBalances, pickFeedBalance } from "./plaid";
 import { streamInvoicePdf, streamBillPdf, streamCustomerStatementPdf, streamVendorStatementPdf, streamCreditNotePdf, streamDebitNotePdf } from "./pdf";
 import { sendEmail, smtpStatus, appBaseUrl } from "./email";
 import { attachSession, requireAuth, requireOrg, requireRole, startSessionCleanup } from "./auth";
@@ -235,6 +235,27 @@ function handleAsync<T>(res: Response, fn: () => Promise<T>) {
   fn()
     .then((out) => { if (!res.headersSent) res.json(out); })
     .catch((err: any) => respondError(res, err));
+}
+
+// Best-effort: fetch the bank-reported balance for a linked Plaid item and
+// persist it (used by exchange + sync). Never throws — a balance-fetch failure
+// must not break linking or transaction syncing; the card just omits the feed
+// balance until the next successful refresh. Returns the resolved Plaid account
+// id (if any) so callers can persist the mapping.
+async function refreshPlaidFeedBalance(itemDbId: number, accessToken: string, plaidAccountId: string | null): Promise<void> {
+  try {
+    const bal = await getAccountBalances(accessToken);
+    if ("error" in bal) { logger.warn("[plaid] feed balance skipped", { itemDbId, error: bal.error }); return; }
+    const picked = pickFeedBalance(bal.accounts, plaidAccountId);
+    if (!picked || picked.currentCents == null) return; // ambiguous or no balance — don't guess
+    await storage.updatePlaidItemFeedBalance(itemDbId, {
+      plaidAccountId: picked.plaidAccountId,
+      feedBalanceCents: picked.currentCents,
+      feedBalanceAt: new Date().toISOString(),
+    });
+  } catch (e: any) {
+    logger.warn("[plaid] feed balance refresh failed", { itemDbId, error: e?.message });
+  }
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
@@ -1536,6 +1557,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const publicToken = req.body?.public_token as string;
       const bankAccountId = Number(req.body?.bankAccountId);
       const institutionName = req.body?.institutionName as string | undefined;
+      // The specific Plaid account (from Link's onSuccess metadata) that maps to
+      // our GL bank account — pins the feed-balance lookup when the item exposes
+      // several accounts.
+      const plaidAccountId = typeof req.body?.plaidAccountId === "string" ? req.body.plaidAccountId : null;
       if (!publicToken) return res.status(400).json({ error: "public_token required" });
       if (!Number.isInteger(bankAccountId) || bankAccountId <= 0) {
         return res.status(400).json({ error: "bankAccountId required (integer)" });
@@ -1553,7 +1578,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         accessToken: out.access_token,
         itemId: out.item_id,
         institutionName,
+        plaidAccountId,
       });
+      // Capture the opening feed balance now so the card shows it immediately.
+      await refreshPlaidFeedBalance(item.id, out.access_token, plaidAccountId);
       res.json({ ok: true, plaidItemId: item.id });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -1604,6 +1632,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         if (!out.has_more) break;
       }
       await storage.updatePlaidItemCursor(id, cursor || "");
+      // Refresh the bank-reported feed balance after importing (best-effort).
+      await refreshPlaidFeedBalance(id, item.accessToken, item.plaidAccountId);
       res.json({ added: totalAdded, skipped: totalSkipped, autoMatched: totalAutoMatched, errors });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
