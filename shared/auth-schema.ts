@@ -41,6 +41,13 @@ export const organizations = pgTable("organizations", {
   // surface; strictFutureDates=true → the write is rejected outright.
   strictFutureDates: boolean("strict_future_dates").notNull().default(false),
   futureDatedGraceDays: integer("future_dated_grace_days").notNull().default(0),
+  // Dimension tracking switches (QBO-style). When on, the class/location/project
+  // pickers appear across the UI (documents, banking, manual entry). Off by
+  // default so dimensions stay opt-in. These gate the UI only; org-scoped
+  // validation (assertDimensions) is the real data-integrity control.
+  enableClassTracking: boolean("enable_class_tracking").notNull().default(false),
+  enableLocationTracking: boolean("enable_location_tracking").notNull().default(false),
+  enableProjectTracking: boolean("enable_project_tracking").notNull().default(false),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
 });
 export type Organization = typeof organizations.$inferSelect;

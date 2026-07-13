@@ -1233,6 +1233,11 @@ export const postBankTransactionSchema = z.object({
   kind: z.enum(["deposit", "withdrawal", "transfer"]),
   categoryAccountId: z.number().int().positive().optional(),
   transferAccountId: z.number().int().positive().optional(),
+  // Optional dimensions (class / location / project) tagged onto the posted
+  // journal lines — validated org-scoped by assertDimensions on post.
+  classId: z.number().int().positive().nullable().optional(),
+  locationId: z.number().int().positive().nullable().optional(),
+  projectId: z.number().int().positive().nullable().optional(),
 }).refine((v) => v.amount !== 0, {
   message: "Amount cannot be zero",
   path: ["amount"],
@@ -1269,6 +1274,12 @@ export const matchBankTransactionSchema = z.object({
   // Optional payee tag applied to the transaction row.
   payee: z.string().max(200).nullable().optional(),
   vendorId: z.number().int().positive().nullable().optional(),
+  // Optional dimensions (class / location / project) tagged onto the posted
+  // journal lines for the categorize and transfer flows. Validated org-scoped
+  // by assertDimensions when the entry posts.
+  classId: z.number().int().positive().nullable().optional(),
+  locationId: z.number().int().positive().nullable().optional(),
+  projectId: z.number().int().positive().nullable().optional(),
 });
 export type MatchBankTransactionInput = z.infer<typeof matchBankTransactionSchema>;
 

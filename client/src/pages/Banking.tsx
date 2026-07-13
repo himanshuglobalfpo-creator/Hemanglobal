@@ -40,6 +40,67 @@ import {
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { fmtMoney, fmtDate, todayISO } from "@/lib/format";
+import type { Me } from "@/App";
+
+// ============================================================
+// Dimension (class / location / project) tracking — QBO-style
+// ============================================================
+// A dimension's picker only appears when the org has that tracking switch on
+// (Settings → Dimension tracking). The selected ids ride along on the match /
+// manual-entry payload and are validated org-scoped on the server.
+export type Dims = { classId: number | null; locationId: number | null; projectId: number | null };
+export const EMPTY_DIMS: Dims = { classId: null, locationId: null, projectId: null };
+
+type DimItem = { id: number; name: string; isActive: boolean };
+
+function useDimensionTracking() {
+  const { data: me } = useQuery<Me>({ queryKey: ["/api/auth/me"] });
+  const enableClass = !!me?.org?.enableClassTracking;
+  const enableLocation = !!me?.org?.enableLocationTracking;
+  const enableProject = !!me?.org?.enableProjectTracking;
+  const anyEnabled = enableClass || enableLocation || enableProject;
+  // Only fetch a dimension list when its tracking is on.
+  const { data: classes = [] } = useQuery<DimItem[]>({ queryKey: ["/api/classes"], enabled: enableClass });
+  const { data: locations = [] } = useQuery<DimItem[]>({ queryKey: ["/api/locations"], enabled: enableLocation });
+  const { data: projects = [] } = useQuery<DimItem[]>({ queryKey: ["/api/projects"], enabled: enableProject });
+  return { enableClass, enableLocation, enableProject, anyEnabled, classes, locations, projects };
+}
+
+// Renders a labelled <select> for each ENABLED dimension. `current` keeps a
+// deactivated-but-already-selected option visible so it never silently drops.
+function DimensionSelects({ dims, onChange, testPrefix }: {
+  dims: Dims;
+  onChange: (next: Dims) => void;
+  testPrefix: string;
+}) {
+  const { enableClass, enableLocation, enableProject, anyEnabled, classes, locations, projects } = useDimensionTracking();
+  if (!anyEnabled) return null;
+
+  const Row = ({ label, kind, value, items }: { label: string; kind: keyof Dims; value: number | null; items: DimItem[] }) => (
+    <div>
+      <Label>{label} <span className="text-muted-foreground font-normal">— optional</span></Label>
+      <select
+        className="flex h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+        data-testid={`${testPrefix}-${kind}`}
+        value={value?.toString() ?? ""}
+        onChange={(e) => onChange({ ...dims, [kind]: e.target.value ? Number(e.target.value) : null })}
+      >
+        <option value="">— None —</option>
+        {items.filter((it) => it.isActive || it.id === value).map((it) => (
+          <option key={it.id} value={it.id}>{it.name}</option>
+        ))}
+      </select>
+    </div>
+  );
+
+  return (
+    <div className="space-y-3">
+      {enableClass && <Row label="Class" kind="classId" value={dims.classId} items={classes} />}
+      {enableLocation && <Row label="Location" kind="locationId" value={dims.locationId} items={locations} />}
+      {enableProject && <Row label="Project" kind="projectId" value={dims.projectId} items={projects} />}
+    </div>
+  );
+}
 
 type BankTx = {
   id: number;
@@ -468,6 +529,7 @@ function ManualEntryDialog({
   const [amount, setAmount] = useState("");
   const [categoryAccountId, setCategoryAccountId] = useState<number | null>(null);
   const [transferAccountId, setTransferAccountId] = useState<number | null>(null);
+  const [dims, setDims] = useState<Dims>(EMPTY_DIMS);
 
   const incomeAccts = accounts.filter((a) => a.type === "income" || a.type === "equity");
   const expenseAccts = accounts.filter((a) => a.type === "expense");
@@ -492,6 +554,9 @@ function ManualEntryDialog({
       } else {
         body.transferAccountId = transferAccountId;
       }
+      if (dims.classId != null) body.classId = dims.classId;
+      if (dims.locationId != null) body.locationId = dims.locationId;
+      if (dims.projectId != null) body.projectId = dims.projectId;
       const r = await apiRequest("POST", "/api/bank-transactions/manual", body);
       return r.json();
     },
@@ -654,6 +719,9 @@ function ManualEntryDialog({
               </p>
             </div>
           )}
+
+          {/* Class / Location / Project — only the dimensions the org tracks. */}
+          <DimensionSelects dims={dims} onChange={setDims} testPrefix="select-manual-dim" />
         </div>
 
         <DialogFooter>
@@ -896,6 +964,7 @@ function MatchDialog({
   const [categoryAccountId, setCategoryAccountId] = useState<number | null>(null);
   const [transferAccountId, setTransferAccountId] = useState<number | null>(null);
   const [payeeVendorId, setPayeeVendorId] = useState<number | null>(tx.vendorId ?? null);
+  const [dims, setDims] = useState<Dims>(EMPTY_DIMS);
 
   const { data: vendors = [] } = useQuery<{ id: number; name: string }[]>({ queryKey: ["/api/vendors"] });
 
@@ -923,6 +992,13 @@ function MatchDialog({
         if (payeeVendorId) body.vendorId = payeeVendorId;
       }
       if (matchType === "transfer") body.transferAccountId = transferAccountId;
+      // Dimensions apply to the categorize + transfer flows (the two that post
+      // a fresh journal entry we control the lines of).
+      if (matchType === "categorize" || matchType === "transfer") {
+        if (dims.classId != null) body.classId = dims.classId;
+        if (dims.locationId != null) body.locationId = dims.locationId;
+        if (dims.projectId != null) body.projectId = dims.projectId;
+      }
       const r = await apiRequest("POST", `/api/bank-transactions/${tx.id}/match`, body);
       return r.json();
     },
@@ -1059,6 +1135,10 @@ function MatchDialog({
                   </select>
                 </div>
               )}
+              {/* Class / Location / Project — only the dimensions the org tracks. */}
+              <div className="mt-3">
+                <DimensionSelects dims={dims} onChange={setDims} testPrefix="select-categorize-dim" />
+              </div>
             </div>
           )}
 
@@ -1080,6 +1160,10 @@ function MatchDialog({
                   ))}
                 </SelectContent>
               </Select>
+              {/* Class / Location / Project — only the dimensions the org tracks. */}
+              <div className="mt-3">
+                <DimensionSelects dims={dims} onChange={setDims} testPrefix="select-transfer-dim" />
+              </div>
             </div>
           )}
 

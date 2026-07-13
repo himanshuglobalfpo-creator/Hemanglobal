@@ -122,7 +122,14 @@ function AppRouter() {
 // Session info shared with Layout (org switcher / logout) via react-query cache.
 export type Me = {
   user: { id: number; email: string; name: string; emailVerified?: boolean; createdAt?: string } | null;
-  org: { id: number; name: string; slug: string } | null;
+  org: {
+    id: number; name: string; slug: string;
+    // Dimension tracking switches (QBO-style) — gate the class/location/project
+    // pickers across the UI.
+    enableClassTracking?: boolean;
+    enableLocationTracking?: boolean;
+    enableProjectTracking?: boolean;
+  } | null;
   role: string | null;
   orgs: Array<{ id: number; name: string; slug: string; role: string }>;
 };

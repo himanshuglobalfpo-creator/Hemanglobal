@@ -329,6 +329,9 @@ export function registerAuthRoutes(app: Express) {
               stripeClearingAccountId: (req.org as any).stripeClearingAccountId ?? null,
               costingMethod: (req.org as any).costingMethod ?? "average",
               allowNegativeStock: (req.org as any).allowNegativeStock ?? false,
+              enableClassTracking: (req.org as any).enableClassTracking ?? false,
+              enableLocationTracking: (req.org as any).enableLocationTracking ?? false,
+              enableProjectTracking: (req.org as any).enableProjectTracking ?? false,
             }
           : null,
         role: req.role ?? null,
@@ -479,10 +482,17 @@ export function registerAuthRoutes(app: Express) {
         // Inventory settings.
         costingMethod: z.enum(["average", "fifo", "lifo"]).optional(),
         allowNegativeStock: z.boolean().optional(),
+        // Dimension tracking switches (QBO-style).
+        enableClassTracking: z.boolean().optional(),
+        enableLocationTracking: z.boolean().optional(),
+        enableProjectTracking: z.boolean().optional(),
       });
       const data = schema.parse(req.body);
       const updates: Record<string, unknown> = {};
       if (data.allowNegativeStock !== undefined) updates.allowNegativeStock = data.allowNegativeStock;
+      if (data.enableClassTracking !== undefined) updates.enableClassTracking = data.enableClassTracking;
+      if (data.enableLocationTracking !== undefined) updates.enableLocationTracking = data.enableLocationTracking;
+      if (data.enableProjectTracking !== undefined) updates.enableProjectTracking = data.enableProjectTracking;
       if (data.costingMethod !== undefined) {
         // Switching costing method mid-stream would make existing layers/average
         // inconsistent — only allow it before any inventory has moved.

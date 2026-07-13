@@ -3590,6 +3590,10 @@ export class DatabaseStorage {
     const absAmount = Math.abs(amountCents);
     if (absAmount === 0) throw new Error("Amount must be non-zero");
 
+    // Optional dimensions tagged onto both journal lines. postJournalEntry
+    // validates them org-scoped (assertDimensions) before any write.
+    const dims = { classId: input.classId ?? null, locationId: input.locationId ?? null, projectId: input.projectId ?? null };
+
     return await db.transaction(async (tx) => {
       let lines: any[] = [];
       let memo = input.description;
@@ -3598,15 +3602,15 @@ export class DatabaseStorage {
         if (!input.categoryAccountId) throw new Error("categoryAccountId required for deposit");
         if (input.amount <= 0) throw new Error("Deposit amount must be positive");
         lines = [
-          { accountId: input.bankAccountId, debit: absAmount, credit: 0, description: input.description },
-          { accountId: input.categoryAccountId, debit: 0, credit: absAmount, description: input.description },
+          { accountId: input.bankAccountId, debit: absAmount, credit: 0, description: input.description, ...dims },
+          { accountId: input.categoryAccountId, debit: 0, credit: absAmount, description: input.description, ...dims },
         ];
       } else if (input.kind === "withdrawal") {
         if (!input.categoryAccountId) throw new Error("categoryAccountId required for withdrawal");
         if (input.amount >= 0) throw new Error("Withdrawal amount must be negative");
         lines = [
-          { accountId: input.categoryAccountId, debit: absAmount, credit: 0, description: input.description },
-          { accountId: input.bankAccountId, debit: 0, credit: absAmount, description: input.description },
+          { accountId: input.categoryAccountId, debit: absAmount, credit: 0, description: input.description, ...dims },
+          { accountId: input.bankAccountId, debit: 0, credit: absAmount, description: input.description, ...dims },
         ];
       } else if (input.kind === "transfer") {
         if (!input.transferAccountId) throw new Error("transferAccountId required for transfer");
@@ -3617,13 +3621,13 @@ export class DatabaseStorage {
         // If amount is negative, money OUT of bankAccountId to transferAccountId
         if (input.amount > 0) {
           lines = [
-            { accountId: input.bankAccountId, debit: absAmount, credit: 0, description: input.description },
-            { accountId: input.transferAccountId, debit: 0, credit: absAmount, description: input.description },
+            { accountId: input.bankAccountId, debit: absAmount, credit: 0, description: input.description, ...dims },
+            { accountId: input.transferAccountId, debit: 0, credit: absAmount, description: input.description, ...dims },
           ];
         } else {
           lines = [
-            { accountId: input.transferAccountId, debit: absAmount, credit: 0, description: input.description },
-            { accountId: input.bankAccountId, debit: 0, credit: absAmount, description: input.description },
+            { accountId: input.transferAccountId, debit: absAmount, credit: 0, description: input.description, ...dims },
+            { accountId: input.bankAccountId, debit: 0, credit: absAmount, description: input.description, ...dims },
           ];
         }
         memo = `Transfer: ${input.description}`;
@@ -3841,6 +3845,10 @@ export class DatabaseStorage {
       payeeFields = { payee: input.payee, vendorId: null };
     }
 
+    // Optional dimensions tagged onto the categorize/transfer journal lines.
+    // postJournalEntry validates them org-scoped (assertDimensions) before write.
+    const dims = { classId: input.classId ?? null, locationId: input.locationId ?? null, projectId: input.projectId ?? null };
+
     const absAmt = Math.abs(bt.amount);
 
     return await db.transaction(async (tx) => {
@@ -3900,15 +3908,18 @@ export class DatabaseStorage {
         const catAcct = await tx.select().from(accounts).where(and(eq(accounts.id, input.categoryAccountId), eq(accounts.orgId, currentOrgId()))).then((r: any[]) => r[0]);
         if (!catAcct) throw new Error("Category account not found");
         if (catAcct.id === bt.bankAccountId) throw new Error("Category account cannot be the same as the bank account");
+        // Dimensions tag BOTH lines: the category (P&L) line so P&L-by-dimension
+        // picks it up, and the bank (balance-sheet) line so balance-sheet-by-
+        // dimension stays consistent — matching how documents propagate dims.
         const lines =
           bt.amount > 0
             ? [
-                { accountId: bt.bankAccountId, debit: absAmt, credit: 0, description: bt.description },
-                { accountId: input.categoryAccountId, debit: 0, credit: absAmt, description: bt.description },
+                { accountId: bt.bankAccountId, debit: absAmt, credit: 0, description: bt.description, ...dims },
+                { accountId: input.categoryAccountId, debit: 0, credit: absAmt, description: bt.description, ...dims },
               ]
             : [
-                { accountId: input.categoryAccountId, debit: absAmt, credit: 0, description: bt.description },
-                { accountId: bt.bankAccountId, debit: 0, credit: absAmt, description: bt.description },
+                { accountId: input.categoryAccountId, debit: absAmt, credit: 0, description: bt.description, ...dims },
+                { accountId: bt.bankAccountId, debit: 0, credit: absAmt, description: bt.description, ...dims },
               ];
         const { entry } = await this.postJournalEntry({
           date: bt.date,
@@ -3931,12 +3942,12 @@ export class DatabaseStorage {
         const lines =
           bt.amount > 0
             ? [
-                { accountId: bt.bankAccountId, debit: absAmt, credit: 0, description: bt.description },
-                { accountId: input.transferAccountId, debit: 0, credit: absAmt, description: bt.description },
+                { accountId: bt.bankAccountId, debit: absAmt, credit: 0, description: bt.description, ...dims },
+                { accountId: input.transferAccountId, debit: 0, credit: absAmt, description: bt.description, ...dims },
               ]
             : [
-                { accountId: input.transferAccountId, debit: absAmt, credit: 0, description: bt.description },
-                { accountId: bt.bankAccountId, debit: 0, credit: absAmt, description: bt.description },
+                { accountId: input.transferAccountId, debit: absAmt, credit: 0, description: bt.description, ...dims },
+                { accountId: bt.bankAccountId, debit: 0, credit: absAmt, description: bt.description, ...dims },
               ];
         const { entry } = await this.postJournalEntry({
           date: bt.date,

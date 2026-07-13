@@ -154,6 +154,67 @@ function InventorySettings({ org, canEdit }: {
   );
 }
 
+// Dimension tracking switches (QBO-style). Turning one ON reveals its picker
+// across documents, banking, and manual entry. Off by default. Owners/admins
+// only. Deactivating a dimension elsewhere hides it from pickers; this toggle
+// governs whether the dimension is offered at all.
+function DimensionTrackingSettings({ org, canEdit }: {
+  org: {
+    id: number;
+    enableClassTracking?: boolean;
+    enableLocationTracking?: boolean;
+    enableProjectTracking?: boolean;
+  } | null;
+  canEdit: boolean;
+}) {
+  const { toast } = useToast();
+  const [cls, setCls] = useState<boolean>(!!org?.enableClassTracking);
+  const [loc, setLoc] = useState<boolean>(!!org?.enableLocationTracking);
+  const [proj, setProj] = useState<boolean>(!!org?.enableProjectTracking);
+  useEffect(() => {
+    setCls(!!org?.enableClassTracking);
+    setLoc(!!org?.enableLocationTracking);
+    setProj(!!org?.enableProjectTracking);
+  }, [org?.enableClassTracking, org?.enableLocationTracking, org?.enableProjectTracking]);
+
+  const saveMut = useMutation({
+    mutationFn: async () => (await apiRequest("PATCH", `/api/orgs/${org!.id}`, {
+      enableClassTracking: cls, enableLocationTracking: loc, enableProjectTracking: proj,
+    })).json(),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["/api/auth/me"] }); toast({ title: "Saved", description: "Dimension tracking updated." }); },
+    onError: (e: any) => toast({ title: "Error", description: String(e?.message || e), variant: "destructive" }),
+  });
+
+  const Toggle = ({ checked, onChange, label, testId }: { checked: boolean; onChange: (v: boolean) => void; label: string; testId: string }) => (
+    <label className="flex items-center gap-2 text-sm">
+      <input type="checkbox" checked={checked} disabled={!canEdit} onChange={(e) => onChange(e.target.checked)} data-testid={testId} className="h-4 w-4" />
+      {label}
+    </label>
+  );
+
+  return (
+    <Card data-testid="card-dimension-tracking">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2"><Tags className="h-5 w-5" /> Dimension tracking</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          Turn on the dimensions you want to track. When enabled, the picker appears on invoices,
+          bills, journal entries, and banking so you can tag transactions.
+        </p>
+        <Toggle checked={cls} onChange={setCls} label="Track Classes" testId="checkbox-enable-class" />
+        <Toggle checked={loc} onChange={setLoc} label="Track Locations" testId="checkbox-enable-location" />
+        <Toggle checked={proj} onChange={setProj} label="Track Projects (jobs)" testId="checkbox-enable-project" />
+        {canEdit && (
+          <Button onClick={() => saveMut.mutate()} disabled={saveMut.isPending} data-testid="button-save-dimension-tracking">
+            {saveMut.isPending ? "Saving…" : "Save dimension tracking"}
+          </Button>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function Settings() {
   const { toast } = useToast();
 
@@ -375,6 +436,7 @@ export default function Settings() {
         </Card>
 
         <InventorySettings org={org} canEdit={canEdit} />
+        <DimensionTrackingSettings org={org} canEdit={canEdit} />
         <DimensionManager kind="classes" title="Classes" singular="class" canEdit={canEdit} />
         <DimensionManager kind="locations" title="Locations" singular="location" canEdit={canEdit} />
         <DimensionManager kind="projects" title="Projects (jobs)" singular="project" canEdit={canEdit} />
