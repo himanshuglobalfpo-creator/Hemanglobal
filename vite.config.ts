@@ -13,6 +13,16 @@ export default defineConfig({
   },
   root: path.resolve(import.meta.dirname, "client"),
   base: "./",
+  // Dependency pre-bundling (dev) must use the SAME modern target as the
+  // production build below — otherwise it falls back to Vite's default
+  // ("modules"/es2020), and esbuild 0.28 chokes on destructuring shipped by deps
+  // like @floating-ui/core ("Transforming destructuring… is not supported yet"),
+  // crashing `npm run dev` on boot even though the production build is fine.
+  optimizeDeps: {
+    esbuildOptions: {
+      target: "es2022",
+    },
+  },
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
