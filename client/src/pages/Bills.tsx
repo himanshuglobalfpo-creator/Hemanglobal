@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Plus, Trash2, DollarSign, FileDown, Paperclip } from "lucide-react";
+import { Plus, Trash2, DollarSign, FileDown, Paperclip, Ban } from "lucide-react";
 import type { Account, Vendor, Bill } from "@shared/schema";
 import { useOpenOnCreateParam } from "@/lib/create-shortcut";
 import { Layout, PageHeader } from "@/components/Layout";
@@ -60,6 +60,12 @@ export default function Bills() {
   }
   // Opened from the global "+ Create → Bill" shortcut.
   useOpenOnCreateParam(openCreate);
+
+  const voidMut = useMutation({
+    mutationFn: async (id: number) => (await apiRequest("POST", `/api/bills/${id}/void`)).json(),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["/api/bills"] }); queryClient.invalidateQueries({ queryKey: ["/api/dashboard"] }); toast({ title: "Bill voided" }); },
+    onError: (e: any) => toast({ title: "Void failed", description: e.message, variant: "destructive" }),
+  });
 
   const createMut = useMutation({
     mutationFn: async () => {
@@ -151,6 +157,11 @@ export default function Bills() {
                         <Button size="sm" variant="ghost" onClick={() => setAttachFor(attachFor === b.id ? null : b.id)} title="Attachments">
                           <Paperclip className="h-4 w-4" />
                         </Button>
+                        {b.status !== "void" && b.status !== "paid" && (
+                          <Button size="sm" variant="ghost" onClick={() => { if (confirm(`Void bill ${b.number}? This reverses its journal entry.`)) voidMut.mutate(b.id); }} data-testid={`button-void-bill-${b.id}`} title="Void bill">
+                            <Ban className="h-4 w-4" />
+                          </Button>
+                        )}
                       </div>
                     </td>
                   </tr>

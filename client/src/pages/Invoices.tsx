@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Plus, Trash2, DollarSign, FileDown, Send, Link as LinkIcon, Check, Paperclip, Settings2, ChevronDown } from "lucide-react";
+import { Plus, Trash2, DollarSign, FileDown, Send, Link as LinkIcon, Check, Paperclip, Settings2, ChevronDown, Ban, CreditCard } from "lucide-react";
 import type { Account, Customer, Invoice, Item, InvoiceSettings } from "@shared/schema";
 import { defaultInvoiceSettings } from "@shared/schema";
 import { useOpenOnCreateParam } from "@/lib/create-shortcut";
@@ -47,7 +47,22 @@ export default function Invoices() {
   const [attachFor, setAttachFor] = useState<number | null>(null);
   const [payOpen, setPayOpen] = useState<number | null>(null);
   const [sendOpen, setSendOpen] = useState<number | null>(null);
+  const [sharesOpen, setSharesOpen] = useState<number | null>(null);
   const [manageOpen, setManageOpen] = useState(false);
+
+  const voidMut = useMutation({
+    mutationFn: async (id: number) => (await apiRequest("POST", `/api/invoices/${id}/void`)).json(),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["/api/invoices"] }); queryClient.invalidateQueries({ queryKey: ["/api/dashboard"] }); toast({ title: "Invoice voided" }); },
+    onError: (e: any) => toast({ title: "Void failed", description: e.message, variant: "destructive" }),
+  });
+  const paymentLinkMut = useMutation({
+    mutationFn: async (id: number) => (await apiRequest("POST", `/api/invoices/${id}/payment-link`, {})).json(),
+    onSuccess: async (data: any) => {
+      await navigator.clipboard.writeText(data.url).catch(() => {});
+      toast({ title: "Payment link ready", description: "Stripe Checkout link copied to your clipboard." });
+    },
+    onError: (e: any) => toast({ title: "Payment link failed", description: e.message, variant: "destructive" }),
+  });
 
   const { data: invoices = [] } = useQuery<(Invoice & { customerName?: string })[]>({ queryKey: ["/api/invoices"] });
   const { data: customers = [] } = useQuery<Customer[]>({ queryKey: ["/api/customers"] });
@@ -225,9 +240,22 @@ export default function Invoices() {
                             <DollarSign className="h-4 w-4" />
                           </Button>
                         )}
+                        {i.status !== "void" && i.status !== "paid" && balance > 0 && (
+                          <Button size="sm" variant="ghost" onClick={() => paymentLinkMut.mutate(i.id)} disabled={paymentLinkMut.isPending} data-testid={`button-payment-link-invoice-${i.id}`} title="Stripe payment link">
+                            <CreditCard className="h-4 w-4" />
+                          </Button>
+                        )}
+                        <Button size="sm" variant="ghost" onClick={() => setSharesOpen(i.id)} data-testid={`button-shares-invoice-${i.id}`} title="Manage share links">
+                          <LinkIcon className="h-4 w-4" />
+                        </Button>
                         <Button size="sm" variant="ghost" onClick={() => setAttachFor(attachFor === i.id ? null : i.id)} title="Attachments">
                           <Paperclip className="h-4 w-4" />
                         </Button>
+                        {i.status !== "void" && i.status !== "paid" && (
+                          <Button size="sm" variant="ghost" onClick={() => { if (confirm(`Void invoice ${i.number}? This reverses its journal entry.`)) voidMut.mutate(i.id); }} data-testid={`button-void-invoice-${i.id}`} title="Void invoice">
+                            <Ban className="h-4 w-4" />
+                          </Button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -581,7 +609,72 @@ export default function Invoices() {
           onClose={() => setPayOpen(null)}
         />
       )}
+
+      {/* Share links manager */}
+      {sharesOpen !== null && (
+        <InvoiceSharesDialog invoiceId={sharesOpen} onClose={() => setSharesOpen(null)} />
+      )}
     </Layout>
+  );
+}
+
+// Manage an invoice's public share links: list, create, copy, revoke.
+function InvoiceSharesDialog({ invoiceId, onClose }: { invoiceId: number; onClose: () => void }) {
+  const { toast } = useToast();
+  const { data: shares = [] } = useQuery<any[]>({
+    queryKey: ["/api/invoices", invoiceId, "shares"],
+    queryFn: async () => (await apiRequest("GET", `/api/invoices/${invoiceId}/shares`)).json(),
+  });
+  const createMut = useMutation({
+    mutationFn: async () => (await apiRequest("POST", `/api/invoices/${invoiceId}/share`, {})).json(),
+    onSuccess: async (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/invoices", invoiceId, "shares"] });
+      await navigator.clipboard.writeText(data.url).catch(() => {});
+      toast({ title: "Share link created", description: "Copied to your clipboard." });
+    },
+    onError: (e: any) => toast({ title: "Failed", description: e.message, variant: "destructive" }),
+  });
+  const revokeMut = useMutation({
+    mutationFn: async (shareId: number) => (await apiRequest("POST", `/api/invoices/shares/${shareId}/revoke`, {})).json(),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["/api/invoices", invoiceId, "shares"] }); toast({ title: "Link revoked" }); },
+    onError: (e: any) => toast({ title: "Revoke failed", description: e.message, variant: "destructive" }),
+  });
+
+  return (
+    <Dialog open onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader><DialogTitle>Share links</DialogTitle></DialogHeader>
+        <div className="space-y-2">
+          {shares.length === 0 && <p className="text-sm text-muted-foreground">No share links yet.</p>}
+          {shares.map((s) => {
+            const revoked = !!s.revokedAt;
+            const url = `${window.location.origin}/#/p/invoice/${s.token}`;
+            return (
+              <div key={s.id} className="flex items-center justify-between gap-2 rounded-md border border-border px-3 py-2 text-sm" data-testid={`row-share-${s.id}`}>
+                <span className="min-w-0">
+                  <span className={`font-mono text-xs truncate ${revoked ? "line-through text-muted-foreground" : ""}`}>…{String(s.token).slice(-10)}</span>
+                  <span className="text-xs text-muted-foreground ml-2">{revoked ? "revoked" : `${s.viewCount ?? 0} views`}</span>
+                </span>
+                <span className="flex items-center gap-1 shrink-0">
+                  {!revoked && (
+                    <>
+                      <Button size="sm" variant="ghost" onClick={() => navigator.clipboard.writeText(url).catch(() => {})} title="Copy"><LinkIcon className="h-3.5 w-3.5" /></Button>
+                      <Button size="sm" variant="ghost" onClick={() => revokeMut.mutate(s.id)} data-testid={`button-revoke-share-${s.id}`}>Revoke</Button>
+                    </>
+                  )}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => createMut.mutate()} disabled={createMut.isPending} data-testid="button-create-share">
+            <LinkIcon className="h-4 w-4 mr-1.5" />{createMut.isPending ? "Creating…" : "New share link"}
+          </Button>
+          <Button onClick={onClose} data-testid="button-close-shares">Done</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
