@@ -27,6 +27,7 @@ import {
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import type { Me } from "@/App";
+import { DataImporters } from "@/components/DataImporters";
 
 type StripeStatus = {
   configured: boolean;
@@ -440,6 +441,7 @@ export default function Settings() {
         <DimensionManager kind="classes" title="Classes" singular="class" canEdit={canEdit} />
         <DimensionManager kind="locations" title="Locations" singular="location" canEdit={canEdit} />
         <DimensionManager kind="projects" title="Projects (jobs)" singular="project" canEdit={canEdit} />
+        {canEdit && <DataImporters />}
       </div>
     </Layout>
   );
