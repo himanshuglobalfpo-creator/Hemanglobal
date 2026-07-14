@@ -41,6 +41,7 @@ const CreditNotes = lazy(() => import("@/pages/CreditNotes"));
 const DebitNotes = lazy(() => import("@/pages/DebitNotes"));
 const PurchaseOrders = lazy(() => import("@/pages/PurchaseOrders"));
 const FixedAssets = lazy(() => import("@/pages/FixedAssets"));
+const Payroll = lazy(() => import("@/pages/Payroll"));
 
 // Shown while a lazily-loaded page chunk is being fetched.
 function PageLoader() {
@@ -129,6 +130,7 @@ function AppRouter() {
       <Route path="/debit-notes" component={DebitNotes} />
       <Route path="/purchase-orders" component={PurchaseOrders} />
       <Route path="/fixed-assets" component={FixedAssets} />
+      <Route path="/payroll" component={Payroll} />
       <Route component={NotFound} />
     </Switch>
     </Suspense>
