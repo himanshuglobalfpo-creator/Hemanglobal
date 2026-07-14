@@ -29,6 +29,7 @@ import {
   FileMinus,
   FilePlus,
   ClipboardList,
+  Boxes,
   Settings as SettingsIcon,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -72,6 +73,7 @@ const NAV = [
   { href: "/items", label: "Products & Services", icon: Package },
   { href: "/budgets", label: "Budgeting", icon: PiggyBank },
   { href: "/accounts", label: "Chart of Accounts", icon: Library },
+  { href: "/fixed-assets", label: "Fixed Assets", icon: Boxes },
   { href: "/journal", label: "Journal", icon: BookOpen },
   { href: "/reports", label: "Reports", icon: BarChart3 },
   { href: "/statements", label: "Statements", icon: Mail },
