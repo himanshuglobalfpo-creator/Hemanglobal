@@ -65,6 +65,10 @@ export default function Reports() {
           <TabsTrigger value="ar" data-testid="tab-ar">A/R Aging</TabsTrigger>
           <TabsTrigger value="ap" data-testid="tab-ap">A/P Aging</TabsTrigger>
           <TabsTrigger value="inv" data-testid="tab-inv">Inventory</TabsTrigger>
+          <TabsTrigger value="sbc" data-testid="tab-sbc">Sales by Customer</TabsTrigger>
+          <TabsTrigger value="ebv" data-testid="tab-ebv">Expenses by Vendor</TabsTrigger>
+          <TabsTrigger value="plm" data-testid="tab-plm">Monthly P&L</TabsTrigger>
+          <TabsTrigger value="1099" data-testid="tab-1099">1099 Summary</TabsTrigger>
         </TabsList>
         <TabsContent value="pl" className="mt-4"><ProfitLoss /></TabsContent>
         <TabsContent value="ppl" className="mt-4"><ProjectPL /></TabsContent>
@@ -75,6 +79,10 @@ export default function Reports() {
         <TabsContent value="ar" className="mt-4"><ARAging /></TabsContent>
         <TabsContent value="ap" className="mt-4"><APAging /></TabsContent>
         <TabsContent value="inv" className="mt-4"><InventoryReport /></TabsContent>
+        <TabsContent value="sbc" className="mt-4"><SalesByCustomer /></TabsContent>
+        <TabsContent value="ebv" className="mt-4"><ExpensesByVendor /></TabsContent>
+        <TabsContent value="plm" className="mt-4"><MonthlyPL /></TabsContent>
+        <TabsContent value="1099" className="mt-4"><Summary1099 /></TabsContent>
       </Tabs>
     </Layout>
   );
@@ -669,5 +677,136 @@ function InventoryReport() {
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Sales by Customer
+// ────────────────────────────────────────────────────────────────────────────
+function SalesByCustomer() {
+  const [from, setFrom] = useState(startOfYearISO());
+  const [to, setTo] = useState(todayISO());
+  const { data = [] } = useQuery<any[]>({
+    queryKey: ["/api/reports/sales-by-customer", from, to],
+    queryFn: async () => (await apiRequest("GET", `/api/reports/sales-by-customer?from=${from}&to=${to}`)).json(),
+  });
+  return (
+    <Card><CardContent className="p-6">
+      <div className="flex items-end gap-3 mb-6"><div><Label>From</Label><Input type="date" data-testid="input-sbc-from" value={from} onChange={(e) => setFrom(e.target.value)} /></div><div><Label>To</Label><Input type="date" data-testid="input-sbc-to" value={to} onChange={(e) => setTo(e.target.value)} /></div></div>
+      <table className="w-full text-sm">
+        <thead className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground"><tr><th className="text-left px-3 py-2 font-medium">Customer</th><th className="text-right px-3 py-2 font-medium">Invoiced</th><th className="text-right px-3 py-2 font-medium">Net</th><th className="text-right px-3 py-2 font-medium">Paid</th><th className="text-right px-3 py-2 font-medium">Balance</th></tr></thead>
+        <tbody>
+          {data.length === 0 && <tr><td colSpan={5} className="px-3 py-8 text-center text-muted-foreground">No sales in this range.</td></tr>}
+          {data.map((r) => (
+            <tr key={r.customerId} className="border-b border-border/40" data-testid={`row-sbc-${r.customerId}`}>
+              <td className="px-3 py-1.5">{r.customerName}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.invoiced)}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.net)}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.paid)}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.balance)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </CardContent></Card>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Expenses by Vendor
+// ────────────────────────────────────────────────────────────────────────────
+function ExpensesByVendor() {
+  const [from, setFrom] = useState(startOfYearISO());
+  const [to, setTo] = useState(todayISO());
+  const { data = [] } = useQuery<any[]>({
+    queryKey: ["/api/reports/expenses-by-vendor", from, to],
+    queryFn: async () => (await apiRequest("GET", `/api/reports/expenses-by-vendor?from=${from}&to=${to}`)).json(),
+  });
+  return (
+    <Card><CardContent className="p-6">
+      <div className="flex items-end gap-3 mb-6"><div><Label>From</Label><Input type="date" data-testid="input-ebv-from" value={from} onChange={(e) => setFrom(e.target.value)} /></div><div><Label>To</Label><Input type="date" data-testid="input-ebv-to" value={to} onChange={(e) => setTo(e.target.value)} /></div></div>
+      <table className="w-full text-sm">
+        <thead className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground"><tr><th className="text-left px-3 py-2 font-medium">Vendor</th><th className="text-right px-3 py-2 font-medium">Billed</th><th className="text-right px-3 py-2 font-medium">Net</th><th className="text-right px-3 py-2 font-medium">Paid</th><th className="text-right px-3 py-2 font-medium">Balance</th></tr></thead>
+        <tbody>
+          {data.length === 0 && <tr><td colSpan={5} className="px-3 py-8 text-center text-muted-foreground">No expenses in this range.</td></tr>}
+          {data.map((r) => (
+            <tr key={r.vendorId} className="border-b border-border/40" data-testid={`row-ebv-${r.vendorId}`}>
+              <td className="px-3 py-1.5">{r.vendorName}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.billed)}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.net)}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.paid)}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.balance)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </CardContent></Card>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Monthly P&L (pivot: one column per calendar month)
+// ────────────────────────────────────────────────────────────────────────────
+function MonthlyPL() {
+  const [from, setFrom] = useState(startOfYearISO());
+  const [to, setTo] = useState(todayISO());
+  const { data } = useQuery<any>({
+    queryKey: ["/api/reports/profit-loss-monthly", from, to],
+    queryFn: async () => (await apiRequest("GET", `/api/reports/profit-loss-monthly?from=${from}&to=${to}`)).json(),
+  });
+  if (!data) return <Loader />;
+  const months: string[] = data.months ?? [];
+  const income = (data.accounts ?? []).filter((a: any) => a.type === "income");
+  const expenses = (data.accounts ?? []).filter((a: any) => a.type === "expense");
+  return (
+    <Card><CardContent className="p-6 overflow-x-auto">
+      <div className="flex items-end gap-3 mb-6"><div><Label>From</Label><Input type="date" data-testid="input-plm-from" value={from} onChange={(e) => setFrom(e.target.value)} /></div><div><Label>To</Label><Input type="date" data-testid="input-plm-to" value={to} onChange={(e) => setTo(e.target.value)} /></div></div>
+      <table className="w-full text-sm min-w-[600px]" data-testid="table-plm">
+        <thead className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground">
+          <tr><th className="text-left px-3 py-2 font-medium">Account</th>{months.map((m) => <th key={m} className="text-right px-3 py-2 font-medium">{m}</th>)}<th className="text-right px-3 py-2 font-medium">Total</th></tr>
+        </thead>
+        <tbody>
+          <tr className="bg-muted/30"><td colSpan={months.length + 2} className="px-3 py-1.5 font-semibold uppercase tracking-wide text-xs text-muted-foreground">Income</td></tr>
+          {income.map((a: any) => (
+            <tr key={a.accountId} className="border-b border-border/40"><td className="px-3 py-1.5">{a.code} {a.name}</td>{months.map((m) => <td key={m} className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(a.byMonth[m] ?? 0)}</td>)}<td className="px-3 py-1.5 text-right tabular-nums font-medium">{fmtMoney(a.total)}</td></tr>
+          ))}
+          <tr className="bg-muted/30"><td colSpan={months.length + 2} className="px-3 py-1.5 font-semibold uppercase tracking-wide text-xs text-muted-foreground">Expenses</td></tr>
+          {expenses.map((a: any) => (
+            <tr key={a.accountId} className="border-b border-border/40"><td className="px-3 py-1.5">{a.code} {a.name}</td>{months.map((m) => <td key={m} className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(a.byMonth[m] ?? 0)}</td>)}<td className="px-3 py-1.5 text-right tabular-nums font-medium">{fmtMoney(a.total)}</td></tr>
+          ))}
+          <tr className="border-t-2 border-foreground font-semibold"><td className="px-3 py-2">Net</td>{months.map((m) => <td key={m} className="px-3 py-2 text-right tabular-nums">{fmtMoney(data.netByMonth?.[m] ?? 0)}</td>)}<td className="px-3 py-2"></td></tr>
+        </tbody>
+      </table>
+    </CardContent></Card>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 1099 Summary
+// ────────────────────────────────────────────────────────────────────────────
+function Summary1099() {
+  const [year, setYear] = useState(new Date().getFullYear());
+  const { data } = useQuery<any>({
+    queryKey: ["/api/reports/1099-summary", year],
+    queryFn: async () => (await apiRequest("GET", `/api/reports/1099-summary?year=${year}`)).json(),
+  });
+  if (!data) return <Loader />;
+  return (
+    <Card><CardContent className="p-6">
+      <div className="flex items-end gap-3 mb-6"><div><Label>Year</Label><Input type="number" className="w-28" data-testid="input-1099-year" value={year} onChange={(e) => setYear(Number(e.target.value))} /></div></div>
+      <table className="w-full text-sm">
+        <thead className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground"><tr><th className="text-left px-3 py-2 font-medium">Vendor</th><th className="text-left px-3 py-2 font-medium">Tax ID</th><th className="text-right px-3 py-2 font-medium">Paid (cash)</th></tr></thead>
+        <tbody>
+          {(data.rows ?? []).length === 0 && <tr><td colSpan={3} className="px-3 py-8 text-center text-muted-foreground">No 1099-reportable vendors above the threshold for {year}.</td></tr>}
+          {(data.rows ?? []).map((r: any) => (
+            <tr key={r.vendorId} className="border-b border-border/40" data-testid={`row-1099-${r.vendorId}`}>
+              <td className="px-3 py-1.5">{r.name}</td>
+              <td className="px-3 py-1.5 font-mono text-xs">{r.taxId || <span className="text-destructive">missing</span>}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.paidCents)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </CardContent></Card>
   );
 }

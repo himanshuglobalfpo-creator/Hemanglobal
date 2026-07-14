@@ -278,6 +278,51 @@ export default function PeriodClose() {
           </Table>
         </CardContent>
       </Card>
+
+      <FxRevaluationCard />
     </Layout>
+  );
+}
+
+// Period-end FX revaluation: restate open foreign-currency balances at the
+// as-of rate and post the unrealized gain/loss. Over POST /api/fx/revalue.
+function FxRevaluationCard() {
+  const { toast } = useToast();
+  const [asOfDate, setAsOfDate] = useState(todayISO());
+  const { data: revsRaw } = useQuery<any>({ queryKey: ["/api/fx/revaluations"], queryFn: async () => (await apiRequest("GET", "/api/fx/revaluations?limit=20")).json() });
+  const revaluations: any[] = Array.isArray(revsRaw) ? revsRaw : revsRaw?.rows ?? [];
+
+  const revalueMut = useMutation({
+    mutationFn: async () => (await apiRequest("POST", "/api/fx/revalue", { asOfDate })).json(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/fx/revaluations"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/journal"] });
+      toast({ title: "FX revaluation posted", description: `Open foreign balances restated as of ${asOfDate}.` });
+    },
+    onError: (e: any) => toast({ title: "Revaluation failed", description: e.message, variant: "destructive" }),
+  });
+
+  return (
+    <Card className="mt-6" data-testid="card-fx-revaluation">
+      <CardHeader><CardTitle className="text-base">FX revaluation</CardTitle></CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-sm text-muted-foreground">Restate open foreign-currency balances at the period-end rate and post the unrealized gain/loss. Requires FX rates for the as-of date (Settings → FX rates).</p>
+        <div className="flex items-end gap-3">
+          <div><Label htmlFor="fx-asof">As-of date</Label><Input id="fx-asof" type="date" className="w-44" data-testid="input-fx-asof" value={asOfDate} onChange={(e) => setAsOfDate(e.target.value)} /></div>
+          <Button onClick={() => revalueMut.mutate()} disabled={revalueMut.isPending} data-testid="button-fx-revalue">{revalueMut.isPending ? "Posting…" : "Run revaluation"}</Button>
+        </div>
+        {revaluations.length > 0 && (
+          <div className="rounded-md border border-border" data-testid="list-fx-revaluations">
+            <div className="px-3 py-2 text-xs uppercase tracking-wide text-muted-foreground border-b border-border">Recent revaluations</div>
+            {revaluations.slice(0, 8).map((r) => (
+              <div key={r.id} className="flex items-center justify-between px-3 py-1.5 text-sm border-b border-border last:border-0" data-testid={`row-fx-revaluation-${r.id}`}>
+                <span>{fmtDate(r.asOfDate ?? r.date)}</span>
+                <span className="tabular-nums text-muted-foreground">{fmtMoney(r.gainLossCents ?? r.adjustmentCents ?? 0)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }

@@ -29,6 +29,7 @@ import { useToast } from "@/hooks/use-toast";
 import type { Me } from "@/App";
 import { DataImporters } from "@/components/DataImporters";
 import { WebhooksManager } from "@/components/WebhooksManager";
+import { FxRatesEditor } from "@/components/FxRatesEditor";
 
 type StripeStatus = {
   configured: boolean;
@@ -442,6 +443,7 @@ export default function Settings() {
         <DimensionManager kind="classes" title="Classes" singular="class" canEdit={canEdit} />
         <DimensionManager kind="locations" title="Locations" singular="location" canEdit={canEdit} />
         <DimensionManager kind="projects" title="Projects (jobs)" singular="project" canEdit={canEdit} />
+        {canEdit && <FxRatesEditor />}
         {canEdit && <DataImporters />}
         {canEdit && <WebhooksManager />}
       </div>
