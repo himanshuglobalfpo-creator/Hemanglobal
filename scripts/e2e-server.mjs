@@ -1,7 +1,7 @@
 // ============================================================================
 // E2E app server launcher (used by playwright.config.ts `webServer`)
 // ============================================================================
-// Starts the PRODUCTION build of the app (node dist/index.js) against a
+// Starts the PRODUCTION build of the app (node dist/index.mjs) against a
 // throwaway Postgres so Playwright can drive real signup → invoice → payment →
 // trial-balance flows end to end.
 //
@@ -9,7 +9,7 @@
 //   • DATABASE_URL unset → boot embedded-postgres, create a fresh DB, and point
 //     the app at it. Torn down on exit.
 //
-// Requires a prior `npm run build` (serves dist/public + dist/index.js). The CI
+// Requires a prior `npm run build` (serves dist/public + dist/index.mjs). The CI
 // workflow builds before the e2e step; locally, run `npm run build` first.
 //
 // Port: E2E_PORT (default 5099).
@@ -55,7 +55,7 @@ async function main() {
     databaseUrl = pg.url;
   }
 
-  child = spawn("node", ["dist/index.js"], {
+  child = spawn("node", ["dist/index.mjs"], {
     env: {
       ...process.env,
       NODE_ENV: "production",

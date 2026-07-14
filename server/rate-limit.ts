@@ -17,8 +17,12 @@
 // an authenticated user's budget follows them across IPs, and unauthenticated
 // traffic still degrades gracefully to per-IP.
 
+import { createRequire } from "node:module";
 import type { Request, Response } from "express";
 import { logger } from "./logger";
+
+// ESM-safe require (production bundle is ESM; global `require` is absent there).
+const require = createRequire(import.meta.url);
 
 export type RateLimiter = (req: Request, res: Response, next: () => void) => void;
 

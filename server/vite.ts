@@ -3,7 +3,7 @@ import { createServer as createViteServer, createLogger } from "vite";
 import type { Server } from 'node:http';
 import fs from "node:fs";
 import path from "node:path";
-import { nanoid } from "nanoid";
+import crypto from "node:crypto";
 import viteConfig from "../vite.config";
 
 const viteLogger = createLogger();
@@ -46,7 +46,7 @@ export async function setupVite(server: Server, app: Express) {
       let template = await fs.promises.readFile(clientTemplate, "utf-8");
       template = template.replace(
         `src="/src/main.tsx"`,
-        `src="/src/main.tsx?v=${nanoid()}"`,
+        `src="/src/main.tsx?v=${crypto.randomUUID()}"`,
       );
       const page = await vite.transformIndexHtml(url, template);
       res.status(200).set({ "Content-Type": "text/html" }).end(page);

@@ -18,6 +18,7 @@
 //   GET  /p/invoice/:token/pay             — public: redirect customer to Stripe Checkout
 //   POST /api/stripe/webhook               — Stripe → us, marks invoice paid
 
+import { createRequire } from "node:module";
 import type { Express, Request, Response } from "express";
 import { accounts } from "@shared/schema";
 import { organizations } from "@shared/auth-schema";
@@ -27,6 +28,11 @@ import { db, storage } from "./storage";
 import { appBaseUrl } from "./email";
 import { withOrg } from "./org-scope";
 import { logger } from "./logger";
+
+// ESM-safe require: the production bundle is ESM (dist/index.mjs), where the
+// global `require` doesn't exist. createRequire rebuilds it from this module's
+// URL so lazy-loading optional native deps works in dev AND prod.
+const require = createRequire(import.meta.url);
 
 // Exact message the webhook/UI contract depends on — do not reword casually.
 export const CLEARING_ACCOUNT_NOT_CONFIGURED =
@@ -83,7 +89,6 @@ function getStripe(): any | null {
   }
   try {
     // Lazy require so the server boots even when stripe isn't installed yet.
-     
     const Stripe = require("stripe");
     _stripe = new Stripe(key, { apiVersion: "2024-06-20" });
     return _stripe;

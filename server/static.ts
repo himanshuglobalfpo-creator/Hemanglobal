@@ -8,7 +8,7 @@ export function serveStatic(app: Express) {
   // Resolve relative to the EXECUTING file. `__dirname` gets inlined by esbuild
   // as the *source* directory ("server/"), which doesn't exist next to the
   // production bundle — import.meta.url survives bundling and points at
-  // dist/index.js, so this finds dist/public exactly where vite wrote it.
+  // dist/index.mjs, so this finds dist/public exactly where vite wrote it.
   const here = path.dirname(fileURLToPath(import.meta.url));
   const distPath = path.resolve(here, "public");
   if (!fs.existsSync(distPath)) {

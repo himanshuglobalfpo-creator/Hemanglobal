@@ -20,7 +20,11 @@
  *      storage.importBankTransactions, persists the new cursor.
  */
 
+import { createRequire } from "node:module";
 import { logger } from "./logger";
+
+// ESM-safe require (production bundle is ESM; global `require` is absent there).
+const require = createRequire(import.meta.url);
 
 let _plaid: any = null;
 let _plaidLoadError: string | null = null;

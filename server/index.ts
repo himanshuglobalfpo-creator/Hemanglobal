@@ -249,7 +249,11 @@ app.use((req, res, next) => {
   if (process.env.NODE_ENV === "production") {
     serveStatic(app);
   } else {
-    const { setupVite } = await import("./vite");
+    // Non-analyzable specifier so esbuild does NOT statically hoist ./vite (and
+    // its dev-only deps: vite, @vitejs/plugin-react) into the production bundle.
+    // Guarded by NODE_ENV, this path never runs in production.
+    const mod = "./vite" + "";
+    const { setupVite } = await import(/* @vite-ignore */ mod);
     await setupVite(httpServer, app);
   }
 
