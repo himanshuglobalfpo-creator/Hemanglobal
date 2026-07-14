@@ -28,6 +28,7 @@ import {
   FileSignature,
   FileMinus,
   FilePlus,
+  ClipboardList,
   Settings as SettingsIcon,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -60,6 +61,7 @@ const NAV = [
   { href: "/credit-notes", label: "Credit Notes", icon: FileMinus },
   { href: "/bills", label: "Bills", icon: Receipt },
   { href: "/debit-notes", label: "Debit Notes", icon: FilePlus },
+  { href: "/purchase-orders", label: "Purchase Orders", icon: ClipboardList },
   { href: "/banking", label: "Banking", icon: Landmark },
   { href: "/transactions", label: "Transactions", icon: ListFilter },
   { href: "/reconciliation", label: "Reconcile", icon: CheckSquare },
@@ -273,6 +275,7 @@ const CREATE_COLUMNS: CreateColumn[] = [
       { label: "Expense", path: "/banking", create: true, testId: "create-expense" },
       { label: "Pay bills", path: "/bills", testId: "create-pay-bills" },
       { label: "Debit note", path: "/debit-notes", create: true, testId: "create-debit-note" },
+      { label: "Purchase order", path: "/purchase-orders", create: true, testId: "create-po" },
       { label: "Add vendor", path: "/vendors", create: true, testId: "create-vendor" },
     ],
   },
