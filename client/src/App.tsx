@@ -36,6 +36,7 @@ const Security = lazy(() => import("@/pages/Security"));
 const Settings = lazy(() => import("@/pages/Settings"));
 const ProductsServices = lazy(() => import("@/pages/ProductsServices"));
 const Budgeting = lazy(() => import("@/pages/Budgeting"));
+const Estimates = lazy(() => import("@/pages/Estimates"));
 
 // Shown while a lazily-loaded page chunk is being fetched.
 function PageLoader() {
@@ -119,6 +120,7 @@ function AppRouter() {
       <Route path="/settings" component={Settings} />
       <Route path="/items" component={ProductsServices} />
       <Route path="/budgets" component={Budgeting} />
+      <Route path="/estimates" component={Estimates} />
       <Route component={NotFound} />
     </Switch>
     </Suspense>

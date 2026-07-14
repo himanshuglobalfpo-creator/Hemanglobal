@@ -25,6 +25,7 @@ import {
   Plus,
   Package,
   PiggyBank,
+  FileSignature,
   Settings as SettingsIcon,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -53,6 +54,7 @@ import {
 const NAV = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/invoices", label: "Invoices", icon: FileText },
+  { href: "/estimates", label: "Estimates", icon: FileSignature },
   { href: "/bills", label: "Bills", icon: Receipt },
   { href: "/banking", label: "Banking", icon: Landmark },
   { href: "/transactions", label: "Transactions", icon: ListFilter },
@@ -252,6 +254,7 @@ const CREATE_COLUMNS: CreateColumn[] = [
     heading: "Customers",
     items: [
       { label: "Invoice", path: "/invoices", create: true, testId: "create-invoice" },
+      { label: "Estimate", path: "/estimates", create: true, testId: "create-estimate-doc" },
       { label: "Receive payment", path: "/invoices", testId: "create-receive-payment" },
       { label: "Recurring payment", path: "/recurring", create: true, testId: "create-recurring" },
       { label: "Statement", path: "/statements", testId: "create-statement" },
