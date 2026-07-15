@@ -46,6 +46,9 @@ import {
   priceRuleCustomers,
   jobs,
   reportSchedules,
+  taxFilingPeriods,
+  type TaxFilingPeriod,
+  type CreateTaxFilingPeriodInput,
   type PriceRule,
   type CreatePriceRuleInput,
   type Job,
@@ -1917,6 +1920,122 @@ export class DatabaseStorage {
       [currentOrgId()]
     )).rows[0] as any;
     return { lastFetchDate: r.lastFetchDate ?? null, systemRateCount: r.systemRateCount ?? 0 };
+  }
+
+  // --------------------------------------------------------------------------
+  // SALES-TAX FILING WORKFLOW (P3.8)
+  // --------------------------------------------------------------------------
+  // Liability for a state over a period = the tax collected on that state's tax
+  // codes. Each invoice's `tax` equals its Sales Tax Payable credit, so this is
+  // exactly the sum of the period's tax JE lines. Void invoices are excluded;
+  // credit notes reduce the liability.
+  // The GL liability accounts a state's tax codes post to (createInvoice credits
+  // the tax code's liabilityAccountId; taxLiabilityReport scopes the same way).
+  private async stateTaxAccountIds(stateCode: string): Promise<number[]> {
+    const rows = (await pool.query(
+      `SELECT DISTINCT liability_account_id AS id FROM tax_codes WHERE org_id = $1 AND upper(state_code) = $2`,
+      [currentOrgId(), stateCode.toUpperCase()]
+    )).rows as any[];
+    return rows.map((r) => r.id as number);
+  }
+
+  // Liability = tax COLLECTED on the state's tax accounts in the period (credits
+  // minus debit adjustments like credit-note reversals), EXCLUDING remittance
+  // payments. Each invoice's tax is a credit to its code's liability account, so
+  // this equals the sum of the period's tax JE lines for that state.
+  async computeStateTaxLiability(stateCode: string, from: string, to: string): Promise<number> {
+    const acctIds = await this.stateTaxAccountIds(stateCode);
+    if (acctIds.length === 0) return 0;
+    const r = (await pool.query(
+      `SELECT COALESCE(SUM(jl.credit - jl.debit), 0)::bigint AS liab
+         FROM journal_lines jl JOIN journal_entries je ON je.id = jl.entry_id
+        WHERE je.org_id = $1 AND je.date BETWEEN $2 AND $3
+          AND je.source <> 'sales_tax_payment'
+          AND jl.account_id = ANY($4)`,
+      [currentOrgId(), from, to, acctIds]
+    )).rows[0] as any;
+    return Number(r.liab);
+  }
+
+  // Net movement on a state's tax accounts over a range INCLUDING payments —
+  // proves a recorded payment clears the period's payable to zero.
+  async stateTaxPayableMovement(stateCode: string, from: string, to: string): Promise<number> {
+    const acctIds = await this.stateTaxAccountIds(stateCode);
+    if (acctIds.length === 0) return 0;
+    const r = (await pool.query(
+      `SELECT COALESCE(SUM(jl.credit - jl.debit), 0)::bigint AS m
+         FROM journal_lines jl JOIN journal_entries je ON je.id = jl.entry_id
+        WHERE je.org_id = $1 AND je.date BETWEEN $2 AND $3 AND jl.account_id = ANY($4)`,
+      [currentOrgId(), from, to, acctIds]
+    )).rows[0] as any;
+    return Number(r.m);
+  }
+
+  async listTaxFilingPeriods(): Promise<Array<TaxFilingPeriod & { liveLiability: number }>> {
+    const rows = await db.select().from(taxFilingPeriods).where(eq(taxFilingPeriods.orgId, currentOrgId())).orderBy(desc(taxFilingPeriods.dueDate));
+    // Open periods show a LIVE liability; filed/paid show the snapshot.
+    return Promise.all(rows.map(async (p) => ({
+      ...p,
+      liveLiability: p.status === "open" ? await this.computeStateTaxLiability(p.stateCode, p.periodStart, p.periodEnd) : p.liabilityCents,
+    })));
+  }
+
+  async createTaxFilingPeriod(input: CreateTaxFilingPeriodInput): Promise<TaxFilingPeriod> {
+    const dueDate = input.dueDate ?? addDaysYmd(input.periodEnd, 20); // default: 20 days after period end
+    const liability = await this.computeStateTaxLiability(input.stateCode, input.periodStart, input.periodEnd);
+    const row = await db.insert(taxFilingPeriods).values({
+      orgId: currentOrgId(), stateCode: input.stateCode, cadence: input.cadence,
+      periodStart: input.periodStart, periodEnd: input.periodEnd, dueDate, liabilityCents: liability,
+    }).returning().then((r) => r[0]);
+    await this.audit("create", "tax_filing_period", row.id, `Opened ${input.stateCode} filing ${input.periodStart}..${input.periodEnd}`);
+    return row;
+  }
+
+  async recordTaxFiling(id: number, confirmationNumber: string, filedDate: string): Promise<TaxFilingPeriod | undefined> {
+    const p = await db.select().from(taxFilingPeriods).where(and(eq(taxFilingPeriods.id, id), eq(taxFilingPeriods.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!p) return undefined;
+    if (p.status === "paid") throw new Error("This period is already paid.");
+    const liability = await this.computeStateTaxLiability(p.stateCode, p.periodStart, p.periodEnd);
+    const row = await db.update(taxFilingPeriods)
+      .set({ status: "filed", confirmationNumber, filedDate, liabilityCents: liability })
+      .where(eq(taxFilingPeriods.id, id)).returning().then((r) => r[0]);
+    await this.audit("file", "tax_filing_period", id, `Filed ${p.stateCode} ${p.periodStart}..${p.periodEnd}, confirmation ${confirmationNumber}`);
+    return row;
+  }
+
+  // Record payment: Dr Sales Tax Payable (2100) / Cr Bank for the liability. This
+  // clears the period's payable to zero.
+  async recordTaxPayment(id: number, bankAccountId: number, paidDate: string): Promise<TaxFilingPeriod> {
+    const orgId = currentOrgId();
+    return await db.transaction(async (tx) => {
+      const p = await tx.select().from(taxFilingPeriods).where(and(eq(taxFilingPeriods.id, id), eq(taxFilingPeriods.orgId, orgId))).then((r: any[]) => r[0]);
+      if (!p) throw new Error("Filing period not found");
+      if (p.status === "paid") throw new Error("This period is already paid.");
+      const liability = await this.computeStateTaxLiability(p.stateCode, p.periodStart, p.periodEnd);
+      if (liability <= 0) throw new Error("Nothing to pay for this period.");
+      // Debit the SAME liability account(s) the state's tax was collected into,
+      // so the payment clears exactly what was collected. Falls back to 2100.
+      const stateAccts = await this.stateTaxAccountIds(p.stateCode);
+      const payableAcctId = stateAccts[0] ?? (await tx.select().from(accounts).where(and(eq(accounts.code, "2100"), eq(accounts.orgId, orgId))).then((r: any[]) => r[0]))?.id;
+      if (!payableAcctId) throw new Error("Sales Tax Payable account missing for this state");
+      const bank = await tx.select().from(accounts).where(and(eq(accounts.id, bankAccountId), eq(accounts.orgId, orgId))).then((r: any[]) => r[0]);
+      if (!bank || bank.subtype !== "bank") throw new Error("Choose a bank account to pay from");
+      const { entry } = await this.postJournalEntry({
+        date: paidDate,
+        memo: `Sales tax payment — ${p.stateCode} ${p.periodStart}..${p.periodEnd}`,
+        reference: `TAXPMT-${p.stateCode}-${p.periodEnd}`,
+        source: "sales_tax_payment",
+        lines: [
+          { accountId: payableAcctId, debit: liability, credit: 0, description: `${p.stateCode} sales tax remittance` },
+          { accountId: bankAccountId, debit: 0, credit: liability, description: `${p.stateCode} sales tax remittance` },
+        ],
+      } as any, { _tx: tx });
+      const row = await tx.update(taxFilingPeriods)
+        .set({ status: "paid", paidDate, paymentEntryId: entry.id, liabilityCents: liability })
+        .where(eq(taxFilingPeriods.id, id)).returning().then((r) => r[0]);
+      await this.audit("pay", "tax_filing_period", id, `Paid ${p.stateCode} sales tax ${formatMoney(liability)} for ${p.periodStart}..${p.periodEnd}`);
+      return row;
+    });
   }
 
   async listReportSchedules(): Promise<ReportSchedule[]> {

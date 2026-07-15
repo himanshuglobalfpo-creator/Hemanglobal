@@ -336,6 +336,53 @@ export default function SalesTax() {
           </Card>
         </TabsContent>
       </Tabs>
+      <div className="mt-6"><FilingPeriods /></div>
     </Layout>
+  );
+}
+
+// P3.8 — sales-tax filing periods: open → file → pay.
+function FilingPeriods() {
+  const { toast } = useToast();
+  const { data: periods = [] } = useQuery<any[]>({ queryKey: ["/api/tax-filings"] });
+  const { data: accounts = [] } = useQuery<Account[]>({ queryKey: ["/api/accounts"] });
+  const banks = accounts.filter((a: any) => a.subtype === "bank");
+  const [f, setF] = useState({ stateCode: "", cadence: "quarterly", periodStart: "", periodEnd: "" });
+  const inv = () => queryClient.invalidateQueries({ queryKey: ["/api/tax-filings"] });
+
+  const create = useMutation({ mutationFn: () => apiRequest("POST", "/api/tax-filings", f), onSuccess: () => { setF({ ...f, stateCode: "" }); inv(); toast({ title: "Filing period opened" }); }, onError: (e: any) => toast({ title: "Failed", description: e.message, variant: "destructive" }) });
+  const file = useMutation({ mutationFn: (id: number) => { const c = window.prompt("Confirmation number?") || ""; if (!c) throw new Error("cancelled"); return apiRequest("POST", `/api/tax-filings/${id}/file`, { confirmationNumber: c }); }, onSuccess: () => { inv(); toast({ title: "Filing recorded" }); }, onError: (e: any) => { if (e.message !== "cancelled") toast({ title: "Failed", description: e.message, variant: "destructive" }); } });
+  const pay = useMutation({ mutationFn: ({ id, bankId }: { id: number; bankId: number }) => apiRequest("POST", `/api/tax-filings/${id}/pay`, { bankAccountId: bankId }), onSuccess: () => { inv(); toast({ title: "Payment posted" }); }, onError: (e: any) => toast({ title: "Failed", description: e.message, variant: "destructive" }) });
+
+  return (
+    <Card data-testid="card-tax-filings">
+      <CardHeader><CardTitle>Sales-tax filings</CardTitle></CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex flex-wrap items-end gap-2">
+          <div><Label className="text-xs">State</Label><Input className="w-20" placeholder="CA" value={f.stateCode} onChange={(e) => setF({ ...f, stateCode: e.target.value.toUpperCase().slice(0, 2) })} data-testid="input-filing-state" /></div>
+          <div><Label className="text-xs">Cadence</Label>
+            <select className="block rounded-md border bg-background px-2 py-1.5 text-sm" value={f.cadence} onChange={(e) => setF({ ...f, cadence: e.target.value })}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annual">Annual</option></select>
+          </div>
+          <div><Label className="text-xs">Period start</Label><Input type="date" value={f.periodStart} onChange={(e) => setF({ ...f, periodStart: e.target.value })} data-testid="input-filing-start" /></div>
+          <div><Label className="text-xs">Period end</Label><Input type="date" value={f.periodEnd} onChange={(e) => setF({ ...f, periodEnd: e.target.value })} data-testid="input-filing-end" /></div>
+          <Button disabled={!f.stateCode || !f.periodStart || !f.periodEnd || create.isPending} onClick={() => create.mutate()} data-testid="button-open-filing">Open period</Button>
+        </div>
+        <div className="space-y-1">
+          {periods.length === 0 && <p className="text-sm text-muted-foreground">No filing periods yet.</p>}
+          {periods.map((p) => (
+            <div key={p.id} className="flex flex-wrap items-center gap-2 rounded-md border p-2 text-sm" data-testid={`filing-row-${p.id}`}>
+              <span className="font-medium">{p.stateCode}</span>
+              <span className="text-muted-foreground">{p.periodStart} → {p.periodEnd} · due {p.dueDate}</span>
+              <span>{fmtMoney(p.status === "open" ? p.liveLiability : p.liabilityCents)}</span>
+              <span className={`rounded px-1.5 py-0.5 text-xs ${p.status === "paid" ? "bg-green-100 text-green-800" : p.status === "filed" ? "bg-blue-100 text-blue-800" : "bg-amber-100 text-amber-800"}`}>{p.status}</span>
+              <div className="ml-auto flex items-center gap-2">
+                {p.status !== "paid" && <button className="text-xs underline" onClick={() => file.mutate(p.id)} data-testid={`button-file-${p.id}`}>Record filing</button>}
+                {p.status !== "paid" && banks[0] && <button className="text-xs underline" onClick={() => pay.mutate({ id: p.id, bankId: banks[0].id })} data-testid={`button-pay-${p.id}`}>Record payment</button>}
+              </div>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
   );
 }

@@ -1776,10 +1776,41 @@ export const taxCodes = pgTable("tax_codes", {
   rate: doublePrecision("rate").notNull(), // percentage, e.g. 8.875
   agency: text("agency"), // "NY Dept of Taxation"
   liabilityAccountId: integer("liability_account_id").notNull(),
+  stateCode: text("state_code"), // 2-char nexus state this code files under
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
 });
+
+// ---------- SALES-TAX FILING PERIODS (P3.8) ----------
+export const TAX_FILING_CADENCES = ["monthly", "quarterly", "annual"] as const;
+export const taxFilingPeriods = pgTable("tax_filing_periods", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  stateCode: text("state_code").notNull(),
+  cadence: text("cadence").notNull().default("quarterly"),
+  periodStart: text("period_start").notNull(),
+  periodEnd: text("period_end").notNull(),
+  dueDate: text("due_date").notNull(),
+  status: text("status").notNull().default("open"), // open | filed | paid
+  liabilityCents: bigint("liability_cents", { mode: "number" }).notNull().default(0),
+  confirmationNumber: text("confirmation_number"),
+  filedDate: text("filed_date"),
+  paidDate: text("paid_date"),
+  paymentEntryId: integer("payment_entry_id"),
+  reminderSent: boolean("reminder_sent").notNull().default(false),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type TaxFilingPeriod = typeof taxFilingPeriods.$inferSelect;
+
+export const createTaxFilingPeriodSchema = z.object({
+  stateCode: z.string().length(2).transform((s) => s.toUpperCase()),
+  cadence: z.enum(TAX_FILING_CADENCES).default("quarterly"),
+  periodStart: isoDate,
+  periodEnd: isoDate,
+  dueDate: isoDate.optional(),
+}).refine((v) => v.periodEnd >= v.periodStart, { message: "periodEnd must be on or after periodStart", path: ["periodEnd"] });
+export type CreateTaxFilingPeriodInput = z.infer<typeof createTaxFilingPeriodSchema>;
 export const taxCodeSchema = z.object({
   name: z.string().min(1).max(100),
   rate: z.number().min(0).max(100),

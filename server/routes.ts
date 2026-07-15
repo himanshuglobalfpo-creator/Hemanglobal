@@ -31,6 +31,7 @@ import {
   createPriceRuleSchema,
   createJobSchema,
   createReportScheduleSchema,
+  createTaxFilingPeriodSchema,
   postJournalEntrySchema,
   createInvoiceSchema,
   createBillSchema,
@@ -2036,6 +2037,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   );
   app.get("/api/reports/tax-liability", (req, res) =>
     handle(res, () => storage.taxLiabilityReport((req.query.asOf as string) || undefined))
+  );
+
+  // ---------- Sales-tax filing workflow (P3.8) ----------
+  app.get("/api/tax-filings", (_req, res) => handle(res, () => storage.listTaxFilingPeriods()));
+  app.post("/api/tax-filings", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => storage.createTaxFilingPeriod(createTaxFilingPeriodSchema.parse(req.body)))
+  );
+  app.post("/api/tax-filings/:id/file", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const conf = String(req.body?.confirmationNumber || "").trim();
+      const filedDate = String(req.body?.filedDate || new Date().toISOString().slice(0, 10));
+      if (!conf) throw new Error("confirmationNumber is required");
+      const p = await storage.recordTaxFiling(parseId(req.params.id), conf, filedDate);
+      if (!p) throw new Error("Filing period not found");
+      return p;
+    })
+  );
+  app.post("/api/tax-filings/:id/pay", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => storage.recordTaxPayment(parseId(req.params.id), parseId(req.body?.bankAccountId, "bankAccountId"), String(req.body?.paidDate || new Date().toISOString().slice(0, 10))))
   );
 
   // 1099 Summary — cash paid to 1099-tracked vendors in a calendar year.
