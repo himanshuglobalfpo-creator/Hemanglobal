@@ -292,6 +292,12 @@ export default function Invoices() {
                       <Badge variant={i.status === "paid" ? "default" : overdue ? "destructive" : "secondary"}>
                         {overdue ? "overdue" : i.status}
                       </Badge>
+                      {/* Delivery chip (P3.10): Sent → Viewed → Paid */}
+                      {i.status !== "paid" && ((i as any).firstViewedAt || (i as any).sentAt) && (
+                        <Badge variant="outline" className="ml-1" data-testid={`chip-delivery-${i.id}`}>
+                          {(i as any).firstViewedAt ? "viewed" : "sent"}
+                        </Badge>
+                      )}
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums font-medium">{fmtMoney(i.total)}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{fmtMoney(balance)}</td>

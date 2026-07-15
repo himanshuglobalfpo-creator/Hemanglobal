@@ -1208,6 +1208,25 @@ export class DatabaseStorage {
       .where(eq(invoiceShares.id, share.id))
       ;
   }
+  // P3.10 — invoice-level viewed tracking. Stamps first_viewed_at ONCE and
+  // last_viewed_at on every page view. Resolves the invoice via the share token;
+  // no auth (the token is the capability). Returns whether a stamp was made.
+  async recordInvoiceViewed(token: string): Promise<boolean> {
+    const share = await db.select().from(invoiceShares).where(eq(invoiceShares.token, token)).then((r: any[]) => r[0]);
+    if (!share) return false;
+    const now = new Date().toISOString();
+    await pool.query(
+      `UPDATE invoices SET first_viewed_at = COALESCE(first_viewed_at, $1), last_viewed_at = $1 WHERE id = $2 AND org_id = $3`,
+      [now, share.invoiceId, share.orgId]
+    );
+    return true;
+  }
+
+  // Stamp sent_at (once) when an invoice is emailed — drives the Sent chip.
+  async markInvoiceSent(id: number): Promise<void> {
+    await pool.query(`UPDATE invoices SET sent_at = COALESCE(sent_at, $1) WHERE id = $2 AND org_id = $3`, [new Date().toISOString(), id, currentOrgId()]);
+  }
+
   async markShareSent(id: number, status: "sent" | "failed", error?: string) {
     await db.update(invoiceShares)
       .set({

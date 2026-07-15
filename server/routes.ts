@@ -2274,6 +2274,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         sendResult.ok ? "sent" : "failed",
         sendResult.ok ? undefined : sendResult.error
       );
+      if (sendResult.ok) await storage.markInvoiceSent(id); // P3.10: Sent chip
       await storage.audit("send", "invoice", id, `Sent invoice ${inv.number} to ${to}`, {
         shareId: share.id,
         mode: sendResult.mode,
@@ -2487,11 +2488,28 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     </div>
     <div class="footer">Powered by LedgerLite · This is a read-only preview shared with ${escapeHtml(cust.email || "you")}</div>
   </div>
+  <script>
+    // Honest page-view tracking (P3.10): records that the recipient opened this
+    // page. No pixels, no email tracking — a real page view only.
+    try { fetch("/p/invoice/${encodeURIComponent(token)}/viewed", { method: "POST" }); } catch (e) {}
+  </script>
 </body></html>`;
       res.type("html").send(html);
     } catch (err: any) {
       logger.error("Route error", { reqId: (res.req as any)?.reqId, error: err?.message });
       res.status(500).type("html").send("<h1>Server error</h1>");
+    }
+  });
+
+  // Page-view tracking (P3.10): the public share page fires this on load. No
+  // auth (the token is the capability), rate-limited, and honest — a page view,
+  // not an email tracking pixel. Records first/last viewed on the invoice.
+  app.post("/p/invoice/:token/viewed", publicLimiter, async (req, res) => {
+    try {
+      await storage.recordInvoiceViewed(req.params.token);
+      res.json({ ok: true }); // always 200 — never leak whether the token exists
+    } catch {
+      res.json({ ok: true });
     }
   });
 
