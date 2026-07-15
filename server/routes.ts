@@ -32,6 +32,7 @@ import {
   createJobSchema,
   createReportScheduleSchema,
   createTaxFilingPeriodSchema,
+  addBundleComponentSchema,
   postJournalEntrySchema,
   createInvoiceSchema,
   createBillSchema,
@@ -875,6 +876,28 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   );
   app.delete("/api/items/:id", requireRole("owner", "admin"), (req, res) =>
     handle(res, () => storage.deleteItem(parseId(req.params.id)))
+  );
+
+  // ---------- Bundles + reorder (P3.9) ----------
+  app.get("/api/items/:id/bundle-components", (req, res) =>
+    handle(res, () => storage.listBundleComponents(parseId(req.params.id)))
+  );
+  app.post("/api/items/:id/bundle-components", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const { componentItemId, quantity } = addBundleComponentSchema.parse(req.body);
+      await storage.addBundleComponent(parseId(req.params.id), componentItemId, quantity);
+      return { ok: true };
+    })
+  );
+  app.delete("/api/bundle-components/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const ok = await storage.removeBundleComponent(parseId(req.params.id));
+      if (!ok) throw new Error("Bundle component not found");
+      return { ok: true };
+    })
+  );
+  app.get("/api/inventory/reorder-suggestions", (_req, res) =>
+    handle(res, () => storage.reorderSuggestions())
   );
 
   // ---------- Purchase Orders ----------

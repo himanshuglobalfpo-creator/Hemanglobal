@@ -264,6 +264,28 @@ export default function Dashboard() {
           </CardContent>
         </Card>
       )}
+      <LowStockCard />
     </Layout>
+  );
+}
+
+// P3.9 — low-stock reorder suggestions (respects open PO quantity).
+type ReorderRow = { itemId: number; sku: string; name: string; onHand: number; onOrder: number; reorderPoint: number; reorderQty: number; preferredVendorName: string | null };
+function LowStockCard() {
+  const { data = [] } = useQuery<ReorderRow[]>({ queryKey: ["/api/inventory/reorder-suggestions"] });
+  if (data.length === 0) return null;
+  return (
+    <Card className="mt-6" data-testid="card-low-stock">
+      <CardHeader><CardTitle className="text-base">Low stock — reorder suggestions ({data.length})</CardTitle></CardHeader>
+      <CardContent className="space-y-1">
+        {data.map((r) => (
+          <div key={r.itemId} className="flex flex-wrap items-center gap-2 border-b py-1 text-sm last:border-0" data-testid={`low-stock-${r.itemId}`}>
+            <span className="font-medium">{r.name}</span>
+            <span className="text-muted-foreground">on hand {r.onHand} · on order {r.onOrder} · reorder at {r.reorderPoint}</span>
+            <span className="ml-auto text-muted-foreground">{r.preferredVendorName ? `→ ${r.preferredVendorName}` : "no preferred vendor"} · suggest {r.reorderQty}</span>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
   );
 }

@@ -47,6 +47,8 @@ import {
   jobs,
   reportSchedules,
   taxFilingPeriods,
+  bundleComponents,
+  type BundleComponent,
   type TaxFilingPeriod,
   type CreateTaxFilingPeriodInput,
   type PriceRule,
@@ -1550,6 +1552,86 @@ export class DatabaseStorage {
       budgetIncome: project.budgetIncomeCents, budgetCost: project.budgetCostCents, budgetNet: project.budgetIncomeCents - project.budgetCostCents,
       unbilledMinutes: Number(unbilled.minutes), unbilledAmount: Number(unbilled.amount),
     };
+  }
+
+  // --------------------------------------------------------------------------
+  // INVENTORY WORKFLOW (P3.9) — bundles + low-stock reorder
+  // --------------------------------------------------------------------------
+  // Component items (with their cost/GL fields) for a bundle — used by the sale
+  // explosion in createInvoice.
+  private async bundleComponentItems(bundleId: number): Promise<Array<{ quantity: number; item: any }>> {
+    const rows = (await pool.query(
+      `SELECT bc.quantity,
+              i.id, i.sku, i.type, i.avg_cost_cents AS "avgCostCents",
+              i.cogs_account_id AS "cogsAccountId", i.inventory_asset_account_id AS "inventoryAssetAccountId",
+              i.quantity_on_hand AS "quantityOnHand"
+         FROM bundle_components bc JOIN items i ON i.id = bc.component_item_id
+        WHERE bc.org_id = $1 AND bc.bundle_item_id = $2`,
+      [currentOrgId(), bundleId]
+    )).rows as any[];
+    return rows.map((r) => ({ quantity: r.quantity, item: r }));
+  }
+
+  async listBundleComponents(bundleId: number): Promise<Array<BundleComponent & { name: string; sku: string; type: string }>> {
+    return (await pool.query(
+      `SELECT bc.id, bc.bundle_item_id AS "bundleItemId", bc.component_item_id AS "componentItemId", bc.quantity,
+              i.name, i.sku, i.type
+         FROM bundle_components bc JOIN items i ON i.id = bc.component_item_id
+        WHERE bc.org_id = $1 AND bc.bundle_item_id = $2 ORDER BY i.name`,
+      [currentOrgId(), bundleId]
+    )).rows as any[];
+  }
+
+  async addBundleComponent(bundleId: number, componentItemId: number, quantity: number): Promise<void> {
+    const orgId = currentOrgId();
+    if (bundleId === componentItemId) throw new Error("A bundle cannot contain itself.");
+    const bundle = await db.select().from(items).where(and(eq(items.id, bundleId), eq(items.orgId, orgId))).then((r: any[]) => r[0]);
+    if (!bundle) throw new Error("Bundle item not found");
+    const comp = await db.select().from(items).where(and(eq(items.id, componentItemId), eq(items.orgId, orgId))).then((r: any[]) => r[0]);
+    if (!comp) throw new Error("Component item not found");
+    // No nesting: a component may not itself be a bundle.
+    if (comp.isBundle) throw new Error("Bundles cannot be nested — a component may not be a bundle.");
+    await db.transaction(async (tx) => {
+      await tx.insert(bundleComponents).values({ orgId, bundleItemId: bundleId, componentItemId, quantity })
+        .onConflictDoUpdate({ target: [bundleComponents.bundleItemId, bundleComponents.componentItemId], set: { quantity } });
+      if (!bundle.isBundle) await tx.update(items).set({ isBundle: true, updatedAt: nowIso() }).where(eq(items.id, bundleId));
+    });
+    await this.audit("update", "item", bundleId, `Added component #${componentItemId} ×${quantity} to bundle ${bundle.sku}`);
+  }
+
+  async removeBundleComponent(id: number): Promise<boolean> {
+    const orgId = currentOrgId();
+    const row = await db.select().from(bundleComponents).where(and(eq(bundleComponents.id, id), eq(bundleComponents.orgId, orgId))).then((r: any[]) => r[0]);
+    if (!row) return false;
+    await db.delete(bundleComponents).where(and(eq(bundleComponents.id, id), eq(bundleComponents.orgId, orgId)));
+    // If that was the last component, clear the bundle flag.
+    const remaining = (await pool.query(`SELECT COUNT(*)::int AS c FROM bundle_components WHERE org_id=$1 AND bundle_item_id=$2`, [orgId, row.bundleItemId])).rows[0].c;
+    if (remaining === 0) await db.update(items).set({ isBundle: false, updatedAt: nowIso() }).where(and(eq(items.id, row.bundleItemId), eq(items.orgId, orgId)));
+    return true;
+  }
+
+  // Low-stock suggestions: an inventory item is suggested when on-hand PLUS the
+  // open (undelivered) PO quantity is at/below its reorder point. Respecting the
+  // open-PO quantity is what stops us re-ordering something already on the way.
+  async reorderSuggestions(): Promise<Array<{ itemId: number; sku: string; name: string; onHand: number; onOrder: number; reorderPoint: number; reorderQty: number; preferredVendorId: number | null; preferredVendorName: string | null }>> {
+    const rows = (await pool.query(
+      `SELECT i.id AS "itemId", i.sku, i.name, i.quantity_on_hand AS "onHand",
+              COALESCE(oo.qty, 0)::int AS "onOrder", i.reorder_point AS "reorderPoint",
+              i.reorder_qty AS "reorderQty", i.preferred_vendor_id AS "preferredVendorId", v.name AS "preferredVendorName"
+         FROM items i
+         LEFT JOIN (
+           SELECT pol.item_id, SUM(GREATEST(pol.quantity - pol.qty_received, 0)) AS qty
+             FROM purchase_order_lines pol JOIN purchase_orders po ON po.id = pol.po_id
+            WHERE po.org_id = $1 AND po.status <> 'cancelled' AND pol.item_id IS NOT NULL
+            GROUP BY pol.item_id
+         ) oo ON oo.item_id = i.id
+         LEFT JOIN vendors v ON v.id = i.preferred_vendor_id
+        WHERE i.org_id = $1 AND i.type = 'inventory' AND i.is_active = true AND i.reorder_point > 0
+          AND (i.quantity_on_hand + COALESCE(oo.qty, 0)) <= i.reorder_point
+        ORDER BY i.name`,
+      [currentOrgId()]
+    )).rows as any[];
+    return rows;
   }
 
   // --------------------------------------------------------------------------
@@ -3650,38 +3732,44 @@ export class DatabaseStorage {
       const cogsComponents: CogsComponent[] = [];
       const saleMovements: { itemId: number; qty: number; avgCostCents: number }[] = [];
       const workingQty = new Map<number, number>(); // item id -> running on-hand
+      // Relieve `qty` units of ONE inventory item: whole-unit + negative-stock
+      // checks, cost per the org method, and record the COGS component + stock
+      // movement. Shared by plain inventory lines and exploded bundle components.
+      const relieveOne = async (item: any, qty: number) => {
+        if (item.type !== "inventory") return;
+        if (!Number.isInteger(qty)) throw new Error(`Inventory item "${item.sku}" must be sold in whole units (got ${qty}).`);
+        const startQty = workingQty.get(item.id) ?? item.quantityOnHand;
+        const newQty = startQty - qty;
+        if (newQty < 0 && !allowNegative) {
+          throw new Error(`Selling ${qty} of "${item.sku}" would drive stock to ${newQty} (on hand ${startQty}). Enable allow_negative_stock for this organization to permit overselling.`);
+        }
+        workingQty.set(item.id, newQty);
+        let cogsCents: number; let movementUnitCost: number;
+        if (costingMethod === "average") {
+          cogsCents = qty * item.avgCostCents; movementUnitCost = item.avgCostCents;
+        } else {
+          const layers = await loadLayers(item.id);
+          cogsCents = relieveLayers(layers, qty, item.avgCostCents);
+          movementUnitCost = qty > 0 ? Math.round(cogsCents / qty) : 0;
+        }
+        cogsComponents.push({ cogsAccountId: item.cogsAccountId, inventoryAssetAccountId: item.inventoryAssetAccountId!, cogsCents });
+        saleMovements.push({ itemId: item.id, qty, avgCostCents: movementUnitCost });
+      };
       for (let idx = 0; idx < input.lines.length; idx++) {
         const l = input.lines[idx];
         if (l.itemId === undefined) continue;
         const item = invItemMap.get(l.itemId)!;
+        if ((item as any).isBundle) {
+          // Explode the bundle: relieve each component (qty per bundle × line qty).
+          // Bundles cannot be nested (enforced when components are added), so one
+          // level of explosion is complete. The bundle prints as one line; only
+          // its inventory components move stock and post COGS.
+          const comps = await this.bundleComponentItems(item.id);
+          for (const c of comps) await relieveOne(c.item, c.quantity * l.quantity);
+          continue;
+        }
         if (item.type !== "inventory") continue;
-        if (!Number.isInteger(l.quantity)) {
-          throw new Error(`Inventory item "${item.sku}" must be sold in whole units (got ${l.quantity}).`);
-        }
-        const startQty = workingQty.get(item.id) ?? item.quantityOnHand;
-        const newQty = startQty - l.quantity;
-        if (newQty < 0 && !allowNegative) {
-          throw new Error(
-            `Selling ${l.quantity} of "${item.sku}" would drive stock to ${newQty} (on hand ${startQty}). ` +
-            `Enable allow_negative_stock for this organization to permit overselling.`
-          );
-        }
-        workingQty.set(item.id, newQty);
-        // Cost the sale. FIFO/LIFO consume layers (fallback to avg cost for any
-        // shortfall past the layers, i.e. oversold negative stock).
-        let cogsCents: number;
-        let movementUnitCost: number;
-        if (costingMethod === "average") {
-          cogsCents = l.quantity * item.avgCostCents;
-          movementUnitCost = item.avgCostCents;
-        } else {
-          const layers = await loadLayers(item.id);
-          cogsCents = relieveLayers(layers, l.quantity, item.avgCostCents);
-          movementUnitCost = l.quantity > 0 ? Math.round(cogsCents / l.quantity) : 0;
-        }
-        // inventoryAssetAccountId is guaranteed non-null for type 'inventory' (schema refine + createItem).
-        cogsComponents.push({ cogsAccountId: item.cogsAccountId, inventoryAssetAccountId: item.inventoryAssetAccountId!, cogsCents });
-        saleMovements.push({ itemId: item.id, qty: l.quantity, avgCostCents: movementUnitCost });
+        await relieveOne(item, l.quantity);
       }
       const cogsLines = buildCogsJournalLines(cogsComponents, `COGS for ${invNumber}`);
       if (cogsLines.length > 0) {

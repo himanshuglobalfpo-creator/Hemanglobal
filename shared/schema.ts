@@ -417,6 +417,12 @@ export const items = pgTable("items", {
   cogsAccountId: integer("cogs_account_id").notNull(),     // COGS debited when inventory is sold
   // Lightweight product category (nullable) — targeted by category-scoped price rules.
   category: text("category"),
+  // Low-stock reorder (P3.9): suggest a PO when on-hand + open PO qty <= point.
+  reorderPoint: integer("reorder_point").notNull().default(0),
+  reorderQty: integer("reorder_qty").notNull().default(0),
+  preferredVendorId: integer("preferred_vendor_id"),
+  // Bundle (P3.9): a kit that explodes to component items on sale (bundle_components).
+  isBundle: boolean("is_bundle").notNull().default(false),
   quantityOnHand: integer("quantity_on_hand").notNull().default(0), // whole units
   // Weighted-average unit cost. Stored in cents (integer). $2.50 = 250. Never REAL.
   avgCostCents: bigint("avg_cost_cents", { mode: "number" }).notNull().default(0),
@@ -460,6 +466,20 @@ export const insertItemSchema = baseItemSchema.superRefine(refineItemShape);
 export const updateItemSchema = baseItemSchema.partial().superRefine(refineItemShape);
 export type InsertItem = z.infer<typeof insertItemSchema>;
 export type UpdateItem = z.infer<typeof updateItemSchema>;
+
+// ---------- BUNDLE COMPONENTS (P3.9) ----------
+export const bundleComponents = pgTable("bundle_components", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  bundleItemId: integer("bundle_item_id").notNull(),
+  componentItemId: integer("component_item_id").notNull(),
+  quantity: integer("quantity").notNull().default(1),
+});
+export type BundleComponent = typeof bundleComponents.$inferSelect;
+export const addBundleComponentSchema = z.object({
+  componentItemId: z.number().int().positive(),
+  quantity: z.number().int().min(1).default(1),
+});
 
 // ============================================================================
 // PRICE RULES (P3.4) — customer-specific & scoped pricing
