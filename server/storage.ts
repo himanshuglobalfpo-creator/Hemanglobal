@@ -40,6 +40,7 @@ import {
   classes,
   locations,
   projects,
+  timeEntries,
   type OrgNexusState,
   type NexusStateInput,
   type Class,
@@ -48,6 +49,9 @@ import {
   type InsertLocation,
   type Project,
   type InsertProject,
+  type TimeEntry,
+  type InsertTimeEntry,
+  type UpdateTimeEntry,
 } from "@shared/schema";
 import { organizations } from "@shared/auth-schema";
 import { applyPurchase, costOfSale, buildCogsJournalLines, relieveLayers, layerValuation, type CogsComponent } from "@shared/inventory";
@@ -127,7 +131,7 @@ import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
 import { futureDatedWarning } from "@shared/dates";
 import { drizzle } from "drizzle-orm/node-postgres";
-import { eq, ne, sql, and, gt, gte, lte, desc, inArray } from "drizzle-orm";
+import { eq, ne, sql, and, gt, gte, lte, desc, inArray, isNull } from "drizzle-orm";
 import pg from "pg";
 import fs from "node:fs";
 import path from "node:path";
@@ -1373,6 +1377,129 @@ export class DatabaseStorage {
     return db.update(projects).set(data)
       .where(and(eq(projects.id, id), eq(projects.orgId, currentOrgId())))
       .returning().then((r) => r[0]);
+  }
+
+  // --------------------------------------------------------------------------
+  // TIME TRACKING (P3.3)
+  // --------------------------------------------------------------------------
+  async createTimeEntry(data: InsertTimeEntry): Promise<TimeEntry> {
+    // The project must belong to this org (defense in depth beyond org scope).
+    const proj = await db.select().from(projects).where(and(eq(projects.id, data.projectId), eq(projects.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!proj) throw new Error(`Project #${data.projectId} not found in this organization`);
+    const row = await db.insert(timeEntries).values({
+      ...data,
+      orgId: currentOrgId(),
+      invoicedLineId: null,
+      updatedAt: nowIso(),
+    }).returning().then((r) => r[0]);
+    await this.audit("create", "time_entry", row.id, `Logged ${(row.minutes / 60).toFixed(2)}h on project #${row.projectId}`);
+    return row;
+  }
+
+  async updateTimeEntry(id: number, data: UpdateTimeEntry): Promise<TimeEntry | undefined> {
+    const existing = await db.select().from(timeEntries).where(and(eq(timeEntries.id, id), eq(timeEntries.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!existing) return undefined;
+    // A billed entry is frozen — editing it would desync the invoice line it was
+    // billed on. Unbill (void/edit the invoice) before changing the time.
+    if (existing.invoicedLineId) throw new Error("This time entry has already been invoiced. Remove it from the invoice before editing.");
+    if (data.projectId != null && data.projectId !== existing.projectId) {
+      const proj = await db.select().from(projects).where(and(eq(projects.id, data.projectId), eq(projects.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+      if (!proj) throw new Error(`Project #${data.projectId} not found in this organization`);
+    }
+    const row = await db.update(timeEntries).set({ ...data, updatedAt: nowIso() })
+      .where(and(eq(timeEntries.id, id), eq(timeEntries.orgId, currentOrgId())))
+      .returning().then((r) => r[0]);
+    await this.audit("update", "time_entry", id, `Updated time entry #${id}`);
+    return row;
+  }
+
+  async deleteTimeEntry(id: number): Promise<boolean> {
+    const existing = await db.select().from(timeEntries).where(and(eq(timeEntries.id, id), eq(timeEntries.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!existing) return false;
+    if (existing.invoicedLineId) throw new Error("This time entry has already been invoiced. Remove it from the invoice before deleting.");
+    await db.delete(timeEntries).where(and(eq(timeEntries.id, id), eq(timeEntries.orgId, currentOrgId())));
+    await this.audit("delete", "time_entry", id, `Deleted time entry #${id}`);
+    return true;
+  }
+
+  async listTimeEntries(filter: { projectId?: number; userId?: number; from?: string; to?: string; unbilledOnly?: boolean } = {}): Promise<Array<TimeEntry & { projectName: string; userName: string }>> {
+    const params: any[] = [currentOrgId()];
+    const conds: string[] = ["te.org_id = $1"];
+    if (filter.projectId != null) { params.push(filter.projectId); conds.push(`te.project_id = $${params.length}`); }
+    if (filter.userId != null) { params.push(filter.userId); conds.push(`te.user_id = $${params.length}`); }
+    if (filter.from) { params.push(filter.from); conds.push(`te.service_date >= $${params.length}`); }
+    if (filter.to) { params.push(filter.to); conds.push(`te.service_date <= $${params.length}`); }
+    if (filter.unbilledOnly) conds.push(`te.invoiced_line_id IS NULL AND te.billable = true`);
+    const rows = (await pool.query(
+      `SELECT te.*, te.rate_cents AS "rateCents", te.project_id AS "projectId", te.user_id AS "userId",
+              te.service_date AS "serviceDate", te.invoiced_line_id AS "invoicedLineId",
+              p.name AS "projectName", COALESCE(u.name, 'User #' || te.user_id) AS "userName"
+         FROM time_entries te
+         JOIN projects p ON p.id = te.project_id
+         LEFT JOIN users u ON u.id = te.user_id
+        WHERE ${conds.join(" AND ")}
+        ORDER BY te.service_date DESC, te.id DESC`,
+      params
+    )).rows as any[];
+    return rows;
+  }
+
+  // Billable, not-yet-invoiced time for a customer's projects — the pool the
+  // "Add unbilled time to invoice" action draws from.
+  async listUnbilledTimeForCustomer(customerId: number): Promise<Array<TimeEntry & { projectName: string; userName: string }>> {
+    const rows = (await pool.query(
+      `SELECT te.*, te.rate_cents AS "rateCents", te.project_id AS "projectId", te.user_id AS "userId",
+              te.service_date AS "serviceDate", te.invoiced_line_id AS "invoicedLineId",
+              p.name AS "projectName", COALESCE(u.name, 'User #' || te.user_id) AS "userName"
+         FROM time_entries te
+         JOIN projects p ON p.id = te.project_id
+         LEFT JOIN users u ON u.id = te.user_id
+        WHERE te.org_id = $1 AND p.customer_id = $2
+          AND te.billable = true AND te.invoiced_line_id IS NULL AND te.minutes > 0
+        ORDER BY te.service_date, te.id`,
+      [currentOrgId(), customerId]
+    )).rows as any[];
+    return rows;
+  }
+
+  // Actual (from the GL) vs budget for a single project, plus unbilled time.
+  async projectBudgetActual(projectId: number): Promise<{
+    project: Project;
+    actualIncome: number; actualCost: number; actualNet: number;
+    budgetIncome: number; budgetCost: number; budgetNet: number;
+    unbilledMinutes: number; unbilledAmount: number;
+  }> {
+    const project = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+    if (!project) throw new Error(`Project #${projectId} not found`);
+    // Actuals from the ledger (all dates), scoped to this project's GL lines.
+    const gl = (await pool.query(
+      `SELECT a.type,
+              COALESCE(SUM(jl.debit), 0)  AS debit,
+              COALESCE(SUM(jl.credit), 0) AS credit
+         FROM journal_lines jl
+         JOIN journal_entries je ON je.id = jl.entry_id
+         JOIN accounts a        ON a.id = jl.account_id
+        WHERE je.org_id = $1 AND jl.project_id = $2 AND a.type IN ('income','expense')
+        GROUP BY a.type`,
+      [currentOrgId(), projectId]
+    )).rows as Array<{ type: string; debit: number; credit: number }>;
+    let actualIncome = 0, actualCost = 0;
+    for (const r of gl) {
+      if (r.type === "income") actualIncome += Number(r.credit) - Number(r.debit);
+      else actualCost += Number(r.debit) - Number(r.credit);
+    }
+    const unbilled = (await pool.query(
+      `SELECT COALESCE(SUM(minutes), 0)::int AS minutes,
+              COALESCE(SUM(ROUND(minutes / 60.0 * rate_cents)), 0)::bigint AS amount
+         FROM time_entries WHERE org_id = $1 AND project_id = $2 AND billable = true AND invoiced_line_id IS NULL`,
+      [currentOrgId(), projectId]
+    )).rows[0] as { minutes: number; amount: string };
+    return {
+      project,
+      actualIncome, actualCost, actualNet: actualIncome - actualCost,
+      budgetIncome: project.budgetIncomeCents, budgetCost: project.budgetCostCents, budgetNet: project.budgetIncomeCents - project.budgetCostCents,
+      unbilledMinutes: Number(unbilled.minutes), unbilledAmount: Number(unbilled.amount),
+    };
   }
   // Validate that every referenced class/location/project id exists in THIS org.
   // Nulls and undefineds are ignored (dimensions are optional). Cheap: at most
@@ -2842,7 +2969,7 @@ export class DatabaseStorage {
         .returning().then((r: any[]) => r[0]);
       for (let idx = 0; idx < input.lines.length; idx++) {
         const l = input.lines[idx];
-        await tx.insert(invoiceLines)
+        const insertedLine = await tx.insert(invoiceLines)
           .values({
             orgId: currentOrgId(),
             invoiceId: inv.id,
@@ -2858,7 +2985,27 @@ export class DatabaseStorage {
             classId: (l as any).classId ?? null,
             locationId: (l as any).locationId ?? null,
             projectId: (l as any).projectId ?? null,
-          });
+          })
+          .returning().then((r: any[]) => r[0]);
+        // Bill a time entry (P3.3): link it to THIS line and refuse to bill it
+        // twice. The guarded UPDATE only matches an unbilled, billable, in-org
+        // entry — a zero row count means it was already billed (or invalid), so
+        // we throw and the whole invoice rolls back. This is the double-billing
+        // guard, enforced atomically inside the invoice transaction.
+        if ((l as any).timeEntryId != null) {
+          const teId = (l as any).timeEntryId as number;
+          const linked = await tx
+            .update(timeEntries)
+            .set({ invoicedLineId: insertedLine.id, updatedAt: nowIso() })
+            .where(and(
+              eq(timeEntries.id, teId),
+              eq(timeEntries.orgId, currentOrgId()),
+              eq(timeEntries.billable, true),
+              isNull(timeEntries.invoicedLineId),
+            ))
+            .returning().then((r: any[]) => r[0]);
+          if (!linked) throw new Error(`Time entry #${teId} is already invoiced or not billable — it cannot be billed again.`);
+        }
       }
       // Post journal entry: Dr A/R, Cr each Income account, Cr Sales Tax Payable.
       // Group income by (account, class, location, project) so each dimension
@@ -3214,6 +3361,14 @@ export class DatabaseStorage {
           }, { _tx: tx });
         }
       }
+
+      // Unlink any billed time entries (P3.3): the time is PRESERVED and
+      // becomes billable again — we never delete the entry, only clear its
+      // invoiced_line_id. Uses the invoice's line ids so it stays org-scoped.
+      await tx.execute(sql`
+        UPDATE time_entries SET invoiced_line_id = NULL, updated_at = now()
+         WHERE org_id = ${currentOrgId()}
+           AND invoiced_line_id IN (SELECT id FROM invoice_lines WHERE invoice_id = ${id} AND org_id = ${currentOrgId()})`);
 
       const row = await tx
         .update(invoices)

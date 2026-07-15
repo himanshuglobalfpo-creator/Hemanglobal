@@ -3,6 +3,7 @@ import { Link, useLocation } from "wouter";
 import {
   LayoutDashboard,
   BookOpen,
+  Clock,
   Users,
   Truck,
   FileText,
@@ -76,6 +77,7 @@ const NAV = [
   { href: "/accounts", label: "Chart of Accounts", icon: Library },
   { href: "/fixed-assets", label: "Fixed Assets", icon: Boxes },
   { href: "/payroll", label: "Payroll", icon: UsersRound },
+  { href: "/timesheet", label: "Timesheet", icon: Clock },
   { href: "/journal", label: "Journal", icon: BookOpen },
   { href: "/reports", label: "Reports", icon: BarChart3 },
   { href: "/statements", label: "Statements", icon: Mail },

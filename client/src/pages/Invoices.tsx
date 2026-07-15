@@ -24,6 +24,9 @@ interface NewLine {
   description: string; quantity: number; rate: number;
   incomeAccountId: number | null; projectId?: number | null;
   itemId?: number | null; serviceDate?: string;
+  // Set when the line was generated from a billable time entry, so the server
+  // can link it and refuse to bill it twice.
+  timeEntryId?: number | null;
 }
 
 // Payment terms (QBO-style). "Net N" computes the due date from the invoice date.
@@ -49,6 +52,8 @@ export default function Invoices() {
   const [sendOpen, setSendOpen] = useState<number | null>(null);
   const [sharesOpen, setSharesOpen] = useState<number | null>(null);
   const [manageOpen, setManageOpen] = useState(false);
+  const [timePickerOpen, setTimePickerOpen] = useState(false);
+  const [pickedTime, setPickedTime] = useState<Record<number, boolean>>({});
 
   const voidMut = useMutation({
     mutationFn: async (id: number) => (await apiRequest("POST", `/api/invoices/${id}/void`)).json(),
@@ -125,6 +130,32 @@ export default function Invoices() {
 
   const selectedCustomer = customers.find((c) => c.id === form.customerId);
 
+  // Unbilled billable time for the selected customer (P3.3) — the pool the
+  // "Add unbilled time" picker draws from. Fetched only while the picker is open.
+  type UnbilledTime = { id: number; projectId: number; projectName: string; userName: string; serviceDate: string; description: string; minutes: number; rateCents: number };
+  const { data: unbilledTime = [] } = useQuery<UnbilledTime[]>({
+    queryKey: ["/api/time-entries/unbilled", form.customerId],
+    queryFn: async () => (await apiRequest("GET", `/api/time-entries/unbilled?customerId=${form.customerId}`)).json(),
+    enabled: timePickerOpen && !!form.customerId,
+  });
+  function addPickedTime() {
+    const chosen = unbilledTime.filter((t) => pickedTime[t.id]);
+    if (chosen.length === 0) { setTimePickerOpen(false); return; }
+    const newLines: NewLine[] = chosen.map((t) => ({
+      description: t.description || `${t.projectName} — time (${(t.minutes / 60).toFixed(2)}h)`,
+      quantity: Number((t.minutes / 60).toFixed(2)),
+      rate: t.rateCents / 100,
+      incomeAccountId: incomeAccts[0]?.id ?? null,
+      projectId: t.projectId,
+      timeEntryId: t.id,
+    }));
+    // Drop a single empty starter line if present, then append.
+    const existing = form.lines.filter((l) => l.description || l.rate || (l.quantity && l.quantity !== 1) || l.itemId);
+    setForm({ ...form, lines: [...existing, ...newLines] });
+    setPickedTime({});
+    setTimePickerOpen(false);
+  }
+
   const createMut = useMutation({
     mutationFn: async () => {
       const customFields: Record<string, string> = {};
@@ -150,6 +181,7 @@ export default function Invoices() {
           itemId: l.itemId ?? undefined,
           serviceDate: cols.serviceDate.show && l.serviceDate ? l.serviceDate : undefined,
           projectId: l.projectId ?? undefined,
+          timeEntryId: l.timeEntryId ?? undefined,
         })),
       };
       const r = await apiRequest("POST", "/api/invoices", body);
@@ -501,6 +533,16 @@ export default function Invoices() {
                 <Button
                   variant="outline"
                   size="sm"
+                  disabled={!form.customerId}
+                  onClick={() => setTimePickerOpen(true)}
+                  data-testid="button-add-unbilled-time"
+                  title={form.customerId ? "Bill unbilled time for this customer" : "Pick a customer first"}
+                >
+                  <Plus className="h-4 w-4 mr-1" />Add unbilled time
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
                   onClick={() => setForm({ ...form, lines: [{ description: "", quantity: 1, rate: 0, incomeAccountId: incomeAccts[0]?.id ?? null }] })}
                   data-testid="button-clear-lines"
                 >
@@ -614,6 +656,42 @@ export default function Invoices() {
       {sharesOpen !== null && (
         <InvoiceSharesDialog invoiceId={sharesOpen} onClose={() => setSharesOpen(null)} />
       )}
+
+      {/* Add unbilled time picker (P3.3) */}
+      <Dialog open={timePickerOpen} onOpenChange={setTimePickerOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader><DialogTitle>Add unbilled time</DialogTitle></DialogHeader>
+          {unbilledTime.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4">No unbilled billable time for this customer's projects.</p>
+          ) : (
+            <div className="max-h-80 overflow-auto">
+              <table className="w-full text-sm">
+                <thead><tr className="border-b text-left text-xs text-muted-foreground">
+                  <th className="py-1 w-8"></th><th className="py-1">Date</th><th className="py-1">Project</th><th className="py-1">Who</th><th className="py-1">Description</th><th className="py-1 text-right">Hours</th><th className="py-1 text-right">Rate</th><th className="py-1 text-right">Amount</th>
+                </tr></thead>
+                <tbody>
+                  {unbilledTime.map((t) => (
+                    <tr key={t.id} className="border-b/50" data-testid={`unbilled-time-${t.id}`}>
+                      <td className="py-1"><input type="checkbox" checked={!!pickedTime[t.id]} onChange={(e) => setPickedTime({ ...pickedTime, [t.id]: e.target.checked })} data-testid={`check-time-${t.id}`} /></td>
+                      <td className="py-1">{t.serviceDate}</td>
+                      <td className="py-1">{t.projectName}</td>
+                      <td className="py-1">{t.userName}</td>
+                      <td className="py-1">{t.description || "—"}</td>
+                      <td className="py-1 text-right">{(t.minutes / 60).toFixed(2)}</td>
+                      <td className="py-1 text-right">{fmtMoney(t.rateCents)}</td>
+                      <td className="py-1 text-right">{fmtMoney(Math.round((t.minutes / 60) * t.rateCents))}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => { setPickedTime({}); setTimePickerOpen(false); }}>Cancel</Button>
+            <Button onClick={addPickedTime} disabled={unbilledTime.length === 0} data-testid="button-confirm-add-time">Add {Object.values(pickedTime).filter(Boolean).length || ""} to invoice</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Layout>
   );
 }

@@ -199,8 +199,47 @@ export const projects = pgTable("projects", {
   customerId: integer("customer_id"), // optional link to the customer this job is for
   status: text("status").notNull().default("active"), // active | completed | on_hold
   isActive: boolean("is_active").notNull().default(true),
+  // Budget targets for actual-vs-budget (integer cents). 0 = no budget set.
+  budgetIncomeCents: bigint("budget_income_cents", { mode: "number" }).notNull().default(0),
+  budgetCostCents: bigint("budget_cost_cents", { mode: "number" }).notNull().default(0),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
 });
+
+// ---------- TIME ENTRIES ----------
+// Billable/non-billable work logged against a project. A billable entry becomes
+// invoice revenue when added to an invoice; invoiced_line_id links it to the
+// exact invoice_line, which is the double-billing guard (non-null = billed).
+export const timeEntries = pgTable("time_entries", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  userId: integer("user_id").notNull(),
+  projectId: integer("project_id").notNull(),
+  serviceDate: text("service_date").notNull(), // YYYY-MM-DD
+  description: text("description").notNull().default(""),
+  minutes: integer("minutes").notNull(), // whole minutes; hours = minutes / 60
+  billable: boolean("billable").notNull().default(true),
+  rateCents: bigint("rate_cents", { mode: "number" }).notNull().default(0), // per-hour billing rate, integer cents
+  invoicedLineId: integer("invoiced_line_id"), // FK to invoice_lines once billed; NULL = unbilled
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type TimeEntry = typeof timeEntries.$inferSelect;
+
+export const insertTimeEntrySchema = createInsertSchema(timeEntries)
+  .omit({ id: true, orgId: true, invoicedLineId: true, createdAt: true, updatedAt: true })
+  .extend({
+    userId: z.number().int().positive(),
+    projectId: z.number().int().positive(),
+    serviceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be YYYY-MM-DD"),
+    description: z.string().max(500).default(""),
+    minutes: z.number().int().min(1, "Minutes must be at least 1").max(24 * 60, "A single entry cannot exceed 24 hours"),
+    billable: z.boolean().default(true),
+    rateCents: z.number().int().min(0).default(0),
+  });
+export type InsertTimeEntry = z.infer<typeof insertTimeEntrySchema>;
+// PATCH: every field optional (userId cannot be reassigned once logged).
+export const updateTimeEntrySchema = insertTimeEntrySchema.partial().omit({ userId: true });
+export type UpdateTimeEntry = z.infer<typeof updateTimeEntrySchema>;
 export const insertProjectSchema = createInsertSchema(projects)
   .omit({ id: true, orgId: true, createdAt: true })
   .extend({
@@ -574,6 +613,10 @@ export const createInvoiceSchema = z.object({
         classId: z.number().int().positive().nullable().optional(),
         locationId: z.number().int().positive().nullable().optional(),
         projectId: z.number().int().positive().nullable().optional(),
+        // When this line was generated from a billable time entry, its id is
+        // carried here so the server can link it (invoiced_line_id) and refuse
+        // to bill it twice. Validated + linked inside createInvoice's tx.
+        timeEntryId: z.number().int().positive().optional(),
       }).refine((l) => l.itemId !== undefined || l.incomeAccountId !== undefined, {
         message: "Each line must reference an itemId or an incomeAccountId",
         path: ["incomeAccountId"],

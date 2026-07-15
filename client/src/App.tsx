@@ -36,6 +36,7 @@ const Security = lazy(() => import("@/pages/Security"));
 const Settings = lazy(() => import("@/pages/Settings"));
 const MigrationWizard = lazy(() => import("@/pages/MigrationWizard"));
 const FirmDashboard = lazy(() => import("@/pages/FirmDashboard"));
+const Timesheet = lazy(() => import("@/pages/Timesheet"));
 const FirmInvite = lazy(() => import("@/pages/FirmInvite"));
 const ProductsServices = lazy(() => import("@/pages/ProductsServices"));
 const Budgeting = lazy(() => import("@/pages/Budgeting"));
@@ -126,6 +127,7 @@ function AppRouter() {
       <Route path="/audit" component={AuditLog} />
       <Route path="/security" component={Security} />
       <Route path="/firm" component={FirmDashboard} />
+      <Route path="/timesheet" component={Timesheet} />
       <Route path="/firm-invite" component={FirmInvite} />
       <Route path="/settings/import" component={MigrationWizard} />
       <Route path="/settings" component={Settings} />

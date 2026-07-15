@@ -26,6 +26,8 @@ import {
   insertClassSchema,
   insertLocationSchema,
   insertProjectSchema,
+  insertTimeEntrySchema,
+  updateTimeEntrySchema,
   postJournalEntrySchema,
   createInvoiceSchema,
   createBillSchema,
@@ -72,7 +74,7 @@ import { streamInvoicePdf, streamBillPdf, streamCustomerStatementPdf, streamVend
 import { sendEmail, smtpStatus, appBaseUrl } from "./email";
 import { attachSession, requireAuth, requireOrg, requireRole, startSessionCleanup } from "./auth";
 import { csrfProtect } from "./csrf";
-import { orgScopeMiddleware, currentOrgId } from "./org-scope";
+import { orgScopeMiddleware, currentOrgId, currentUserId } from "./org-scope";
 import { registerAuthRoutes } from "./auth-routes";
 import { registerFirmRoutes } from "./firm";
 import { registerStripeRoutes, stripeStatus, stripeOrgStatus } from "./stripe";
@@ -1086,6 +1088,46 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const updated = await storage.updateProject(parseId(req.params.id), insertProjectSchema.partial().parse(req.body));
       if (!updated) throw new Error("Project not found");
       return updated;
+    })
+  );
+  // Actual-vs-budget + unbilled time for one project (project detail page).
+  app.get("/api/projects/:id/budget", (req, res) =>
+    handle(res, () => storage.projectBudgetActual(parseId(req.params.id)))
+  );
+
+  // ---------- Time tracking (P3.3) ----------
+  app.get("/api/time-entries", (req, res) =>
+    handle(res, () => storage.listTimeEntries({
+      projectId: req.query.projectId ? parseId(req.query.projectId, "projectId") : undefined,
+      userId: req.query.userId ? parseId(req.query.userId, "userId") : undefined,
+      from: (req.query.from as string) || undefined,
+      to: (req.query.to as string) || undefined,
+      unbilledOnly: req.query.unbilledOnly === "true",
+    }))
+  );
+  // Unbilled billable time for a customer's projects — the invoice picker.
+  app.get("/api/time-entries/unbilled", (req, res) =>
+    handle(res, () => storage.listUnbilledTimeForCustomer(parseId(req.query.customerId, "customerId")))
+  );
+  app.post("/api/time-entries", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => {
+      // Default the logged user to the acting user; admins may log for others.
+      const body = { userId: currentUserId(), ...req.body };
+      return storage.createTimeEntry(insertTimeEntrySchema.parse(body));
+    })
+  );
+  app.patch("/api/time-entries/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const updated = await storage.updateTimeEntry(parseId(req.params.id), updateTimeEntrySchema.parse(req.body));
+      if (!updated) throw new Error("Time entry not found");
+      return updated;
+    })
+  );
+  app.delete("/api/time-entries/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const ok = await storage.deleteTimeEntry(parseId(req.params.id));
+      if (!ok) throw new Error("Time entry not found");
+      return { ok: true };
     })
   );
 
