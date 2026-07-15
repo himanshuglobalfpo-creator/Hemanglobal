@@ -84,40 +84,6 @@ function withTimeout<T>(p: Promise<T>, ms = FETCH_TIMEOUT_MS): Promise<T> {
 // ---------------------------------------------------------------------------
 // Brand SVGs
 // ---------------------------------------------------------------------------
-function GoogleG() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true">
-      <path
-        fill="#EA4335"
-        d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
-      />
-      <path
-        fill="#4285F4"
-        d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
-      />
-      <path
-        fill="#FBBC05"
-        d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
-      />
-      <path
-        fill="#34A853"
-        d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
-      />
-    </svg>
-  );
-}
-
-function MicrosoftLogo() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 21 21" aria-hidden="true">
-      <rect x="1" y="1" width="9" height="9" fill="#F25022" />
-      <rect x="11" y="1" width="9" height="9" fill="#7FBA00" />
-      <rect x="1" y="11" width="9" height="9" fill="#00A4EF" />
-      <rect x="11" y="11" width="9" height="9" fill="#FFB900" />
-    </svg>
-  );
-}
-
 function EnvelopeIllustration() {
   return (
     <svg viewBox="0 0 96 72" className="h-20 w-auto mx-auto text-primary" fill="none" aria-hidden="true">
@@ -125,74 +91,6 @@ function EnvelopeIllustration() {
       <path d="M8 14l40 30 40-30" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
       <path d="M12 60l26-22M84 60L58 38" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
     </svg>
-  );
-}
-
-function Spinner() {
-  return (
-    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
-    </svg>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Social login buttons (shared by login + signup)
-// ---------------------------------------------------------------------------
-function SocialButtons({
-  highlightGoogle,
-  context,
-}: {
-  highlightGoogle: boolean;
-  context: "login" | "signup";
-}) {
-  const [redirecting, setRedirecting] = useState<"google" | "microsoft" | null>(null);
-
-  const go = (provider: "google" | "microsoft") => {
-    setRedirecting(provider);
-    window.location.href = `/api/auth/${provider}`;
-    // If the redirect somehow stalls, don't spin forever (10s rule).
-    setTimeout(() => setRedirecting(null), FETCH_TIMEOUT_MS);
-  };
-
-  return (
-    <div className="space-y-3">
-      <button
-        type="button"
-        onClick={() => go("google")}
-        disabled={redirecting !== null}
-        data-testid={`button-${context}-google`}
-        className={
-          "w-full h-11 flex items-center justify-center gap-3 rounded-lg border border-gray-300 bg-white " +
-          "text-[13px] font-medium text-gray-700 hover:bg-gray-50 transition disabled:opacity-70 " +
-          (highlightGoogle ? "animate-pulse ring-2 ring-primary ring-offset-2" : "")
-        }
-      >
-        {redirecting === "google" ? <Spinner /> : <GoogleG />}
-        Continue with Google
-      </button>
-      <button
-        type="button"
-        onClick={() => go("microsoft")}
-        disabled={redirecting !== null}
-        data-testid={`button-${context}-microsoft`}
-        className="w-full h-11 flex items-center justify-center gap-3 rounded-lg bg-[#2F2F2F] text-[13px] font-medium text-white hover:bg-[#1f1f1f] transition disabled:opacity-70"
-      >
-        {redirecting === "microsoft" ? <Spinner /> : <MicrosoftLogo />}
-        Continue with Microsoft
-      </button>
-    </div>
-  );
-}
-
-function OrDivider() {
-  return (
-    <div className="flex items-center gap-3" aria-hidden="true">
-      <div className="h-px flex-1 bg-border" />
-      <span className="text-xs text-gray-400">or</span>
-      <div className="h-px flex-1 bg-border" />
-    </div>
   );
 }
 
@@ -359,8 +257,6 @@ export default function Auth() {
   const [verifiedBanner, setVerifiedBanner] = useState(false);
   const [signupSuccessBanner, setSignupSuccessBanner] = useState(false);
   const [forgotSent, setForgotSent] = useState(false);
-  const [highlightGoogle, setHighlightGoogle] = useState(false);
-  const [useGoogleMessage, setUseGoogleMessage] = useState(false);
 
   const setView = (v: View) => {
     setOtpError(null);
@@ -415,15 +311,7 @@ export default function Auth() {
     try {
       await withTimeout(fn());
     } catch (e: any) {
-      const msg = friendlyError(e);
-      // "This account uses Google login" → point at the Google button and pulse it.
-      if (/uses google/i.test(msg)) {
-        setUseGoogleMessage(true);
-        setHighlightGoogle(true);
-        setTimeout(() => setHighlightGoogle(false), 2000);
-      } else {
-        toast({ title: "Error", description: msg, variant: "destructive" });
-      }
+      toast({ title: "Error", description: friendlyError(e), variant: "destructive" });
     } finally {
       setBusy(false);
     }
@@ -442,7 +330,6 @@ export default function Auth() {
 
   const doLogin = () =>
     submit(async () => {
-      setUseGoogleMessage(false);
       const r = await apiRequest("POST", "/api/auth/login", { email, password });
       const body = await r.json();
       if (body?.mfaRequired && body?.mfaToken) {
@@ -616,16 +503,6 @@ export default function Auth() {
         {/* ================================ LOGIN ================================ */}
         {view === "login" && (
           <div className="space-y-5">
-            <SocialButtons highlightGoogle={highlightGoogle} context="login" />
-
-            {useGoogleMessage && (
-              <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" data-testid="text-use-google">
-                This account uses Google login — use the "Sign in with Google" button above.
-              </p>
-            )}
-
-            <OrDivider />
-
             <div className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="login-email">Email</Label>
@@ -698,9 +575,6 @@ export default function Auth() {
         {/* ================================ SIGNUP =============================== */}
         {view === "signup" && (
           <div className="space-y-5">
-            <SocialButtons highlightGoogle={highlightGoogle} context="signup" />
-            <OrDivider />
-
             <div className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="signup-name">Your full name</Label>

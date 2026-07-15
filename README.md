@@ -4,7 +4,7 @@ A multi-tenant accounting SaaS — invoices, bills, banking, double-entry journa
 period close, and the full standard report set (P&L, Balance Sheet, Trial Balance,
 Cash Flow, A/R Aging, A/P Aging, General Ledger, Tax Liability).
 
-Built with TypeScript, Express, React, Drizzle ORM, and SQLite (Postgres-ready).
+Built with TypeScript, Express, React, Drizzle ORM, and PostgreSQL.
 
 ---
 
@@ -93,7 +93,7 @@ gracefully no-op when their credentials are missing.
 | Variable | Required | Purpose |
 |---|---|---|
 | `APP_BASE_URL` | Yes | Public URL of the app (used in share links) |
-| `DB_PATH` | No | SQLite file path. Default `data.db` |
+| `DATABASE_URL` | Yes | PostgreSQL connection string (e.g. `postgresql://user:pass@host:5432/db`) |
 | `PORT` | No | HTTP port. Default `5000` |
 | `SMTP_*` | No | Email sending. Without these, emails log to stdout |
 | `STRIPE_SECRET_KEY` | No | Online invoice payments |
@@ -174,7 +174,7 @@ All five pass on every commit. Wire into CI with `npm test`.
 └─────────────────────────────────────────────────────────────────┘
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  SQLite (Drizzle ORM)                                           │
+│  PostgreSQL (Drizzle ORM)                                           │
 │  19 tables. Every business table has org_id (FK organizations). │
 │  Auto-migrations on first boot — no manual steps.               │
 └─────────────────────────────────────────────────────────────────┘

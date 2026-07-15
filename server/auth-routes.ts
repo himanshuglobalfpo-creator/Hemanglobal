@@ -172,6 +172,88 @@ export function registerAuthRoutes(app: Express) {
     })
   );
 
+  // ------ Auth providers (capability flags for the login UI) ------------------
+  // The client shows only the sign-in methods that are actually available.
+  // OTP + password are always on. OAuth (Google/Microsoft) is not implemented,
+  // so it reports false — this endpoint is the forward-compatible hook a future
+  // OAuth integration would flip once its routes exist.
+  app.get("/api/auth/providers", (_req, res) =>
+    res.json({ password: true, otp: true, google: false, microsoft: false })
+  );
+
+  // ------ Email OTP login -----------------------------------------------------
+  // Passwordless sign-in via a 6-digit code emailed to the user. The code is
+  // stored only as a bcrypt hash, expires in 5 minutes, allows at most one live
+  // code per user, and locks the code after MAX_OTP_ATTEMPTS wrong tries. Both
+  // endpoints are CSRF-exempt (pre-session; see server/csrf.ts) and rate-limited.
+  const OTP_TTL_MS = 5 * 60_000;
+  const MAX_OTP_ATTEMPTS = 5;
+
+  app.post("/api/auth/otp/request", authLimiter, (req, res) =>
+    handle(res, async () => {
+      const email = String(req.body?.email || "").trim().toLowerCase();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error("A valid email address is required.");
+      const u = await getUserByEmail(email);
+      // Neutral response either way — never reveal whether the email is registered.
+      if (u) {
+        const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
+        const codeHash = await hashPassword(code);
+        const expires = new Date(Date.now() + OTP_TTL_MS).toISOString();
+        // One live code per user: drop any prior codes before inserting.
+        await pool.query(`DELETE FROM login_otps WHERE user_id = $1`, [u.id]);
+        await pool.query(`INSERT INTO login_otps (user_id, code_hash, expires_at) VALUES ($1, $2, $3)`, [u.id, codeHash, expires]);
+        await sendEmail({
+          to: email,
+          subject: "Your LedgerLite sign-in code",
+          text: `Your LedgerLite sign-in code is ${code}\n\nIt expires in 5 minutes. If you didn't request it, you can ignore this email.`,
+        }).catch((e) => logger.error("[otp] email send failed", { error: e?.message }));
+      }
+      return { ok: true, message: "If that email is registered, a sign-in code is on its way." };
+    })
+  );
+
+  app.post("/api/auth/otp/verify", authLimiter, (req, res) =>
+    handle(res, async () => {
+      const email = String(req.body?.email || "").trim().toLowerCase();
+      const code = String(req.body?.code || "").trim();
+      const generic = "That code is invalid or has expired.";
+      if (!/^\d{6}$/.test(code)) throw new Error(generic);
+      const u = await getUserByEmail(email);
+      if (!u) throw new Error(generic);
+      const row = (await pool.query(
+        `SELECT id, code_hash AS "codeHash", expires_at AS "expiresAt", attempts
+           FROM login_otps WHERE user_id = $1 ORDER BY id DESC LIMIT 1`,
+        [u.id]
+      )).rows[0] as { id: number; codeHash: string; expiresAt: string; attempts: number } | undefined;
+      if (!row) throw new Error(generic);
+      if (new Date(row.expiresAt).getTime() < Date.now()) {
+        await pool.query(`DELETE FROM login_otps WHERE id = $1`, [row.id]);
+        throw new Error(generic);
+      }
+      if (row.attempts >= MAX_OTP_ATTEMPTS) {
+        await pool.query(`DELETE FROM login_otps WHERE id = $1`, [row.id]);
+        throw new Error("Too many attempts. Request a new code.");
+      }
+      const ok = await verifyPassword(code, row.codeHash);
+      if (!ok) {
+        await pool.query(`UPDATE login_otps SET attempts = attempts + 1 WHERE id = $1`, [row.id]);
+        throw new Error(generic);
+      }
+      // Success: burn the code and establish a session (same as password login).
+      await pool.query(`DELETE FROM login_otps WHERE user_id = $1`, [u.id]);
+      const orgs = await listOrgsForUser(u.id);
+      const activeOrg = orgs[0] || null;
+      const s = await createSession(u.id, activeOrg?.id ?? null, req);
+      setSessionCookie(res, s.id);
+      return {
+        user: { id: u.id, email: u.email, name: u.name },
+        org: activeOrg ? { id: activeOrg.id, name: activeOrg.name, slug: activeOrg.slug } : null,
+        role: activeOrg?.role ?? null,
+        orgs: orgs.map((o) => ({ id: o.id, name: o.name, slug: o.slug, role: o.role })),
+      };
+    })
+  );
+
   // ------ MFA (TOTP) ----------------------------------------------------------
   // Setup: mint a secret, store it ENCRYPTED but PENDING (totp_enabled stays
   // false until the user proves possession by submitting a valid code).

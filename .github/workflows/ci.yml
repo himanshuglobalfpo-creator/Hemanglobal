@@ -26,6 +26,10 @@ jobs:
         run: npm run lint
       - name: Typecheck
         run: npm run check
+      - name: API contract (client paths ↔ server routes)
+        run: npm run check:contract
+      - name: Version-literal consistency
+        run: npm run check:version
       - name: Client unit tests (Vitest)
         run: npm run test:client
 
@@ -74,3 +78,61 @@ jobs:
           name: playwright-report
           path: playwright-report/
           retention-days: 7
+
+  # Prod-smoke: build the SHIPPING artifact and boot it exactly as production
+  # would (NODE_ENV=production node dist/index.mjs) against a disposable
+  # Postgres, then require /api/health/ready = 200. This is the gate that
+  # catches ESM/bundle boot regressions (BUG-1/BUG-3) before merge — the unit
+  # suite can pass while the packaged server fails to start.
+  prod-smoke:
+    name: Prod artifact boot smoke
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NODE_ENV: production
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      APP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      SESSION_SECRET: ci-session-secret-0123456789
+      PORT: "5000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # Install prod deps as production would (--omit=dev), then add just the
+      # build toolchain needed to produce the artifact, so a dependency that was
+      # wrongly placed in devDependencies is caught here.
+      - name: Build the production artifact
+        run: |
+          npm ci
+          npm run build
+      - name: Reinstall production-only deps
+        run: npm ci --omit=dev
+      - name: Boot dist/index.mjs and require health/ready = 200
+        run: |
+          node dist/index.mjs &
+          SERVER_PID=$!
+          echo "Booted server pid=$SERVER_PID"
+          ok=0
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5000/api/health/ready" || echo 000)
+            echo "attempt $i → $code"
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 2
+          done
+          kill "$SERVER_PID" 2>/dev/null || true
+          if [ "$ok" != "1" ]; then echo "::error::production artifact did not reach health/ready=200"; exit 1; fi
+          echo "✅ dist/index.mjs booted and /api/health/ready returned 200"

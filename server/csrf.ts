@@ -40,6 +40,9 @@ const EXEMPT_PATHS = new Set([
   // Pre-session: the 5-minute single-use challenge token is the credential;
   // no session cookie exists yet to forge.
   "/api/auth/mfa/verify",
+  // Pre-session passwordless login — the emailed 6-digit code is the credential.
+  "/api/auth/otp/request",
+  "/api/auth/otp/verify",
   "/api/stripe/webhook",
   "/api/plaid/webhook",
 ]);

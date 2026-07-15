@@ -54,15 +54,27 @@ export async function verifyPassword(plain: string, hash: string): Promise<boole
 // User CRUD
 // ----------------------------------------------------------------------------
 export async function createUser(email: string, password: string, name: string): Promise<User> {
-  const existing = await db.select().from(users).where(eq(users.email, email)).then((r: any[]) => r[0]);
+  // Normalize BEFORE the existence check so "User@X.com" and "user@x.com" are the
+  // same account — otherwise a case variant would pass this check and then hit
+  // the DB unique index with a raw error.
+  const normalizedEmail = email.trim().toLowerCase();
+  const existing = await db.select().from(users).where(eq(users.email, normalizedEmail)).then((r: any[]) => r[0]);
   if (existing) throw new Error("An account with this email already exists.");
   const passwordHash = await hashPassword(password);
   const verifyToken = crypto.randomBytes(24).toString("base64url");
-  const u = await db
-    .insert(users)
-    .values({ email: email.toLowerCase(), passwordHash, name, emailVerifyToken: verifyToken })
-    .returning().then((r) => r[0]);
-  return u;
+  try {
+    return await db
+      .insert(users)
+      .values({ email: normalizedEmail, passwordHash, name, emailVerifyToken: verifyToken })
+      .returning().then((r) => r[0]);
+  } catch (e: any) {
+    // Race: a concurrent signup won the unique index between the check and the
+    // insert. Surface the same friendly message instead of a Postgres 23505.
+    if (e?.code === "23505" || /unique|duplicate key/i.test(String(e?.message))) {
+      throw new Error("An account with this email already exists.");
+    }
+    throw e;
+  }
 }
 
 export async function getUserById(id: number): Promise<User | undefined> {
