@@ -54,6 +54,7 @@ export default function Invoices() {
   const [manageOpen, setManageOpen] = useState(false);
   const [timePickerOpen, setTimePickerOpen] = useState(false);
   const [pickedTime, setPickedTime] = useState<Record<number, boolean>>({});
+  const [ruleHints, setRuleHints] = useState<Record<number, string>>({});
 
   const voidMut = useMutation({
     mutationFn: async (id: number) => (await apiRequest("POST", `/api/invoices/${id}/void`)).json(),
@@ -154,6 +155,23 @@ export default function Invoices() {
     setForm({ ...form, lines: [...existing, ...newLines] });
     setPickedTime({});
     setTimePickerOpen(false);
+  }
+
+  // Resolve the best price rule for a line and pre-fill the (editable) rate,
+  // showing a "rule applied" hint. Rules never mutate stored item prices — this
+  // only adjusts the rate in the form. Base rate = the line's current rate.
+  async function applyPricing(idx: number, itemId: number, baseRate: number) {
+    try {
+      const params = new URLSearchParams({ itemId: String(itemId), baseRate: String(baseRate || 0), date: form.date });
+      if (form.customerId) params.set("customerId", String(form.customerId));
+      const r = await (await apiRequest("GET", `/api/pricing/resolve?${params.toString()}`)).json();
+      if (r.applied) {
+        setForm((f) => { const lines = [...f.lines]; if (lines[idx]) lines[idx] = { ...lines[idx], rate: r.resolvedRate }; return { ...f, lines }; });
+        setRuleHints((h) => ({ ...h, [idx]: r.description || "Price rule applied" }));
+      } else {
+        setRuleHints((h) => { const n = { ...h }; delete n[idx]; return n; });
+      }
+    } catch { /* pricing is best-effort; leave the rate as entered */ }
   }
 
   const createMut = useMutation({
@@ -460,6 +478,9 @@ export default function Invoices() {
                                   if (!lines[idx].description) lines[idx].description = it.name;
                                 }
                                 setForm({ ...form, lines });
+                                // Resolve a customer/date/item price rule (P3.4).
+                                if (it) applyPricing(idx, it.id, lines[idx].rate);
+                                else setRuleHints((h) => { const n = { ...h }; delete n[idx]; return n; });
                               }}
                             >
                               <option value="">—</option>
@@ -506,6 +527,7 @@ export default function Invoices() {
                         {cols.rate.show && (
                           <td className="px-2 py-1">
                             <Input type="number" step="0.01" data-testid={`input-line-rate-${idx}`} className="text-right" value={l.rate} onChange={(e) => { const lines = [...form.lines]; lines[idx].rate = Number(e.target.value); setForm({ ...form, lines }); }} />
+                            {ruleHints[idx] && <div className="mt-0.5 text-[10px] text-green-700" data-testid={`rule-hint-${idx}`}>{ruleHints[idx]}</div>}
                           </td>
                         )}
                         {cols.amount.show && <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(l.quantity * l.rate)}</td>}

@@ -415,6 +415,8 @@ export const items = pgTable("items", {
   expenseAccountId: integer("expense_account_id").notNull(), // expense debited on a service/non-inventory purchase
   inventoryAssetAccountId: integer("inventory_asset_account_id"), // null for service/non-inventory
   cogsAccountId: integer("cogs_account_id").notNull(),     // COGS debited when inventory is sold
+  // Lightweight product category (nullable) — targeted by category-scoped price rules.
+  category: text("category"),
   quantityOnHand: integer("quantity_on_hand").notNull().default(0), // whole units
   // Weighted-average unit cost. Stored in cents (integer). $2.50 = 250. Never REAL.
   avgCostCents: bigint("avg_cost_cents", { mode: "number" }).notNull().default(0),
@@ -458,6 +460,77 @@ export const insertItemSchema = baseItemSchema.superRefine(refineItemShape);
 export const updateItemSchema = baseItemSchema.partial().superRefine(refineItemShape);
 export type InsertItem = z.infer<typeof insertItemSchema>;
 export type UpdateItem = z.infer<typeof updateItemSchema>;
+
+// ============================================================================
+// PRICE RULES (P3.4) — customer-specific & scoped pricing
+// ============================================================================
+// A rule adjusts the unit rate at line entry. Resolution (server) picks the
+// best applicable rule — highest priority, then most specific — and returns an
+// adjusted rate; rules NEVER write back to items. Rules operate in the DOCUMENT
+// currency (base in / adjusted out, no FX conversion).
+export const PRICE_ITEM_SCOPES = ["all", "list", "category"] as const;
+export const PRICE_CUSTOMER_SCOPES = ["all", "list"] as const;
+export const PRICE_ADJUST_TYPES = ["percent", "fixed"] as const;
+export const PRICE_DIRECTIONS = ["discount", "surcharge"] as const;
+
+export const priceRules = pgTable("price_rules", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  name: text("name").notNull(),
+  itemScope: text("item_scope").notNull().default("all"),      // all | list | category
+  category: text("category"),                                  // when itemScope = 'category'
+  customerScope: text("customer_scope").notNull().default("all"), // all | list
+  adjustType: text("adjust_type").notNull(),                   // percent | fixed
+  direction: text("direction").notNull().default("discount"),  // discount | surcharge
+  percent: doublePrecision("percent"),                         // when adjustType = 'percent'
+  amountCents: bigint("amount_cents", { mode: "number" }),     // when adjustType = 'fixed' (document-currency cents)
+  startDate: text("start_date"),                               // YYYY-MM-DD inclusive; null = open
+  endDate: text("end_date"),
+  priority: integer("priority").notNull().default(0),          // higher wins first
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type PriceRule = typeof priceRules.$inferSelect;
+
+export const priceRuleItems = pgTable("price_rule_items", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  ruleId: integer("rule_id").notNull(),
+  itemId: integer("item_id").notNull(),
+});
+export const priceRuleCustomers = pgTable("price_rule_customers", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  ruleId: integer("rule_id").notNull(),
+  customerId: integer("customer_id").notNull(),
+});
+
+export const createPriceRuleSchema = z.object({
+  name: z.string().min(1).max(160),
+  itemScope: z.enum(PRICE_ITEM_SCOPES).default("all"),
+  category: z.string().max(120).nullable().optional(),
+  customerScope: z.enum(PRICE_CUSTOMER_SCOPES).default("all"),
+  adjustType: z.enum(PRICE_ADJUST_TYPES),
+  direction: z.enum(PRICE_DIRECTIONS).default("discount"),
+  percent: z.number().min(0).max(100).nullable().optional(),
+  amountCents: z.number().int().min(0).nullable().optional(),
+  startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+  endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+  priority: z.number().int().default(0),
+  isActive: z.boolean().default(true),
+  itemIds: z.array(z.number().int().positive()).default([]),      // when itemScope = 'list'
+  customerIds: z.array(z.number().int().positive()).default([]),  // when customerScope = 'list'
+}).superRefine((v, ctx) => {
+  if (v.adjustType === "percent" && (v.percent === null || v.percent === undefined))
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["percent"], message: "percent is required for a percent rule" });
+  if (v.adjustType === "fixed" && (v.amountCents === null || v.amountCents === undefined))
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["amountCents"], message: "amountCents is required for a fixed rule" });
+  if (v.itemScope === "category" && !v.category)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["category"], message: "category is required for a category-scoped rule" });
+  if (v.startDate && v.endDate && v.endDate < v.startDate)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["endDate"], message: "endDate must be on or after startDate" });
+});
+export type CreatePriceRuleInput = z.infer<typeof createPriceRuleSchema>;
 
 // ============================================================================
 // INVENTORY MOVEMENTS — the append-only ledger behind quantity_on_hand

@@ -41,6 +41,11 @@ import {
   locations,
   projects,
   timeEntries,
+  priceRules,
+  priceRuleItems,
+  priceRuleCustomers,
+  type PriceRule,
+  type CreatePriceRuleInput,
   type OrgNexusState,
   type NexusStateInput,
   type Class,
@@ -1499,6 +1504,137 @@ export class DatabaseStorage {
       actualIncome, actualCost, actualNet: actualIncome - actualCost,
       budgetIncome: project.budgetIncomeCents, budgetCost: project.budgetCostCents, budgetNet: project.budgetIncomeCents - project.budgetCostCents,
       unbilledMinutes: Number(unbilled.minutes), unbilledAmount: Number(unbilled.amount),
+    };
+  }
+
+  // --------------------------------------------------------------------------
+  // PRICE RULES (P3.4)
+  // --------------------------------------------------------------------------
+  async listPriceRules(): Promise<Array<PriceRule & { itemIds: number[]; customerIds: number[] }>> {
+    const orgId = currentOrgId();
+    const rules = await db.select().from(priceRules).where(eq(priceRules.orgId, orgId)).orderBy(desc(priceRules.priority), priceRules.id);
+    const items = (await pool.query(`SELECT rule_id AS "ruleId", item_id AS "itemId" FROM price_rule_items WHERE org_id = $1`, [orgId])).rows as any[];
+    const custs = (await pool.query(`SELECT rule_id AS "ruleId", customer_id AS "customerId" FROM price_rule_customers WHERE org_id = $1`, [orgId])).rows as any[];
+    return rules.map((r) => ({
+      ...r,
+      itemIds: items.filter((x) => x.ruleId === r.id).map((x) => x.itemId),
+      customerIds: custs.filter((x) => x.ruleId === r.id).map((x) => x.customerId),
+    }));
+  }
+
+  async createPriceRule(input: CreatePriceRuleInput): Promise<PriceRule> {
+    const orgId = currentOrgId();
+    return await db.transaction(async (tx) => {
+      const rule = await tx.insert(priceRules).values({
+        orgId, name: input.name, itemScope: input.itemScope, category: input.category ?? null,
+        customerScope: input.customerScope, adjustType: input.adjustType, direction: input.direction,
+        percent: input.adjustType === "percent" ? (input.percent ?? 0) : null,
+        amountCents: input.adjustType === "fixed" ? (input.amountCents ?? 0) : null,
+        startDate: input.startDate ?? null, endDate: input.endDate ?? null,
+        priority: input.priority, isActive: input.isActive,
+      }).returning().then((r: any[]) => r[0]);
+      if (input.itemScope === "list") {
+        for (const itemId of input.itemIds) await tx.insert(priceRuleItems).values({ orgId, ruleId: rule.id, itemId });
+      }
+      if (input.customerScope === "list") {
+        for (const customerId of input.customerIds) await tx.insert(priceRuleCustomers).values({ orgId, ruleId: rule.id, customerId });
+      }
+      return rule;
+    }).then(async (rule) => {
+      await this.audit("create", "price_rule", rule.id, `Created price rule "${rule.name}"`);
+      return rule;
+    });
+  }
+
+  async setPriceRuleActive(id: number, isActive: boolean): Promise<PriceRule | undefined> {
+    const row = await db.update(priceRules).set({ isActive })
+      .where(and(eq(priceRules.id, id), eq(priceRules.orgId, currentOrgId())))
+      .returning().then((r) => r[0]);
+    if (row) await this.audit("update", "price_rule", id, `${isActive ? "Enabled" : "Disabled"} price rule "${row.name}"`);
+    return row;
+  }
+
+  async deletePriceRule(id: number): Promise<boolean> {
+    const orgId = currentOrgId();
+    const existing = await db.select().from(priceRules).where(and(eq(priceRules.id, id), eq(priceRules.orgId, orgId))).then((r: any[]) => r[0]);
+    if (!existing) return false;
+    await db.transaction(async (tx) => {
+      await tx.delete(priceRuleItems).where(and(eq(priceRuleItems.ruleId, id), eq(priceRuleItems.orgId, orgId)));
+      await tx.delete(priceRuleCustomers).where(and(eq(priceRuleCustomers.ruleId, id), eq(priceRuleCustomers.orgId, orgId)));
+      await tx.delete(priceRules).where(and(eq(priceRules.id, id), eq(priceRules.orgId, orgId)));
+    });
+    await this.audit("delete", "price_rule", id, `Deleted price rule "${existing.name}"`);
+    return true;
+  }
+
+  // Resolve the best applicable price rule for (item, customer, date) and apply
+  // it to baseRate. baseRate + the returned rate are BOTH in the document
+  // currency — a rule never performs FX conversion. "Best" = highest priority,
+  // then most specific (list beats category beats all; a customer-list rule
+  // beats an all-customers rule), then lowest id as a stable tiebreak.
+  async resolvePrice(opts: { itemId: number; customerId?: number | null; date?: string; baseRate: number; currency?: string | null }): Promise<{
+    baseRate: number; resolvedRate: number; currency: string | null;
+    applied: boolean; ruleId?: number; ruleName?: string; description?: string;
+  }> {
+    const orgId = currentOrgId();
+    const date = opts.date && /^\d{4}-\d{2}-\d{2}$/.test(opts.date) ? opts.date : new Date().toISOString().slice(0, 10);
+    const currency = opts.currency ?? null;
+    const item = await db.select().from(items).where(and(eq(items.id, opts.itemId), eq(items.orgId, orgId))).then((r: any[]) => r[0]);
+    if (!item) throw new Error(`Item #${opts.itemId} not found`);
+
+    // Candidate rules: active and within the date window (inclusive, open-ended
+    // when a bound is null).
+    const candidates = (await pool.query(
+      `SELECT * FROM price_rules
+        WHERE org_id = $1 AND is_active = true
+          AND (start_date IS NULL OR start_date <= $2)
+          AND (end_date   IS NULL OR end_date   >= $2)`,
+      [orgId, date]
+    )).rows as any[];
+    if (candidates.length === 0) return { baseRate: opts.baseRate, resolvedRate: opts.baseRate, currency, applied: false };
+
+    const ruleIds = candidates.map((r) => r.id);
+    const ruleItems = (await pool.query(`SELECT rule_id, item_id FROM price_rule_items WHERE org_id = $1 AND rule_id = ANY($2)`, [orgId, ruleIds])).rows as any[];
+    const ruleCusts = (await pool.query(`SELECT rule_id, customer_id FROM price_rule_customers WHERE org_id = $1 AND rule_id = ANY($2)`, [orgId, ruleIds])).rows as any[];
+    const itemsByRule = new Map<number, Set<number>>();
+    for (const r of ruleItems) { if (!itemsByRule.has(r.rule_id)) itemsByRule.set(r.rule_id, new Set()); itemsByRule.get(r.rule_id)!.add(r.item_id); }
+    const custsByRule = new Map<number, Set<number>>();
+    for (const r of ruleCusts) { if (!custsByRule.has(r.rule_id)) custsByRule.set(r.rule_id, new Set()); custsByRule.get(r.rule_id)!.add(r.customer_id); }
+
+    const applicable = candidates.filter((r) => {
+      // Item match
+      let itemOk = false;
+      if (r.item_scope === "all") itemOk = true;
+      else if (r.item_scope === "list") itemOk = itemsByRule.get(r.id)?.has(opts.itemId) ?? false;
+      else if (r.item_scope === "category") itemOk = !!r.category && item.category === r.category;
+      if (!itemOk) return false;
+      // Customer match
+      if (r.customer_scope === "all") return true;
+      if (r.customer_scope === "list") return opts.customerId != null && (custsByRule.get(r.id)?.has(opts.customerId) ?? false);
+      return false;
+    });
+    if (applicable.length === 0) return { baseRate: opts.baseRate, resolvedRate: opts.baseRate, currency, applied: false };
+
+    // Specificity: item list(2) > category(1) > all(0); customer list adds 2.
+    const specificity = (r: any) => (r.item_scope === "list" ? 2 : r.item_scope === "category" ? 1 : 0) + (r.customer_scope === "list" ? 2 : 0);
+    applicable.sort((a, b) => (b.priority - a.priority) || (specificity(b) - specificity(a)) || (a.id - b.id));
+    const best = applicable[0];
+
+    let resolved = opts.baseRate;
+    if (best.adjust_type === "percent") {
+      const factor = best.direction === "discount" ? 1 - Number(best.percent) / 100 : 1 + Number(best.percent) / 100;
+      resolved = opts.baseRate * factor;
+    } else { // fixed: adjust by a document-currency amount (cents → rate dollars)
+      const delta = Number(best.amount_cents) / 100;
+      resolved = best.direction === "discount" ? opts.baseRate - delta : opts.baseRate + delta;
+    }
+    resolved = Math.max(0, Math.round(resolved * 10000) / 10000); // never negative; tidy float noise
+    return {
+      baseRate: opts.baseRate, resolvedRate: resolved, currency, applied: true,
+      ruleId: best.id, ruleName: best.name,
+      description: best.adjust_type === "percent"
+        ? `${best.name}: ${best.direction === "discount" ? "-" : "+"}${Number(best.percent)}%`
+        : `${best.name}: ${best.direction === "discount" ? "-" : "+"}${formatMoney(Number(best.amount_cents))}`,
     };
   }
   // Validate that every referenced class/location/project id exists in THIS org.

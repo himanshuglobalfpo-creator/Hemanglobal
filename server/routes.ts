@@ -28,6 +28,7 @@ import {
   insertProjectSchema,
   insertTimeEntrySchema,
   updateTimeEntrySchema,
+  createPriceRuleSchema,
   postJournalEntrySchema,
   createInvoiceSchema,
   createBillSchema,
@@ -1129,6 +1130,37 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (!ok) throw new Error("Time entry not found");
       return { ok: true };
     })
+  );
+
+  // ---------- Price rules (P3.4) ----------
+  app.get("/api/price-rules", (req, res) => handle(res, () => storage.listPriceRules()));
+  app.post("/api/price-rules", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => storage.createPriceRule(createPriceRuleSchema.parse(req.body)))
+  );
+  app.patch("/api/price-rules/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const updated = await storage.setPriceRuleActive(parseId(req.params.id), req.body?.isActive !== false);
+      if (!updated) throw new Error("Price rule not found");
+      return updated;
+    })
+  );
+  app.delete("/api/price-rules/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const ok = await storage.deletePriceRule(parseId(req.params.id));
+      if (!ok) throw new Error("Price rule not found");
+      return { ok: true };
+    })
+  );
+  // Resolve the best rule for a line and return the adjusted rate (document
+  // currency). Used by the invoice/estimate line editor on item/customer change.
+  app.get("/api/pricing/resolve", (req, res) =>
+    handle(res, () => storage.resolvePrice({
+      itemId: parseId(req.query.itemId, "itemId"),
+      customerId: req.query.customerId ? parseId(req.query.customerId, "customerId") : null,
+      date: (req.query.date as string) || undefined,
+      baseRate: Number(req.query.baseRate ?? 0),
+      currency: (req.query.currency as string) || null,
+    }))
   );
 
   // ---------- Journal ----------
