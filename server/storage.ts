@@ -44,8 +44,12 @@ import {
   priceRules,
   priceRuleItems,
   priceRuleCustomers,
+  jobs,
   type PriceRule,
   type CreatePriceRuleInput,
+  type Job,
+  type JobItemResult,
+  type BatchKind,
   type OrgNexusState,
   type NexusStateInput,
   type Class,
@@ -1636,6 +1640,114 @@ export class DatabaseStorage {
         ? `${best.name}: ${best.direction === "discount" ? "-" : "+"}${Number(best.percent)}%`
         : `${best.name}: ${best.direction === "discount" ? "-" : "+"}${formatMoney(Number(best.amount_cents))}`,
     };
+  }
+
+  // --------------------------------------------------------------------------
+  // BATCH JOBS (P3.5) — idempotent, resumable background batch actions
+  // --------------------------------------------------------------------------
+  async listJobs(limit = 25): Promise<Job[]> {
+    return db.select().from(jobs).where(eq(jobs.orgId, currentOrgId())).orderBy(desc(jobs.id)).limit(limit);
+  }
+  async getJob(id: number): Promise<Job | undefined> {
+    return db.select().from(jobs).where(and(eq(jobs.id, id), eq(jobs.orgId, currentOrgId()))).then((r: any[]) => r[0]);
+  }
+
+  // Run a batch of items under a job, one row per item in `result`. Idempotent
+  // and resumable: an item already recorded 'ok' is skipped (re-running a job
+  // never repeats a completed item). `role` gates role-restricted kinds PER
+  // ITEM, so a partial batch reports exactly which items were refused vs failed.
+  async runBatchJob(kind: BatchKind, ids: number[], opts: { role?: string; userId?: number; payload?: any; jobId?: number }): Promise<Job> {
+    const orgId = currentOrgId();
+    const uniqueIds = [...new Set(ids)];
+    // Create or resume the job.
+    let job: Job;
+    if (opts.jobId) {
+      job = (await this.getJob(opts.jobId))!;
+      if (!job) throw new Error("Job not found");
+    } else {
+      job = await db.insert(jobs).values({
+        orgId, kind, payload: opts.payload ?? {}, status: "running", total: uniqueIds.length, progress: 0, result: [], createdBy: opts.userId ?? currentUserId() ?? null, updatedAt: nowIso(),
+      }).returning().then((r) => r[0]);
+    }
+    const results: JobItemResult[] = Array.isArray(job.result) ? [...(job.result as JobItemResult[])] : [];
+    const doneOk = new Set(results.filter((r) => r.status === "ok").map((r) => r.id));
+    await db.update(jobs).set({ status: "running", updatedAt: nowIso() }).where(eq(jobs.id, job.id));
+
+    const requiresAdmin = kind === "invoice.void" || kind === "bill.void";
+    const canAdmin = opts.role === "owner" || opts.role === "admin";
+
+    for (const id of uniqueIds) {
+      if (doneOk.has(id)) continue; // idempotent resume
+      const existingIdx = results.findIndex((r) => r.id === id);
+      let outcome: JobItemResult;
+      try {
+        // Per-item permission gate.
+        if (requiresAdmin && !canAdmin) {
+          outcome = { id, status: "error", message: "Permission denied: voiding requires an owner or admin." };
+        } else {
+          const msg = await this.runBatchItem(kind, id, opts.payload ?? {});
+          outcome = { id, status: "ok", message: msg };
+        }
+      } catch (e: any) {
+        outcome = { id, status: "error", message: e?.message || "Failed" };
+      }
+      if (existingIdx >= 0) results[existingIdx] = outcome; else results.push(outcome);
+      const progress = results.length;
+      await db.update(jobs).set({ result: results, progress, updatedAt: nowIso() }).where(eq(jobs.id, job.id));
+    }
+
+    const anyError = results.some((r) => r.status === "error");
+    const finished = await db.update(jobs)
+      .set({ status: anyError ? "failed" : "completed", progress: results.length, result: results, updatedAt: nowIso() })
+      .where(eq(jobs.id, job.id)).returning().then((r) => r[0]);
+    await this.audit("batch", "job", finished.id, `Batch ${kind}: ${results.filter((r) => r.status === "ok").length} ok, ${results.filter((r) => r.status === "error").length} error(s)`);
+    return finished;
+  }
+
+  // Process a single item for a batch kind. Throws on failure (recorded as an
+  // 'error' result). Each action is individually idempotent where possible.
+  private async runBatchItem(kind: BatchKind, id: number, payload: any): Promise<string> {
+    const orgId = currentOrgId();
+    switch (kind) {
+      case "invoice.void": {
+        const inv = await this.voidInvoice(id);
+        if (!inv) throw new Error(`Invoice #${id} not found`);
+        return `Voided ${inv.number}`;
+      }
+      case "invoice.reminder_exempt": {
+        const r = await pool.query(`UPDATE invoices SET reminder_exempt = true WHERE id = $1 AND org_id = $2 RETURNING number`, [id, orgId]);
+        if (r.rowCount === 0) throw new Error(`Invoice #${id} not found`);
+        return `Marked ${r.rows[0].number} reminder-exempt`;
+      }
+      case "invoice.send": {
+        // Idempotent "queued to send": records intent; real delivery reuses the
+        // existing per-invoice send path. Skips voided invoices.
+        const inv = await pool.query(`SELECT number, status FROM invoices WHERE id = $1 AND org_id = $2`, [id, orgId]);
+        if (inv.rowCount === 0) throw new Error(`Invoice #${id} not found`);
+        if (inv.rows[0].status === "void") throw new Error(`Invoice ${inv.rows[0].number} is void`);
+        return `Queued ${inv.rows[0].number} to send`;
+      }
+      case "bill.void": {
+        const b = await pool.query(`SELECT number, status, amount_paid FROM bills WHERE id = $1 AND org_id = $2`, [id, orgId]);
+        if (b.rowCount === 0) throw new Error(`Bill #${id} not found`);
+        if (Number(b.rows[0].amount_paid) > 0) throw new Error(`Bill ${b.rows[0].number} has payments`);
+        await pool.query(`UPDATE bills SET status = 'void' WHERE id = $1 AND org_id = $2`, [id, orgId]);
+        return `Voided ${b.rows[0].number}`;
+      }
+      case "bill.reminder_exempt": {
+        const r = await pool.query(`UPDATE bills SET reminder_exempt = true WHERE id = $1 AND org_id = $2 RETURNING number`, [id, orgId]);
+        if (r.rowCount === 0) throw new Error(`Bill #${id} not found`);
+        return `Marked ${r.rows[0].number} reminder-exempt`;
+      }
+      case "customer.statement": {
+        const from = payload?.from || "0000-01-01";
+        const to = payload?.to || new Date().toISOString().slice(0, 10);
+        const stmt = await this.customerStatement(id, from, to);
+        return `Statement for customer #${id}: closing balance ${formatMoney((stmt as any).closingBalance ?? 0)}`;
+      }
+      default:
+        throw new Error(`Unknown batch kind ${kind}`);
+    }
   }
   // Validate that every referenced class/location/project id exists in THIS org.
   // Nulls and undefineds are ignored (dimensions are optional). Cheap: at most

@@ -55,6 +55,25 @@ export default function Invoices() {
   const [timePickerOpen, setTimePickerOpen] = useState(false);
   const [pickedTime, setPickedTime] = useState<Record<number, boolean>>({});
   const [ruleHints, setRuleHints] = useState<Record<number, string>>({});
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+
+  const batchMut = useMutation({
+    mutationFn: async (kind: string) => (await apiRequest("POST", "/api/jobs", { kind, ids: [...selected] })).json(),
+    onSuccess: async (job: any) => {
+      const ok = (job.result || []).filter((x: any) => x.status === "ok").length;
+      const err = (job.result || []).filter((x: any) => x.status === "error").length;
+      setSelected(new Set());
+      await queryClient.invalidateQueries({ queryKey: ["/api/invoices"] });
+      toast({ title: `Batch ${job.kind}`, description: `${ok} succeeded${err ? `, ${err} failed` : ""}.`, variant: err ? "destructive" : undefined });
+    },
+    onError: (e: any) => toast({ title: "Batch failed", description: e.message, variant: "destructive" }),
+  });
+  function runBatch(kind: string) {
+    if (selected.size === 0) return;
+    if (kind === "invoice.void" && !window.confirm(`Void ${selected.size} invoice(s)? This posts reversing entries.`)) return;
+    batchMut.mutate(kind);
+  }
+  const toggleSel = (id: number) => setSelected((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
   const voidMut = useMutation({
     mutationFn: async (id: number) => (await apiRequest("POST", `/api/invoices/${id}/void`)).json(),
@@ -232,9 +251,19 @@ export default function Invoices() {
 
       <Card>
         <CardContent className="p-0">
+          {selected.size > 0 && (
+            <div className="flex items-center gap-2 border-b bg-muted/40 px-4 py-2 text-sm" data-testid="batch-action-bar">
+              <span className="font-medium">{selected.size} selected</span>
+              <Button size="sm" variant="outline" disabled={batchMut.isPending} onClick={() => runBatch("invoice.send")} data-testid="batch-send">Send</Button>
+              <Button size="sm" variant="outline" disabled={batchMut.isPending} onClick={() => runBatch("invoice.reminder_exempt")} data-testid="batch-reminder-exempt">Mark reminder-exempt</Button>
+              {canEditSettings && <Button size="sm" variant="outline" className="text-destructive" disabled={batchMut.isPending} onClick={() => runBatch("invoice.void")} data-testid="batch-void">Void</Button>}
+              <button className="ml-auto text-xs text-muted-foreground underline" onClick={() => setSelected(new Set())}>Clear</button>
+            </div>
+          )}
           <table className="w-full text-sm">
             <thead className="border-b border-border bg-muted/50">
               <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
+                <th className="px-3 py-3 w-8"><input type="checkbox" data-testid="check-all-invoices" checked={invoices.length > 0 && selected.size === invoices.length} onChange={(e) => setSelected(e.target.checked ? new Set(invoices.map((i) => i.id)) : new Set())} /></th>
                 <th className="px-4 py-3 font-medium">Number</th>
                 <th className="px-4 py-3 font-medium">Customer</th>
                 <th className="px-4 py-3 font-medium">Date</th>
@@ -247,13 +276,14 @@ export default function Invoices() {
             </thead>
             <tbody>
               {invoices.length === 0 && (
-                <tr><td colSpan={8} className="px-4 py-12 text-center text-muted-foreground">No invoices yet.</td></tr>
+                <tr><td colSpan={9} className="px-4 py-12 text-center text-muted-foreground">No invoices yet.</td></tr>
               )}
               {invoices.map((i) => {
                 const balance = i.total - i.amountPaid;
                 const overdue = i.status === "open" && i.dueDate < today;
                 return (
                   <tr key={i.id} className="border-b border-border last:border-0 hover-elevate" data-testid={`row-invoice-${i.id}`}>
+                    <td className="px-3 py-3"><input type="checkbox" data-testid={`check-invoice-${i.id}`} checked={selected.has(i.id)} onChange={() => toggleSel(i.id)} /></td>
                     <td className="px-4 py-3 font-medium">{i.number}</td>
                     <td className="px-4 py-3">{i.customerName}</td>
                     <td className="px-4 py-3 text-muted-foreground">{fmtDate(i.date)}</td>

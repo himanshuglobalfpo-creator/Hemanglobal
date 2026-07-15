@@ -29,6 +29,7 @@ import {
   insertTimeEntrySchema,
   updateTimeEntrySchema,
   createPriceRuleSchema,
+  createJobSchema,
   postJournalEntrySchema,
   createInvoiceSchema,
   createBillSchema,
@@ -1161,6 +1162,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       baseRate: Number(req.query.baseRate ?? 0),
       currency: (req.query.currency as string) || null,
     }))
+  );
+
+  // ---------- Batch jobs (P3.5) ----------
+  // Creating a job runs it (in-process) and returns the completed job with
+  // per-item results. Role is enforced PER ITEM inside the runner, so a caller
+  // without void rights gets a permission result per row rather than a 403.
+  app.get("/api/jobs", (req, res) => handle(res, () => storage.listJobs(Number(req.query.limit) || 25)));
+  app.get("/api/jobs/:id", (req, res) =>
+    handle(res, async () => {
+      const job = await storage.getJob(parseId(req.params.id));
+      if (!job) throw new Error("Job not found");
+      return job;
+    })
+  );
+  app.post("/api/jobs", (req, res) =>
+    handle(res, () => {
+      const { kind, ids, payload } = createJobSchema.parse(req.body);
+      return storage.runBatchJob(kind, ids, { role: req.role, userId: currentUserId(), payload });
+    })
   );
 
   // ---------- Journal ----------
