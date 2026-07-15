@@ -53,6 +53,11 @@ export const organizations = pgTable("organizations", {
   // validated by invoiceSettingsSchema (shared/schema.ts); defaults live in
   // code, so {} means "all defaults".
   invoiceSettings: jsonb("invoice_settings").notNull().default({}),
+  // Firm layer: an accounting firm is just an organization flagged is_firm.
+  // Its accountant/admin members reach client orgs through firm_client_access
+  // (never through org_memberships), so client member lists stay clean and
+  // firm access can be revoked in one place.
+  isFirm: boolean("is_firm").notNull().default(false),
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
 });
 export type Organization = typeof organizations.$inferSelect;
@@ -93,6 +98,42 @@ export const orgMemberships = pgTable("org_memberships", {
   createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
 });
 export type OrgMembership = typeof orgMemberships.$inferSelect;
+
+// ---------- FIRM ↔ CLIENT ACCESS ----------
+// A grant from a firm (organizations.is_firm = true) to a client org. Created
+// as 'pending' when a firm invites a client; the client owner approves via an
+// emailed link, turning it 'active' and binding the concrete client_org_id.
+// Setting status to 'revoked' (by either side) instantly cuts access — every
+// request re-resolves access from this table (see server/auth.ts).
+export const FIRM_ACCESS_STATUS = ["pending", "active", "revoked", "declined"] as const;
+export type FirmAccessStatus = (typeof FIRM_ACCESS_STATUS)[number];
+
+export const firmClientAccess = pgTable("firm_client_access", {
+  id: serial("id").primaryKey(),
+  firmOrgId: integer("firm_org_id").notNull(),          // the firm organization
+  clientOrgId: integer("client_org_id"),                // bound on approval
+  // The role firm members act AS on the client (accountant by default).
+  grantedRole: text("granted_role").notNull().default("accountant"),
+  status: text("status").notNull().default("pending"),
+  inviteEmail: text("invite_email").notNull(),          // client owner we invited
+  inviteToken: text("invite_token").notNull(),          // single-use approval token
+  invitedByUserId: integer("invited_by_user_id").notNull(),
+  approvedByUserId: integer("approved_by_user_id"),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+  approvedAt: text("approved_at"),
+  revokedAt: text("revoked_at"),
+});
+export type FirmClientAccess = typeof firmClientAccess.$inferSelect;
+
+export const firmInviteSchema = z.object({
+  email: z.string().email().max(200),
+  grantedRole: z.enum(["accountant", "admin"]).default("accountant"),
+});
+export type FirmInviteInput = z.infer<typeof firmInviteSchema>;
+
+export const firmApproveSchema = z.object({
+  orgId: z.number().int().positive(),
+});
 
 // ---------- SESSIONS ----------
 // Server-side session table (we do not want JWT here — accounting data deserves

@@ -35,6 +35,8 @@ const AuditLog = lazy(() => import("@/pages/AuditLog"));
 const Security = lazy(() => import("@/pages/Security"));
 const Settings = lazy(() => import("@/pages/Settings"));
 const MigrationWizard = lazy(() => import("@/pages/MigrationWizard"));
+const FirmDashboard = lazy(() => import("@/pages/FirmDashboard"));
+const FirmInvite = lazy(() => import("@/pages/FirmInvite"));
 const ProductsServices = lazy(() => import("@/pages/ProductsServices"));
 const Budgeting = lazy(() => import("@/pages/Budgeting"));
 const Estimates = lazy(() => import("@/pages/Estimates"));
@@ -123,6 +125,8 @@ function AppRouter() {
       <Route path="/period-close" component={PeriodClose} />
       <Route path="/audit" component={AuditLog} />
       <Route path="/security" component={Security} />
+      <Route path="/firm" component={FirmDashboard} />
+      <Route path="/firm-invite" component={FirmInvite} />
       <Route path="/settings/import" component={MigrationWizard} />
       <Route path="/settings" component={Settings} />
       <Route path="/items" component={ProductsServices} />
@@ -144,6 +148,8 @@ export type Me = {
   user: { id: number; email: string; name: string; emailVerified?: boolean; createdAt?: string } | null;
   org: {
     id: number; name: string; slug: string;
+    // Firm layer: true when the active org is an accounting firm.
+    isFirm?: boolean;
     // Dimension tracking switches (QBO-style) — gate the class/location/project
     // pickers across the UI.
     enableClassTracking?: boolean;
@@ -153,7 +159,9 @@ export type Me = {
     invoiceSettings?: import("@shared/schema").InvoiceSettings;
   } | null;
   role: string | null;
-  orgs: Array<{ id: number; name: string; slug: string; role: string }>;
+  // True when the active org is reached via firm access (outside accountant).
+  firmAccess?: boolean;
+  orgs: Array<{ id: number; name: string; slug: string; role: string; isFirm?: boolean; viaFirm?: boolean }>;
 };
 
 // Handles the link from the verification email: /#/verify-email?token=...

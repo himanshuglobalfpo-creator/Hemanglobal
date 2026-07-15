@@ -33,7 +33,7 @@ import {
   createSession, revokeSession, setActiveOrg,
   setSessionCookie, clearSessionCookie,
   recordFailedLogin, clearFailedLogins, isLocked,
-  hashPassword,
+  hashPassword, resolveOrgAccess, listAccessibleOrgs,
 } from "./auth";
 import { sendEmail, appBaseUrl } from "./email";
 import { authLimiter } from "./rate-limit";
@@ -390,7 +390,7 @@ export function registerAuthRoutes(app: Express) {
   app.get("/api/auth/me", (req, res) =>
     handle(res, async () => {
       if (!req.user) return { user: null, org: null, role: null, orgs: [] };
-      const orgs = await listOrgsForUser(req.user.id);
+      const orgs = await listAccessibleOrgs(req.user.id);
       return {
         user: {
           id: req.user.id,
@@ -405,6 +405,7 @@ export function registerAuthRoutes(app: Express) {
               id: req.org.id,
               name: req.org.name,
               slug: req.org.slug,
+              isFirm: (req.org as any).isFirm ?? false,
               addressCity: (req.org as any).addressCity ?? null,
               addressState: (req.org as any).addressState ?? null,
               addressZip: (req.org as any).addressZip ?? null,
@@ -420,7 +421,8 @@ export function registerAuthRoutes(app: Express) {
             }
           : null,
         role: req.role ?? null,
-        orgs: orgs.map((o) => ({ id: o.id, name: o.name, slug: o.slug, role: o.role })),
+        firmAccess: req.firmAccess ?? false,
+        orgs: orgs.map((o) => ({ id: o.id, name: o.name, slug: o.slug, role: o.role, isFirm: o.isFirm, viaFirm: o.viaFirm })),
       };
     })
   );
@@ -431,10 +433,21 @@ export function registerAuthRoutes(app: Express) {
       if (!req.user || !req.session) throw new Error("Authentication required");
       const orgId = Number(req.body?.orgId);
       if (!Number.isInteger(orgId) || orgId <= 0) throw new Error("Invalid orgId");
-      const m = await getMembership(req.user.id, orgId);
-      if (!m) throw new Error("You are not a member of this organization.");
+      // Accept a direct membership OR active firm access to a client org.
+      const access = await resolveOrgAccess(req.user.id, orgId);
+      if (!access) throw new Error("You do not have access to this organization.");
       await setActiveOrg(req.session.id, orgId);
-      return { ok: true, orgId };
+      // Cross-org access is auditable: record every time a firm user enters a
+      // client org, attributed to the acting firm user in the CLIENT's log.
+      if (access.viaFirm) {
+        const firm = (await pool.query(`SELECT name FROM organizations WHERE id = $1`, [access.firmOrgId])).rows[0] as { name?: string } | undefined;
+        await pool.query(
+          `INSERT INTO audit_log (org_id, ts, "user", action, entity_type, entity_id, summary)
+           VALUES ($1, now(), $2, 'firm_access', 'organization', $3, $4)`,
+          [orgId, String(req.user.id), orgId, `Firm access: ${req.user.name} (${req.user.email}) from firm "${firm?.name ?? access.firmOrgId}" opened this organization`]
+        );
+      }
+      return { ok: true, orgId, viaFirm: access.viaFirm };
     })
   );
 

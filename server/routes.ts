@@ -74,6 +74,7 @@ import { attachSession, requireAuth, requireOrg, requireRole, startSessionCleanu
 import { csrfProtect } from "./csrf";
 import { orgScopeMiddleware, currentOrgId } from "./org-scope";
 import { registerAuthRoutes } from "./auth-routes";
+import { registerFirmRoutes } from "./firm";
 import { registerStripeRoutes, stripeStatus, stripeOrgStatus } from "./stripe";
 import { calculateSalesTax, validateAddress, taxjarStatus } from "./taxjar";
 import { publicLimiter, writeLimiter, importLimiter } from "./rate-limit";
@@ -295,6 +296,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // Register the auth-specific routes (signup/login/logout/me/etc.)
   registerAuthRoutes(app);
+
+  // Firm layer: accountant access to client orgs (/api/firm/*).
+  registerFirmRoutes(app);
 
   // Stripe (lazy-loads SDK; no-ops gracefully if STRIPE_SECRET_KEY missing).
   // Note: the webhook route /api/stripe/webhook is mounted here but does NOT

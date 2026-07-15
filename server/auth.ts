@@ -18,7 +18,7 @@ import crypto from "node:crypto";
 import type { Request, Response, NextFunction } from "express";
 import { eq, and, lt, gt } from "drizzle-orm";
 import {
-  users, sessions, organizations, orgMemberships,
+  users, sessions, organizations, orgMemberships, firmClientAccess,
   type User, type Session, type Organization, type OrgRole,
 } from "@shared/schema";
 import { buildCsrfCookie, buildClearCsrfCookie, generateCsrfToken } from "./csrf";
@@ -135,6 +135,7 @@ export async function listOrgsForUser(userId: number): Promise<Array<Organizatio
     enableLocationTracking: r.enable_location_tracking ?? false,
     enableProjectTracking: r.enable_project_tracking ?? false,
     invoiceSettings: r.invoice_settings ?? {},
+    isFirm: r.is_firm ?? false,
     addressCity: r.address_city ?? null,
     addressState: r.address_state ?? null,
     addressZip: r.address_zip ?? null,
@@ -149,6 +150,64 @@ export async function getMembership(userId: number, orgId: number) {
     .from(orgMemberships)
     .where(and(eq(orgMemberships.userId, userId), eq(orgMemberships.orgId, orgId)))
     .then((r: any[]) => r[0]);
+}
+
+// ----------------------------------------------------------------------------
+// Access resolution — the SINGLE authority on whether a user may act in an org
+// and with what role. Checked on EVERY request (attachSession) and by
+// switch-org, so a revoked grant or removed membership takes effect on the very
+// next request.
+//
+// A user reaches an org one of two ways:
+//   1. Direct membership (org_memberships) — the normal case.
+//   2. Firm access — the user is an accountant/admin/owner of a FIRM org that
+//      holds an ACTIVE firm_client_access grant on the target (client) org. The
+//      effective role is the grant's granted_role (accountant by default).
+// ----------------------------------------------------------------------------
+export type OrgAccess = { role: OrgRole; viaFirm: boolean; firmOrgId?: number };
+
+export async function resolveOrgAccess(userId: number, orgId: number): Promise<OrgAccess | null> {
+  const m = await getMembership(userId, orgId);
+  if (m) return { role: m.role as OrgRole, viaFirm: false };
+  // Firm path: an active grant on this client org, held by a firm the user is
+  // an accountant/admin/owner of. Requires the granting org to be is_firm.
+  const row = (await pool.query(
+    `SELECT fca.granted_role AS role, fca.firm_org_id
+       FROM firm_client_access fca
+       JOIN org_memberships m ON m.org_id = fca.firm_org_id AND m.user_id = $1
+       JOIN organizations f   ON f.id = fca.firm_org_id AND f.is_firm = true
+      WHERE fca.client_org_id = $2
+        AND fca.status = 'active'
+        AND m.role IN ('accountant', 'admin', 'owner')
+      ORDER BY fca.id
+      LIMIT 1`,
+    [userId, orgId]
+  )).rows[0] as { role: string; firm_org_id: number } | undefined;
+  if (row) return { role: row.role as OrgRole, viaFirm: true, firmOrgId: row.firm_org_id };
+  return null;
+}
+
+// Orgs the user can switch into: direct memberships PLUS active firm-granted
+// clients. viaFirm distinguishes the two for the UI.
+export async function listAccessibleOrgs(userId: number): Promise<Array<{ id: number; name: string; slug: string; isFirm: boolean; role: OrgRole; viaFirm: boolean }>> {
+  const rows = (await pool.query(
+    `SELECT o.id, o.name, o.slug, o.is_firm AS "isFirm", m.role AS role, false AS "viaFirm"
+       FROM organizations o
+       JOIN org_memberships m ON m.org_id = o.id
+      WHERE m.user_id = $1
+     UNION
+     SELECT o.id, o.name, o.slug, o.is_firm AS "isFirm", fca.granted_role AS role, true AS "viaFirm"
+       FROM firm_client_access fca
+       JOIN organizations o    ON o.id = fca.client_org_id
+       JOIN org_memberships fm ON fm.org_id = fca.firm_org_id AND fm.user_id = $1
+       JOIN organizations f    ON f.id = fca.firm_org_id AND f.is_firm = true
+      WHERE fca.status = 'active'
+        AND fm.role IN ('accountant', 'admin', 'owner')
+        AND NOT EXISTS (SELECT 1 FROM org_memberships m2 WHERE m2.org_id = o.id AND m2.user_id = $1)
+      ORDER BY name`,
+    [userId]
+  )).rows as any[];
+  return rows.map((r) => ({ id: r.id, name: r.name, slug: r.slug, isFirm: !!r.isFirm, role: r.role, viaFirm: !!r.viaFirm }));
 }
 
 // ----------------------------------------------------------------------------
@@ -245,6 +304,10 @@ declare global {
       user?: User;
       org?: Organization;
       role?: OrgRole;
+      // True when the active org is reached via firm access (not a direct
+      // membership) — i.e. the acting user is an outside accountant.
+      firmAccess?: boolean;
+      firmOrgId?: number;
     }
   }
 }
@@ -297,11 +360,20 @@ export async function attachSession(req: Request, _res: Response, next: NextFunc
     if (!u) return next();
     req.user = u;
     if (s.activeOrgId) {
-      const o = await db.select().from(organizations).where(eq(organizations.id, s.activeOrgId)).then((r: any[]) => r[0]);
-      if (o) {
-        req.org = o;
-        const m = await getMembership(u.id, o.id);
-        if (m) req.role = m.role as OrgRole;
+      // Establish org context ONLY when the user still has effective access to
+      // the session's active org. This makes revocation (membership removal or
+      // firm-grant revoke) take effect on the next request, and closes the
+      // window where a stale activeOrgId would otherwise expose an org the user
+      // no longer belongs to.
+      const access = await resolveOrgAccess(u.id, s.activeOrgId);
+      if (access) {
+        const o = await db.select().from(organizations).where(eq(organizations.id, s.activeOrgId)).then((r: any[]) => r[0]);
+        if (o) {
+          req.org = o;
+          req.role = access.role;
+          req.firmAccess = access.viaFirm;
+          req.firmOrgId = access.firmOrgId;
+        }
       }
     }
     // Touch the session in the background — we don't block the request on it

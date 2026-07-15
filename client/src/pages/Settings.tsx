@@ -444,6 +444,7 @@ export default function Settings() {
         <DimensionManager kind="locations" title="Locations" singular="location" canEdit={canEdit} />
         <DimensionManager kind="projects" title="Projects (jobs)" singular="project" canEdit={canEdit} />
         {canEdit && <FxRatesEditor />}
+        {canEdit && <YourAccountant />}
         {canEdit && (
           <Card data-testid="card-migrate-cta">
             <CardHeader><CardTitle className="flex items-center gap-2"><Boxes className="h-5 w-5" /> Switching from QuickBooks or Xero?</CardTitle></CardHeader>
@@ -457,5 +458,41 @@ export default function Settings() {
         {canEdit && <WebhooksManager />}
       </div>
     </Layout>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// "Your accountant" — active outside firms attached to THIS org, with revoke.
+// ---------------------------------------------------------------------------
+type Accountant = { id: number; firmName: string; grantedRole: string; approvedAt: string | null };
+
+function YourAccountant() {
+  const { toast } = useToast();
+  const { data } = useQuery<{ accountants: Accountant[] }>({ queryKey: ["/api/firm/my-accountants"] });
+  const revoke = useMutation({
+    mutationFn: (id: number) => apiRequest("POST", `/api/firm/my-accountants/${id}/revoke`, {}),
+    onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ["/api/firm/my-accountants"] }); toast({ title: "Accountant access revoked" }); },
+    onError: (e: any) => toast({ title: "Revoke failed", description: e.message, variant: "destructive" }),
+  });
+  const list = data?.accountants ?? [];
+  return (
+    <Card data-testid="card-your-accountant">
+      <CardHeader><CardTitle className="flex items-center gap-2"><CheckCircle2 className="h-5 w-5" /> Your accountant</CardTitle></CardHeader>
+      <CardContent className="space-y-2">
+        {list.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No outside accounting firm has access to this organization. Firms request access by email; you approve from the link they send.</p>
+        ) : (
+          list.map((a) => (
+            <div key={a.id} className="flex items-center gap-2 text-sm" data-testid={`accountant-row-${a.id}`}>
+              <span className="font-medium">{a.firmName}</span>
+              <span className="text-muted-foreground">has {a.grantedRole} access{a.approvedAt ? ` since ${a.approvedAt.slice(0, 10)}` : ""}</span>
+              <Button size="sm" variant="ghost" className="ml-auto" onClick={() => revoke.mutate(a.id)} disabled={revoke.isPending} data-testid={`button-revoke-accountant-${a.id}`}>
+                <XCircle className="mr-1 h-3.5 w-3.5" /> Revoke
+              </Button>
+            </div>
+          ))
+        )}
+      </CardContent>
+    </Card>
   );
 }

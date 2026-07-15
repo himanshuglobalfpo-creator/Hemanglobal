@@ -603,6 +603,11 @@ export function Layout({ children }: { children: ReactNode }) {
   const [location] = useLocation();
   const { toast } = useToast();
   const [searchOpen, setSearchOpen] = useState(false);
+  const { data: me } = useQuery<Me>({ queryKey: ["/api/auth/me"] });
+  // Firm orgs get a "Firm" entry (client dashboard) right after Dashboard.
+  const nav = me?.org?.isFirm
+    ? [NAV[0], { href: "/firm", label: "Firm", icon: Building2 }, ...NAV.slice(1)]
+    : NAV;
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -632,7 +637,7 @@ export function Layout({ children }: { children: ReactNode }) {
           <Logo />
         </div>
         <nav className="flex-1 px-2 py-3 space-y-0.5">
-          {NAV.map((item) => {
+          {nav.map((item) => {
             const Icon = item.icon;
             const active = location === item.href || (item.href !== "/" && location.startsWith(item.href));
             return (
@@ -685,6 +690,14 @@ export function Layout({ children }: { children: ReactNode }) {
           </div>
         </div>
         <EmailVerificationBanner />
+        {me?.firmAccess && me.org && (
+          <div className="border-b border-amber-300 bg-amber-50 text-amber-900" data-testid="banner-firm-access">
+            <div className="max-w-6xl mx-auto px-8 py-2 flex items-center gap-2 text-sm">
+              <Building2 className="h-4 w-4" />
+              You're working in <strong>{me.org.name}</strong> as an outside accountant. All actions are logged in this client's audit trail.
+            </div>
+          </div>
+        )}
         <div className="max-w-6xl mx-auto px-8 py-8">{children}</div>
       </main>
       <GlobalSearch open={searchOpen} setOpen={setSearchOpen} />
