@@ -444,6 +444,7 @@ export default function Settings() {
         <DimensionManager kind="locations" title="Locations" singular="location" canEdit={canEdit} />
         <DimensionManager kind="projects" title="Projects (jobs)" singular="project" canEdit={canEdit} />
         {canEdit && <FxRatesEditor />}
+        {canEdit && <RolesManager />}
         {canEdit && <YourAccountant />}
         {canEdit && (
           <Card data-testid="card-migrate-cta">
@@ -492,6 +493,46 @@ function YourAccountant() {
             </div>
           ))
         )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// P3.11 — custom roles: a named permission set (built-in roles are immutable).
+function RolesManager() {
+  const { toast } = useToast();
+  const { data: roles = [] } = useQuery<Array<{ id: number; name: string; permissions: string[] }>>({ queryKey: ["/api/roles"] });
+  const { data: cat } = useQuery<{ permissions: string[]; builtinRoles: Record<string, string[]> }>({ queryKey: ["/api/permissions"] });
+  const [name, setName] = useState("");
+  const [perms, setPerms] = useState<Record<string, boolean>>({});
+  const inv = () => queryClient.invalidateQueries({ queryKey: ["/api/roles"] });
+  const create = useMutation({
+    mutationFn: () => apiRequest("POST", "/api/roles", { name: name.trim(), permissions: Object.keys(perms).filter((k) => perms[k]) }),
+    onSuccess: () => { setName(""); setPerms({}); inv(); toast({ title: "Role created" }); },
+    onError: (e: any) => toast({ title: "Failed", description: e.message, variant: "destructive" }),
+  });
+  const del = useMutation({ mutationFn: (id: number) => apiRequest("DELETE", `/api/roles/${id}`), onSuccess: inv });
+  return (
+    <Card data-testid="card-roles">
+      <CardHeader><CardTitle>Custom roles</CardTitle></CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-xs text-muted-foreground">Built-in roles (owner, admin, accountant, viewer) are fixed. Create custom roles with a specific set of permissions, then assign them to members.</p>
+        {roles.map((r) => (
+          <div key={r.id} className="flex items-center gap-2 rounded-md border p-2 text-sm" data-testid={`role-row-${r.id}`}>
+            <span className="font-medium">{r.name}</span>
+            <span className="text-muted-foreground">{r.permissions.length} permission(s)</span>
+            <button className="ml-auto text-muted-foreground hover:text-destructive" onClick={() => del.mutate(r.id)} data-testid={`delete-role-${r.id}`}><XCircle className="h-3.5 w-3.5" /></button>
+          </div>
+        ))}
+        <div className="space-y-2">
+          <Input placeholder="Role name (e.g. Auditor)" value={name} onChange={(e) => setName(e.target.value)} className="max-w-xs" data-testid="input-role-name" />
+          <div className="grid grid-cols-2 gap-1 sm:grid-cols-3">
+            {(cat?.permissions ?? []).map((k) => (
+              <label key={k} className="flex items-center gap-1.5 text-xs"><input type="checkbox" checked={!!perms[k]} onChange={(e) => setPerms({ ...perms, [k]: e.target.checked })} data-testid={`perm-${k}`} /> {k}</label>
+            ))}
+          </div>
+          <Button disabled={!name.trim() || create.isPending} onClick={() => create.mutate()} data-testid="button-create-role">Create role</Button>
+        </div>
       </CardContent>
     </Card>
   );

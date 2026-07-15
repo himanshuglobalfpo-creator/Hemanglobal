@@ -45,6 +45,7 @@ import {
   priceRuleItems,
   priceRuleCustomers,
   jobs,
+  orgRoles,
   reportSchedules,
   taxFilingPeriods,
   bundleComponents,
@@ -147,6 +148,7 @@ import type {
 } from "@shared/schema";
 import crypto from "node:crypto";
 import { toCents, formatMoney } from "@shared/money";
+import { PERMISSION_KEYS } from "@shared/permissions";
 import { futureDatedWarning } from "@shared/dates";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { eq, ne, sql, and, gt, gte, lte, desc, inArray, isNull } from "drizzle-orm";
@@ -2137,6 +2139,27 @@ export class DatabaseStorage {
       await this.audit("pay", "tax_filing_period", id, `Paid ${p.stateCode} sales tax ${formatMoney(liability)} for ${p.periodStart}..${p.periodEnd}`);
       return row;
     });
+  }
+
+  // --------------------------------------------------------------------------
+  // CUSTOM ROLES (P3.11)
+  // --------------------------------------------------------------------------
+  async listOrgRoles(): Promise<Array<{ id: number; name: string; permissions: string[] }>> {
+    return (await pool.query(`SELECT id, name, permissions FROM org_roles WHERE org_id = $1 ORDER BY name`, [currentOrgId()])).rows as any[];
+  }
+  async createOrgRole(name: string, permissions: string[]): Promise<{ id: number; name: string; permissions: string[] }> {
+    if (["owner", "admin", "accountant", "viewer"].includes(name.toLowerCase())) throw new Error(`"${name}" is a built-in role and cannot be redefined.`);
+    const valid = permissions.filter((p) => (PERMISSION_KEYS as readonly string[]).includes(p));
+    const row = (await pool.query(
+      `INSERT INTO org_roles (org_id, name, permissions) VALUES ($1, $2, $3::jsonb) RETURNING id, name, permissions`,
+      [currentOrgId(), name, JSON.stringify(valid)]
+    ).catch((e: any) => { if (e?.code === "23505") throw new Error(`A role named "${name}" already exists.`); throw e; })).rows[0];
+    await this.audit("create", "org_role", row.id, `Created custom role "${name}" with ${valid.length} permission(s)`);
+    return row;
+  }
+  async deleteOrgRole(id: number): Promise<boolean> {
+    const r = await pool.query(`DELETE FROM org_roles WHERE id = $1 AND org_id = $2 RETURNING name`, [id, currentOrgId()]);
+    return (r.rowCount ?? 0) > 0;
   }
 
   async listReportSchedules(): Promise<ReportSchedule[]> {

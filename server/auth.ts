@@ -21,6 +21,7 @@ import {
   users, sessions, organizations, orgMemberships, firmClientAccess,
   type User, type Session, type Organization, type OrgRole,
 } from "@shared/schema";
+import { type PermissionKey, isBuiltinRole, roleGrants } from "@shared/permissions";
 import { buildCsrfCookie, buildClearCsrfCookie, generateCsrfToken } from "./csrf";
 
 // ----------------------------------------------------------------------------
@@ -414,5 +415,41 @@ export function requireRole(...allowed: OrgRole[]) {
       return;
     }
     next();
+  };
+}
+
+// Permissions of a CUSTOM org role (built-ins resolve in code). Cached briefly
+// per (org, role) to avoid a DB hit on every guarded request.
+const customRoleCache = new Map<string, { perms: string[]; at: number }>();
+export async function getCustomRolePermissions(orgId: number, roleName: string): Promise<string[]> {
+  const key = `${orgId}:${roleName}`;
+  const hit = customRoleCache.get(key);
+  if (hit && Date.now() - hit.at < 30_000) return hit.perms;
+  const row = (await pool.query(`SELECT permissions FROM org_roles WHERE org_id = $1 AND lower(name) = lower($2)`, [orgId, roleName])).rows[0] as any;
+  const perms = Array.isArray(row?.permissions) ? row.permissions as string[] : [];
+  customRoleCache.set(key, { perms, at: Date.now() });
+  return perms;
+}
+export function invalidateRoleCache() { customRoleCache.clear(); }
+
+// Permission guard (P3.11) — the granular successor to requireRole. A user
+// passes if their role grants `key`: owner always; a built-in role via its
+// coded permission set; a custom role via its stored permission set. Use AFTER
+// requireOrg.
+export function requirePermission(key: PermissionKey) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    if (!req.user) { res.status(401).json({ error: "Authentication required" }); return; }
+    if (!req.org || !req.role) { res.status(403).json({ error: "No active organization." }); return; }
+    try {
+      if (req.role === "owner") return next();
+      if (isBuiltinRole(req.role)) {
+        if (roleGrants(req.role, key)) return next();
+        res.status(403).json({ error: `This action requires the "${key}" permission.` });
+        return;
+      }
+      const perms = await getCustomRolePermissions(req.org.id, req.role) as PermissionKey[];
+      if (roleGrants(req.role, key, perms)) return next();
+      res.status(403).json({ error: `This action requires the "${key}" permission.` });
+    } catch (e) { next(e); }
   };
 }

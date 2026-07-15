@@ -553,6 +553,23 @@ export const createPriceRuleSchema = z.object({
 export type CreatePriceRuleInput = z.infer<typeof createPriceRuleSchema>;
 
 // ============================================================================
+// CUSTOM ROLES (P3.11) — per-org named permission sets
+// ============================================================================
+export const orgRoles = pgTable("org_roles", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  name: text("name").notNull(),
+  permissions: jsonb("permissions").notNull().default([]),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type OrgRole_ = typeof orgRoles.$inferSelect;
+export const createOrgRoleSchema = z.object({
+  name: z.string().min(1).max(60),
+  permissions: z.array(z.string().max(60)).default([]),
+});
+export type CreateOrgRoleInput = z.infer<typeof createOrgRoleSchema>;
+
+// ============================================================================
 // BATCH JOBS (P3.5) — background batch actions & statement automation
 // ============================================================================
 // A job records a batch operation and its per-item results, so batch actions

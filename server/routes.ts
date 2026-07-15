@@ -33,6 +33,7 @@ import {
   createReportScheduleSchema,
   createTaxFilingPeriodSchema,
   addBundleComponentSchema,
+  createOrgRoleSchema,
   postJournalEntrySchema,
   createInvoiceSchema,
   createBillSchema,
@@ -72,12 +73,13 @@ import { toCents, formatMoney } from "@shared/money";
 import { z } from "zod";
 import crypto from "node:crypto";
 import express from "express";
+import { PERMISSION_KEYS, BUILTIN_ROLE_PERMISSIONS } from "@shared/permissions";
 import { storage, dbHealthCheck, pool } from "./storage";
 import * as noteService from "./creditNoteService";
 import { plaidStatus, createLinkToken, exchangePublicToken, syncTransactions, handlePlaidWebhook, getAccountBalances, pickFeedBalance } from "./plaid";
 import { streamInvoicePdf, streamBillPdf, streamCustomerStatementPdf, streamVendorStatementPdf, streamCreditNotePdf, streamDebitNotePdf } from "./pdf";
 import { sendEmail, smtpStatus, appBaseUrl } from "./email";
-import { attachSession, requireAuth, requireOrg, requireRole, startSessionCleanup } from "./auth";
+import { attachSession, requireAuth, requireOrg, requireRole, requirePermission, startSessionCleanup } from "./auth";
 import { csrfProtect } from "./csrf";
 import { orgScopeMiddleware, currentOrgId, currentUserId } from "./org-scope";
 import { registerAuthRoutes } from "./auth-routes";
@@ -1320,6 +1322,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       if (compare !== "none") return storage.profitAndLossComparison(from, to, compare, filter);
       return storage.profitAndLoss(from, to, filter);
+    })
+  );
+
+  // ---------- Roles & permissions (P3.11) ----------
+  // The permission catalog + built-in role definitions (for the Roles UI).
+  app.get("/api/permissions", requireOrg, (_req, res) =>
+    handle(res, () => ({ permissions: PERMISSION_KEYS, builtinRoles: BUILTIN_ROLE_PERMISSIONS }))
+  );
+  // Custom roles are managed with the members.admin permission (owner/admin).
+  app.get("/api/roles", requireOrg, requirePermission("members.admin"), (_req, res) =>
+    handle(res, () => storage.listOrgRoles())
+  );
+  app.post("/api/roles", requireOrg, requirePermission("members.admin"), (req, res) =>
+    handle(res, () => {
+      const { name, permissions } = createOrgRoleSchema.parse(req.body);
+      return storage.createOrgRole(name, permissions);
+    })
+  );
+  app.delete("/api/roles/:id", requireOrg, requirePermission("members.admin"), (req, res) =>
+    handle(res, async () => {
+      const ok = await storage.deleteOrgRole(parseId(req.params.id));
+      if (!ok) throw new Error("Role not found");
+      return { ok: true };
     })
   );
 
