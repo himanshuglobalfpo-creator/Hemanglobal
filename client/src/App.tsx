@@ -34,6 +34,7 @@ const PeriodClose = lazy(() => import("@/pages/PeriodClose"));
 const AuditLog = lazy(() => import("@/pages/AuditLog"));
 const Security = lazy(() => import("@/pages/Security"));
 const Settings = lazy(() => import("@/pages/Settings"));
+const MigrationWizard = lazy(() => import("@/pages/MigrationWizard"));
 const ProductsServices = lazy(() => import("@/pages/ProductsServices"));
 const Budgeting = lazy(() => import("@/pages/Budgeting"));
 const Estimates = lazy(() => import("@/pages/Estimates"));
@@ -122,6 +123,7 @@ function AppRouter() {
       <Route path="/period-close" component={PeriodClose} />
       <Route path="/audit" component={AuditLog} />
       <Route path="/security" component={Security} />
+      <Route path="/settings/import" component={MigrationWizard} />
       <Route path="/settings" component={Settings} />
       <Route path="/items" component={ProductsServices} />
       <Route path="/budgets" component={Budgeting} />

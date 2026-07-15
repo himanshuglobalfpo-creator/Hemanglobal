@@ -1,0 +1,10 @@
+Account Number,Account,Debit,Credit
+1000,Checking Account,25000.00,
+1100,Accounts Receivable,8500.00,
+1200,Inventory,12000.00,
+1500,Office Equipment,6000.00,
+1510,Accumulated Depreciation,,1500.00
+2000,Accounts Payable,,4200.00
+2200,Credit Card,,1800.00
+3000,Owner's Equity,,20000.00
+3100,Retained Earnings,,24000.00

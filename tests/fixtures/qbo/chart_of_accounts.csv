@@ -1,0 +1,11 @@
+Account Number,Account Name,Type,Detail Type
+1000,Checking Account,Bank,Checking
+1100,Accounts Receivable,Accounts receivable,Accounts Receivable (A/R)
+4000,Sales Revenue,Income,Sales of Product Income
+4900,Other Income,Other Income,Other Miscellaneous Income
+2000,Accounts Payable,Accounts payable,Accounts Payable (A/P)
+2200,Credit Card,Credit Card,Credit Card
+3000,Owner's Equity,Equity,Owner's Equity
+5000,Cost of Goods Sold,Cost of Goods Sold,Supplies & Materials - COGS
+6000,Rent Expense,Expense,Rent or Lease of Buildings
+6800,Depreciation Expense,Expense,Depreciation

@@ -444,6 +444,15 @@ export default function Settings() {
         <DimensionManager kind="locations" title="Locations" singular="location" canEdit={canEdit} />
         <DimensionManager kind="projects" title="Projects (jobs)" singular="project" canEdit={canEdit} />
         {canEdit && <FxRatesEditor />}
+        {canEdit && (
+          <Card data-testid="card-migrate-cta">
+            <CardHeader><CardTitle className="flex items-center gap-2"><Boxes className="h-5 w-5" /> Switching from QuickBooks or Xero?</CardTitle></CardHeader>
+            <CardContent className="flex items-center justify-between gap-4">
+              <p className="text-sm text-muted-foreground">Use the guided migration wizard to bring your Chart of Accounts, contacts, catalog, open invoices/bills and opening balances across — with source auto-detect, column mapping and a dry-run preview before anything is posted.</p>
+              <Button asChild><a href="/settings/import" data-testid="link-migration-wizard">Open migration wizard</a></Button>
+            </CardContent>
+          </Card>
+        )}
         {canEdit && <DataImporters />}
         {canEdit && <WebhooksManager />}
       </div>

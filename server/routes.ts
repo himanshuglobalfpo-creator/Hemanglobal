@@ -84,6 +84,7 @@ import { fileDriver, ATTACHMENT_MAX_BYTES, ATTACHMENT_MIME_WHITELIST } from "./f
 import { encryptBlob, decryptBlob } from "./crypto-vault";
 import { toCsv, csvMoney, type CsvColumn } from "./csv";
 import * as importers from "./importers";
+import * as migration from "./migration";
 import { assertSafeWebhookUrl, signWebhookPayload, startWebhookWorker } from "./webhooks";
 
 // Heuristic: any Error whose message looks like a business-rule violation
@@ -485,6 +486,45 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     handle(res, () => importers.importInvoices(csvBody(req), flag(req, "dryRun"), flag(req, "partial"))));
   app.post("/api/import/opening-balances", importLimiter, importText, (req, res) =>
     handle(res, () => importers.importOpeningBalances(csvBody(req), String((req.body?.asOfDate ?? req.query.asOfDate) || ""), flag(req, "dryRun"))));
+
+  // ---------- Guided migration wizard (QBO/Xero switcher path) ----------
+  // JSON in, JSON out. The wizard uploads each source CSV verbatim; the server
+  // detects the source, maps columns, and drives the row-level importers above.
+  // Restricted to owners/admins because a commit posts to the ledger.
+  app.get("/api/migration/summary", requireRole("owner", "admin"), (_req, res) =>
+    handle(res, () => migration.orgMigrationSummary()));
+
+  // Analyze: detect source/entity + suggest a column mapping for one file.
+  app.post("/api/migration/analyze", requireRole("owner", "admin"), (req, res) =>
+    handle(res, async () => {
+      const csv = String(req.body?.csv ?? "");
+      if (!csv.trim()) throw new Error("Provide the file contents as JSON { csv: \"...\" }");
+      return migration.analyzeFile(csv, req.body?.entity, req.body?.source);
+    }));
+
+  // Import one mapped file. ?dryRun=true validates with zero writes. A commit
+  // into an org that already has transactions requires confirmOrgName to match.
+  app.post("/api/migration/import", importLimiter, requireRole("owner", "admin"), (req, res) =>
+    handle(res, async () => {
+      const b = req.body ?? {};
+      const entity = b.entity as migration.EntityKind;
+      const source = (b.source ?? "generic") as migration.Source;
+      const mapping = (b.mapping ?? {}) as Record<string, string>;
+      const csv = String(b.csv ?? "");
+      const dryRun = flag(req, "dryRun") || b.dryRun === true;
+      if (!entity || !csv.trim()) throw new Error("entity and csv are required");
+      if (!dryRun) {
+        const summary = await migration.orgMigrationSummary();
+        if (summary.hasTransactions && String(b.confirmOrgName ?? "").trim() !== summary.orgName) {
+          throw new Error(`This organization already has ${summary.journalEntryCount} posted transaction(s). Type the organization name "${summary.orgName}" to confirm the import.`);
+        }
+      }
+      return migration.runImport(entity, source, mapping, csv, {
+        dryRun,
+        conversionDate: b.conversionDate,
+        partial: b.partial === true,
+      });
+    }));
 
   // ---------- Report pack (Phase 3) ----------
   // Every report accepts ?format=csv and streams RFC-4180 CSV via the shared

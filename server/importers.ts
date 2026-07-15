@@ -22,7 +22,16 @@ export type ImportReport = {
   skipped: number;
   errors: Array<{ row: number; message: string }>;
   dryRun: boolean;
+  // Migration extras (populated by the QBO/Xero wizard path; optional so the
+  // five legacy importers keep their exact response shape).
+  updated?: number;
+  // Per-row disposition for the downloadable dry-run report.
+  rows?: Array<{ row: number; status: "created" | "updated" | "skipped" | "error"; message?: string; key?: string }>;
 };
+
+function emptyReport(dryRun: boolean): ImportReport {
+  return { inserted: 0, skipped: 0, errors: [], dryRun };
+}
 
 function parseCsv(csvText: string): Record<string, string>[] {
   return parse(csvText, {
@@ -87,11 +96,20 @@ async function importParties(
 
   await db.transaction(async () => {
     for (const p of toInsert) {
-      await pool.query(
-        `INSERT INTO ${table} (org_id, name, email, phone, address, shipping_city, shipping_state, shipping_zip)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [orgId, p.name, p.email, p.phone, p.address, p.shipping_city, p.shipping_state, p.shipping_zip]
-      );
+      // Only the customers table carries shipping_* columns; vendors is
+      // name/email/phone/address only, so branch the INSERT by table.
+      if (table === "customers") {
+        await pool.query(
+          `INSERT INTO customers (org_id, name, email, phone, address, shipping_city, shipping_state, shipping_zip)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [orgId, p.name, p.email, p.phone, p.address, p.shipping_city, p.shipping_state, p.shipping_zip]
+        );
+      } else {
+        await pool.query(
+          `INSERT INTO vendors (org_id, name, email, phone, address) VALUES ($1,$2,$3,$4,$5)`,
+          [orgId, p.name, p.email, p.phone, p.address]
+        );
+      }
       report.inserted++;
     }
   });
@@ -328,5 +346,281 @@ export async function importOpeningBalances(csvText: string, asOfDate: string, d
   report.inserted = 1;
   await storage.audit("import", "journal_entry", null,
     `Opening balances imported as of ${asOfDate}: ${jeLines.length} lines, ${(totalDr / 100).toFixed(2)} each side`);
+  return report;
+}
+
+// ===========================================================================
+// MIGRATION SUITE — QBO/Xero switcher path (Products/Services, open Bills,
+// Trial Balance as opening balances). These run behind the guided wizard at
+// /settings/import; the wizard canonicalizes each source CSV into the header
+// shapes below before calling in, so QBO and Xero exports share one code path.
+// ===========================================================================
+
+const OPENING_BALANCE_EQUITY_CODE = "3900";
+const OPENING_BALANCE_EQUITY_NAME = "Opening Balance Equity";
+
+// Find (or, on commit, create) the Opening Balance Equity account — the QBO
+// convention for the contra side of every conversion balance. Matched by code
+// 3900 first, then by name, so an org that already has one is reused.
+async function resolveOpeningBalanceEquity(orgId: number, create: boolean): Promise<number | null> {
+  const found = (await pool.query(
+    `SELECT id FROM accounts WHERE org_id = $1 AND (code = $2 OR lower(name) = lower($3)) ORDER BY (code = $2) DESC LIMIT 1`,
+    [orgId, OPENING_BALANCE_EQUITY_CODE, OPENING_BALANCE_EQUITY_NAME]
+  )).rows[0] as { id: number } | undefined;
+  if (found) return found.id;
+  if (!create) return null;
+  const inserted = (await pool.query(
+    `INSERT INTO accounts (org_id, code, name, type, subtype, is_active) VALUES ($1,$2,$3,'equity','equity',true) RETURNING id`,
+    [orgId, OPENING_BALANCE_EQUITY_CODE, OPENING_BALANCE_EQUITY_NAME]
+  )).rows[0] as { id: number };
+  return inserted.id;
+}
+
+// ---------------------------------------------------------------------------
+// Products / Services (catalog items)
+// Canonical headers: sku,name,type,income_account_code,expense_account_code,
+//                    cogs_account_code,inventory_account_code,description
+// ---------------------------------------------------------------------------
+export async function importItems(csvText: string, dryRun: boolean): Promise<ImportReport> {
+  const rows = parseCsv(csvText);
+  const report = emptyReport(dryRun);
+  const orgId = currentOrgId();
+  const accounts = (await pool.query(`SELECT id, code FROM accounts WHERE org_id = $1`, [orgId])).rows as any[];
+  const acctByCode = new Map(accounts.map((a) => [String(a.code), a.id]));
+  const existingSkus = new Set(
+    ((await pool.query(`SELECT lower(sku) AS sku FROM items WHERE org_id = $1`, [orgId])).rows as any[]).map((r) => r.sku)
+  );
+  const ITEM_TYPES = new Set(["inventory", "service", "noninventory"]);
+
+  type Prepared = {
+    sku: string; name: string; type: string; description: string | null;
+    salesAccountId: number; expenseAccountId: number; cogsAccountId: number; inventoryAssetAccountId: number | null;
+  };
+  const prepared: Prepared[] = [];
+
+  rows.forEach((r, i) => {
+    const rowNum = i + 1;
+    const name = (r.name || "").trim();
+    const sku = (r.sku || name).trim();
+    if (!name) { report.errors.push({ row: rowNum, message: "name is required" }); return; }
+    // Normalize the source type ("Inventory"/"Non-inventory"/"Service") to ours.
+    const rawType = (r.type || "service").trim().toLowerCase().replace(/[\s-]/g, "");
+    const type = rawType.startsWith("inventor") ? "inventory" : rawType.startsWith("noninventor") ? "noninventory" : "service";
+    if (!ITEM_TYPES.has(type)) { report.errors.push({ row: rowNum, message: `invalid item type "${r.type}"` }); return; }
+    if (existingSkus.has(sku.toLowerCase())) { report.skipped++; return; }
+
+    const salesAccountId = acctByCode.get((r.income_account_code || "").trim());
+    if (!salesAccountId) { report.errors.push({ row: rowNum, message: `unresolved income_account_code "${r.income_account_code}"` }); return; }
+    // Expense/COGS fall back to each other so a minimal export (income + expense
+    // only) still imports; inventory additionally needs an asset account.
+    const expenseAccountId = acctByCode.get((r.expense_account_code || "").trim()) ?? acctByCode.get((r.cogs_account_code || "").trim());
+    if (!expenseAccountId) { report.errors.push({ row: rowNum, message: `unresolved expense_account_code "${r.expense_account_code}"` }); return; }
+    const cogsAccountId = acctByCode.get((r.cogs_account_code || "").trim()) ?? expenseAccountId;
+    const inventoryAssetAccountId: number | null = acctByCode.get((r.inventory_account_code || "").trim()) ?? null;
+    if (type === "inventory" && !inventoryAssetAccountId) {
+      report.errors.push({ row: rowNum, message: `inventory item "${name}" needs inventory_account_code` });
+      return;
+    }
+    existingSkus.add(sku.toLowerCase());
+    prepared.push({ sku, name, type, description: (r.description || "").trim() || null, salesAccountId, expenseAccountId, cogsAccountId, inventoryAssetAccountId });
+  });
+
+  if (report.errors.length > 0 || dryRun) {
+    report.inserted = prepared.length;
+    return report;
+  }
+  // One transaction per file: direct inserts keep every item in the same tx
+  // (createItem is not tx-aware). quantity/cost stay zero — stock only moves
+  // through inventory_movements, never a seeded import.
+  await db.transaction(async () => {
+    for (const p of prepared) {
+      await pool.query(
+        `INSERT INTO items (org_id, sku, name, description, type, sales_account_id, expense_account_id, inventory_asset_account_id, cogs_account_id, quantity_on_hand, avg_cost_cents, is_active, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,0,true,now())`,
+        [orgId, p.sku, p.name, p.description, p.type, p.salesAccountId, p.expenseAccountId, p.inventoryAssetAccountId, p.cogsAccountId]
+      );
+      report.inserted++;
+    }
+  });
+  await storage.audit("import", "item", null, `CSV import: ${report.inserted} items inserted, ${report.skipped} skipped`);
+  return report;
+}
+
+// ---------------------------------------------------------------------------
+// Open Bills (flat rows grouped by number) — mirror of importInvoices.
+// Canonical headers: number,vendor_name,date,due_date,tax_rate,line_description,
+//                    quantity,rate,expense_account_code
+// ---------------------------------------------------------------------------
+export async function importBills(csvText: string, dryRun: boolean, partial: boolean): Promise<ImportReport> {
+  const rows = parseCsv(csvText);
+  const report = emptyReport(dryRun);
+  const orgId = currentOrgId();
+
+  const vendors = (await pool.query(`SELECT id, lower(name) AS name FROM vendors WHERE org_id = $1`, [orgId])).rows as any[];
+  const vendorByName = new Map(vendors.map((v) => [v.name, v.id]));
+  const accounts = (await pool.query(`SELECT id, code FROM accounts WHERE org_id = $1`, [orgId])).rows as any[];
+  const acctByCode = new Map(accounts.map((a) => [String(a.code), a.id]));
+  const existingNumbers = new Set(
+    ((await pool.query(`SELECT number FROM bills WHERE org_id = $1`, [orgId])).rows as any[]).map((r) => r.number)
+  );
+
+  type Group = { number: string; rows: Array<{ rowNum: number; r: Record<string, string> }> };
+  const groups = new Map<string, Group>();
+  rows.forEach((r, i) => {
+    const number = (r.number || "").trim();
+    if (!number) { report.errors.push({ row: i + 1, message: "number is required" }); return; }
+    if (!groups.has(number)) groups.set(number, { number, rows: [] });
+    groups.get(number)!.rows.push({ rowNum: i + 1, r });
+  });
+
+  type Prepared = {
+    number: string; vendorId: number; date: string; dueDate: string; taxRate: number;
+    lines: Array<{ description: string; quantity: number; rate: number; expenseAccountId: number }>;
+  };
+  const prepared: Prepared[] = [];
+
+  for (const g of groups.values()) {
+    if (existingNumbers.has(g.number)) { report.skipped++; continue; }
+    const head = g.rows[0];
+    const vendorName = (head.r.vendor_name || "").trim().toLowerCase();
+    const vendorId = vendorByName.get(vendorName);
+    const groupErrors: Array<{ row: number; message: string }> = [];
+    if (!vendorId) groupErrors.push({ row: head.rowNum, message: `unresolved vendor_name "${head.r.vendor_name}"` });
+    const date = (head.r.date || "").trim();
+    const dueDate = (head.r.due_date || date).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) groupErrors.push({ row: head.rowNum, message: `invalid date "${date}" (YYYY-MM-DD)` });
+    const taxRate = Number(head.r.tax_rate || 0);
+    if (!(taxRate >= 0 && taxRate <= 100)) groupErrors.push({ row: head.rowNum, message: `invalid tax_rate "${head.r.tax_rate}"` });
+
+    const lines: Prepared["lines"] = [];
+    for (const { rowNum, r } of g.rows) {
+      const qty = Number(r.quantity);
+      const rate = Number(r.rate);
+      const acctId = acctByCode.get((r.expense_account_code || "").trim());
+      if (!r.line_description) groupErrors.push({ row: rowNum, message: "line_description is required" });
+      if (!(qty > 0)) groupErrors.push({ row: rowNum, message: `invalid quantity "${r.quantity}"` });
+      if (!(rate >= 0) || !Number.isFinite(rate)) groupErrors.push({ row: rowNum, message: `invalid rate "${r.rate}"` });
+      if (!acctId) groupErrors.push({ row: rowNum, message: `unresolved expense_account_code "${r.expense_account_code}"` });
+      if (acctId) lines.push({ description: r.line_description, quantity: qty, rate, expenseAccountId: acctId });
+    }
+    if (groupErrors.length > 0) { report.errors.push(...groupErrors); continue; }
+    prepared.push({ number: g.number, vendorId: vendorId!, date, dueDate, taxRate, lines });
+  }
+
+  if ((report.errors.length > 0 && !partial) || dryRun) {
+    report.inserted = prepared.length;
+    return report;
+  }
+
+  await db.transaction(async (tx) => {
+    for (const p of prepared) {
+      try {
+        await tx.transaction(async (sp) => {
+          await storage.createBill({
+            number: p.number,
+            vendorId: p.vendorId,
+            date: p.date,
+            dueDate: p.dueDate,
+            taxRate: p.taxRate,
+            lines: p.lines,
+          } as any, { _tx: sp });
+        });
+        report.inserted++;
+      } catch (e: any) {
+        if (!partial) throw e;
+        report.errors.push({ row: 0, message: `bill ${p.number}: ${e.message}` });
+      }
+    }
+  });
+  await storage.audit("import", "bill", null,
+    `CSV import: ${report.inserted} bills inserted, ${report.skipped} skipped, ${report.errors.length} errors`);
+  return report;
+}
+
+// ---------------------------------------------------------------------------
+// Trial Balance → opening balances (single balanced JE against OBE)
+// Canonical headers: account_code,account_name,debit,credit
+// Accounts resolve by code first, then case-insensitive name (QBO/Xero trial
+// balances export names, not codes). Any residual imbalance is absorbed by
+// Opening Balance Equity so the posted JE ALWAYS balances; a source trial
+// balance that already balances posts verbatim (OBE plug = 0), so the trial
+// balance after import equals the source to the cent.
+// ---------------------------------------------------------------------------
+export async function importTrialBalance(csvText: string, conversionDate: string, dryRun: boolean): Promise<ImportReport> {
+  const rows = parseCsv(csvText);
+  const report = emptyReport(dryRun);
+  const orgId = currentOrgId();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(conversionDate || "")) {
+    report.errors.push({ row: 0, message: "conversionDate (YYYY-MM-DD) is required" });
+    return report;
+  }
+  const accounts = (await pool.query(`SELECT id, code, lower(name) AS name FROM accounts WHERE org_id = $1`, [orgId])).rows as any[];
+  const acctByCode = new Map(accounts.map((a) => [String(a.code), a.id]));
+  const acctByName = new Map(accounts.map((a) => [a.name, a.id]));
+  const obeId = accounts.find((a) => String(a.code) === OPENING_BALANCE_EQUITY_CODE || a.name === OPENING_BALANCE_EQUITY_NAME.toLowerCase())?.id ?? null;
+
+  const jeLines: Array<{ accountId: number; debit: number; credit: number; description: string }> = [];
+  let totalDr = 0;
+  let totalCr = 0;
+  rows.forEach((r, i) => {
+    const rowNum = i + 1;
+    const code = (r.account_code || "").trim();
+    const name = (r.account_name || "").trim().toLowerCase();
+    const acctId = acctByCode.get(code) ?? (name ? acctByName.get(name) : undefined);
+    if (!acctId) {
+      report.errors.push({ row: rowNum, message: `unresolved account "${r.account_code || r.account_name}"` });
+      return;
+    }
+    const debit = r.debit ? toCents(Number(r.debit)) : 0;
+    const credit = r.credit ? toCents(Number(r.credit)) : 0;
+    if (debit < 0 || credit < 0 || (debit > 0 && credit > 0)) {
+      report.errors.push({ row: rowNum, message: "each row needs debit OR credit (non-negative, not both)" });
+      return;
+    }
+    if (debit === 0 && credit === 0) return; // blank row — ignore
+    totalDr += debit;
+    totalCr += credit;
+    jeLines.push({ accountId: acctId, debit, credit, description: "Opening balance" });
+  });
+
+  // Balancing plug to Opening Balance Equity for any residual. On a balanced
+  // trial balance the plug is zero and no OBE line is added.
+  const plug = totalDr - totalCr;
+  if (plug !== 0) {
+    if (obeId) {
+      // debits exceed credits → credit OBE, and vice versa.
+      jeLines.push({ accountId: obeId, debit: plug < 0 ? -plug : 0, credit: plug > 0 ? plug : 0, description: "Opening Balance Equity (plug)" });
+    }
+    // else: OBE is auto-created on commit (below); dry run reports the plug amount.
+  }
+
+  if (jeLines.length < 1 && plug === 0) {
+    report.errors.push({ row: 0, message: "no non-zero trial balance rows found" });
+  }
+  if (report.errors.length > 0 || dryRun) {
+    report.inserted = report.errors.length === 0 ? 1 : 0;
+    if (plug !== 0 && report.errors.length === 0) {
+      report.rows = [{ row: 0, status: "created", message: `Opening Balance Equity plug of ${(Math.abs(plug) / 100).toFixed(2)} will balance the entry`, key: "OBE" }];
+    }
+    return report;
+  }
+
+  // Commit path: ensure OBE exists if a plug is needed, then post one JE.
+  let lines = jeLines;
+  if (plug !== 0 && !obeId) {
+    const createdObe = await resolveOpeningBalanceEquity(orgId, true);
+    lines = [...jeLines, { accountId: createdObe!, debit: plug < 0 ? -plug : 0, credit: plug > 0 ? plug : 0, description: "Opening Balance Equity (plug)" }];
+  }
+
+  await storage.postJournalEntry({
+    date: conversionDate,
+    memo: "Opening balances (migrated)",
+    reference: "MIGRATION",
+    source: "opening_balance",
+    lines,
+  } as any);
+  report.inserted = 1;
+  await storage.audit("import", "journal_entry", null,
+    `Trial balance migrated as of ${conversionDate}: ${lines.length} lines, ${(Math.max(totalDr, totalCr) / 100).toFixed(2)} each side`);
   return report;
 }
