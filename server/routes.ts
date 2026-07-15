@@ -2396,6 +2396,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return;
       }
       await storage.recordShareView(token);
+      await storage.recordInvoiceViewed(token); // P3.10: stamp first/last viewed (server-side, CSP-safe)
       const inv = data.invoice;
       const cust = data.customer || { name: "Customer" };
       const lines = (data.lines || []) as any[];
@@ -2488,11 +2489,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     </div>
     <div class="footer">Powered by LedgerLite · This is a read-only preview shared with ${escapeHtml(cust.email || "you")}</div>
   </div>
-  <script>
-    // Honest page-view tracking (P3.10): records that the recipient opened this
-    // page. No pixels, no email tracking — a real page view only.
-    try { fetch("/p/invoice/${encodeURIComponent(token)}/viewed", { method: "POST" }); } catch (e) {}
-  </script>
 </body></html>`;
       res.type("html").send(html);
     } catch (err: any) {

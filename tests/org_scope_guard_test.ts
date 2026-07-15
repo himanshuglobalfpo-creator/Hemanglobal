@@ -96,6 +96,10 @@ const ALLOWLIST: Record<string, { tables: string[]; reason: string }> = {
     tables: ["invoiceShares"],
     reason: "public share page: token is the auth; only bumps view counters on that share row",
   },
+  recordInvoiceViewed: {
+    tables: ["invoiceShares"],
+    reason: "public share page (P3.10): token is the auth; resolves the share, then stamps first/last viewed on its invoice using the share's own orgId (org-scoped UPDATE)",
+  },
   runCatchUp: {
     tables: ["recurringTemplates"],
     reason: "boot-time job outside any request; iterates ALL orgs' due templates wrapping EACH in withOrg(t.orgId)",
