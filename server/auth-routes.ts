@@ -36,6 +36,7 @@ import {
   hashPassword, resolveOrgAccess, listAccessibleOrgs,
 } from "./auth";
 import { sendEmail, appBaseUrl } from "./email";
+import { startTrial, assertSeatAvailable } from "./billing";
 import { authLimiter } from "./rate-limit";
 import { seedOrgDefaults } from "./storage";
 import { generateTotpSecret, verifyTotp, otpauthUri, generateRecoveryCodes } from "./totp";
@@ -111,6 +112,7 @@ export function registerAuthRoutes(app: Express) {
         const o = await createOrg(data.orgName, slug);
         await addMember(u.id, o.id, "owner");
         await seedOrgDefaults(o.id);
+        await startTrial(o.id); // P4.1: signup starts a 14-day trial
         const s = await createSession(u.id, o.id, req);
         setSessionCookie(res, s.id);
         return { user: { id: u.id, email: u.email, name: u.name }, org: { id: o.id, name: o.name, slug: o.slug }, role: "owner" };
@@ -120,6 +122,7 @@ export function registerAuthRoutes(app: Express) {
           const o = await createOrg(data.orgName, slug);
           await addMember(u.id, o.id, "owner");
           await seedOrgDefaults(o.id);
+          await startTrial(o.id);
           const s = await createSession(u.id, o.id, req);
           setSessionCookie(res, s.id);
           return { user: { id: u.id, email: u.email, name: u.name }, org: { id: o.id, name: o.name, slug: o.slug }, role: "owner" };
@@ -644,6 +647,7 @@ export function registerAuthRoutes(app: Express) {
       const orgId = Number(req.params.id);
       if (orgId !== req.org.id) throw new Error("Can only invite to your active org");
       if (req.role !== "owner" && req.role !== "admin") throw new Error("Owner/admin only");
+      await assertSeatAvailable(req.org); // P4.1: block the (N+1)th member at the seat limit
       const data = inviteUserSchema.parse(req.body);
       let u = await getUserByEmail(data.email);
       if (!u) {

@@ -443,6 +443,7 @@ export default function Settings() {
         <DimensionManager kind="classes" title="Classes" singular="class" canEdit={canEdit} />
         <DimensionManager kind="locations" title="Locations" singular="location" canEdit={canEdit} />
         <DimensionManager kind="projects" title="Projects (jobs)" singular="project" canEdit={canEdit} />
+        <BillingCard />
         {canEdit && <FxRatesEditor />}
         {canEdit && <RolesManager />}
         {canEdit && <YourAccountant />}
@@ -533,6 +534,31 @@ function RolesManager() {
           </div>
           <Button disabled={!name.trim() || create.isPending} onClick={() => create.mutate()} data-testid="button-create-role">Create role</Button>
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// P4.1 — subscription plan, seats, and Stripe-hosted portal/checkout.
+function BillingCard() {
+  const { toast } = useToast();
+  const { data } = useQuery<{ plan: string; status: string; readOnly: boolean; seatLimit: number; seatsUsed: number; trialEndsAt: string | null; configured: boolean }>({ queryKey: ["/api/billing"] });
+  const portal = useMutation({ mutationFn: async () => (await apiRequest("POST", "/api/billing/portal", {})).json(), onSuccess: (r: any) => { if (r.url) window.location.href = r.url; }, onError: (e: any) => toast({ title: "Billing", description: e.message, variant: "destructive" }) });
+  if (!data) return null;
+  return (
+    <Card data-testid="card-billing">
+      <CardHeader><CardTitle className="flex items-center gap-2"><CreditCard className="h-5 w-5" /> Subscription</CardTitle></CardHeader>
+      <CardContent className="space-y-2 text-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium capitalize">{data.plan}</span>
+          <span className={`rounded px-1.5 py-0.5 text-xs ${data.readOnly ? "bg-red-100 text-red-800" : data.status === "past_due" ? "bg-amber-100 text-amber-800" : "bg-green-100 text-green-800"}`}>{data.readOnly ? "read-only" : data.status}</span>
+          <span className="text-muted-foreground">· {data.seatsUsed}/{data.seatLimit} seats</span>
+          {data.trialEndsAt && data.status === "trialing" && <span className="text-muted-foreground">· trial ends {data.trialEndsAt.slice(0, 10)}</span>}
+        </div>
+        {data.readOnly && <p className="text-xs text-red-700">Your subscription is inactive — the workspace is read-only until billing is updated.</p>}
+        {data.configured
+          ? <Button size="sm" variant="outline" onClick={() => portal.mutate()} disabled={portal.isPending} data-testid="button-billing-portal">Manage billing & invoices</Button>
+          : <p className="text-xs text-muted-foreground">Platform billing is not configured in this environment.</p>}
       </CardContent>
     </Card>
   );

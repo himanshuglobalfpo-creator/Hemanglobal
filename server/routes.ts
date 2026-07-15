@@ -95,6 +95,7 @@ import { encryptBlob, decryptBlob } from "./crypto-vault";
 import { toCsv, csvMoney, type CsvColumn } from "./csv";
 import { streamXlsx, wantsXlsx } from "./xlsx";
 import { getFxProvider } from "./fx-rates";
+import { effectiveBillingState, requireEntitlement, applyPlatformEvent, getPlatformStripe, seatUsage, platformBillingConfigured } from "./billing";
 import * as importers from "./importers";
 import * as migration from "./migration";
 import { assertSafeWebhookUrl, signWebhookPayload, startWebhookWorker } from "./webhooks";
@@ -327,6 +328,35 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // Platform-billing webhook (P4.1) — SEPARATE endpoint from app-Stripe's
+  // /api/stripe/webhook. Stripe signs the raw body; verified with the platform
+  // webhook secret. No session (exempted from the auth gate below).
+  app.post("/api/platform-stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+    try {
+      const stripe = getPlatformStripe();
+      const secret = process.env.PLATFORM_STRIPE_WEBHOOK_SECRET;
+      if (!stripe || !secret) { res.status(503).json({ error: "Platform billing not configured" }); return; }
+      let event: any;
+      try {
+        event = stripe.webhooks.constructEvent((req as any).body, req.headers["stripe-signature"] as string, secret);
+      } catch (e: any) {
+        res.status(400).json({ error: `Webhook signature verification failed: ${e.message}` });
+        return;
+      }
+      // Resolve org by stripe_customer_id on the event object.
+      const obj = event.data?.object ?? {};
+      const customerId = obj.customer || obj.customer_id;
+      const org = customerId ? (await pool.query(`SELECT id FROM organizations WHERE stripe_customer_id=$1`, [customerId])).rows[0] : null;
+      if (org) {
+        const priceId = obj.items?.data?.[0]?.price?.id || obj.lines?.data?.[0]?.price?.id;
+        await applyPlatformEvent(org.id, event.type, priceId);
+      }
+      res.json({ received: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Auth gate for everything below /api/* EXCEPT explicitly-public routes.
   // Public: /api/auth/*, /api/health, /api/stripe/webhook, /api/plaid/webhook
   app.use("/api", (req, res, next) => {
@@ -334,6 +364,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (req.path === "/health" || req.path === "/healthz" || req.path.startsWith("/health/")) return next();
     if (req.path === "/metrics") return next();           // guarded by METRICS_TOKEN, not sessions
     if (req.path === "/stripe/webhook") return next();    // Stripe signs the body
+    if (req.path === "/platform-stripe/webhook") return next(); // platform billing → us
     if (req.path === "/plaid/webhook") return next();     // Plaid → us
     if (!req.user) {
       res.status(401).json({ error: "Authentication required. POST /api/auth/login." });
@@ -362,6 +393,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const createdMs = req.user.createdAt ? new Date(req.user.createdAt).getTime() : 0;
       if (Date.now() - createdMs > 7 * 24 * 60 * 60 * 1000) {
         res.status(403).json({ error: "Owners must enable two-factor authentication to continue.", code: "MFA_REQUIRED" });
+        return;
+      }
+    }
+    // Read-only mode (P4.1): when the trial has expired or dunning grace has
+    // elapsed, block MUTATING routes with 402 — except billing (so they can pay)
+    // and auth (already exempted above). Reads stay available so data is never
+    // held hostage.
+    const mutating = req.method === "POST" || req.method === "PUT" || req.method === "PATCH" || req.method === "DELETE";
+    if (mutating && !req.path.startsWith("/billing")) {
+      const state = effectiveBillingState(req.org);
+      if (state.readOnly) {
+        res.status(402).json({
+          error: "Your subscription is inactive. Update billing to restore full access.",
+          code: "BILLING_READ_ONLY", reason: state.reason, plan: state.plan,
+        });
         return;
       }
     }
@@ -1212,7 +1258,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return job;
     })
   );
-  app.post("/api/jobs", (req, res) =>
+  app.post("/api/jobs", requireEntitlement("batchActions"), (req, res) =>
     handle(res, () => {
       const { kind, ids, payload } = createJobSchema.parse(req.body);
       return storage.runBatchJob(kind, ids, { role: req.role, userId: currentUserId(), payload });
@@ -1322,6 +1368,46 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       if (compare !== "none") return storage.profitAndLossComparison(from, to, compare, filter);
       return storage.profitAndLoss(from, to, filter);
+    })
+  );
+
+  // ---------- Billing (P4.1) ----------
+  app.get("/api/billing", requireOrg, (req, res) =>
+    handle(res, async () => {
+      const state = effectiveBillingState(req.org);
+      return { ...state, seatsUsed: await seatUsage(req.org!.id), configured: platformBillingConfigured() };
+    })
+  );
+  // Start a Stripe Checkout session for an upgrade/downgrade.
+  app.post("/api/billing/checkout", requireOrg, requireRole("owner", "admin"), (req, res) =>
+    handle(res, async () => {
+      const stripe = getPlatformStripe();
+      if (!stripe) throw new Error("Platform billing is not configured.");
+      const priceId = String(req.body?.priceId || "");
+      if (!priceId) throw new Error("priceId is required");
+      const org: any = req.org;
+      const session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        line_items: [{ price: priceId, quantity: 1 }],
+        customer: org.stripeCustomerId || undefined,
+        success_url: `${appBaseUrl()}/#/settings?billing=success`,
+        cancel_url: `${appBaseUrl()}/#/settings?billing=cancel`,
+        metadata: { orgId: String(org.id) },
+      });
+      return { url: session.url };
+    })
+  );
+  // Open the Stripe-hosted billing portal (invoices, payment method).
+  app.post("/api/billing/portal", requireOrg, requireRole("owner", "admin"), (req, res) =>
+    handle(res, async () => {
+      const stripe = getPlatformStripe();
+      const org: any = req.org;
+      if (!stripe || !org.stripeCustomerId) throw new Error("No billing account yet — start a subscription first.");
+      const session = await stripe.billingPortal.sessions.create({
+        customer: org.stripeCustomerId,
+        return_url: `${appBaseUrl()}/#/settings`,
+      });
+      return { url: session.url };
     })
   );
 
