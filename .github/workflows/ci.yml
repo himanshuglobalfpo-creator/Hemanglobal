@@ -101,7 +101,6 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      NODE_ENV: production
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       APP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
       SESSION_SECRET: ci-session-secret-0123456789
@@ -112,16 +111,19 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      # Install prod deps as production would (--omit=dev), then add just the
-      # build toolchain needed to produce the artifact, so a dependency that was
-      # wrongly placed in devDependencies is caught here.
+      # Build with the FULL toolchain (vite/esbuild are devDependencies), so
+      # NODE_ENV must NOT be "production" here or `npm ci` would omit them.
       - name: Build the production artifact
         run: |
           npm ci
           npm run build
+      # Now reinstall production-only deps — this catches a runtime dependency
+      # wrongly placed in devDependencies (dist/ is preserved by npm ci).
       - name: Reinstall production-only deps
         run: npm ci --omit=dev
       - name: Boot dist/index.mjs and require health/ready = 200
+        env:
+          NODE_ENV: production
         run: |
           node dist/index.mjs &
           SERVER_PID=$!
