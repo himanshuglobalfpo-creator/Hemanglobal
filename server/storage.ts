@@ -1831,6 +1831,94 @@ export class DatabaseStorage {
     };
   }
 
+  // --------------------------------------------------------------------------
+  // AUTOMATIC FX RATES (P3.7)
+  // --------------------------------------------------------------------------
+  // Distinct non-base document currencies actually used by the org's invoices
+  // and bills — the set we bother fetching rates for.
+  async orgDocumentCurrencies(): Promise<string[]> {
+    const orgId = currentOrgId();
+    const base = (await pool.query(`SELECT base_currency AS b FROM organizations WHERE id = $1`, [orgId])).rows[0]?.b ?? "USD";
+    const rows = (await pool.query(
+      `SELECT DISTINCT currency FROM (
+         SELECT currency FROM invoices WHERE org_id = $1
+         UNION SELECT currency FROM bills WHERE org_id = $1
+       ) t WHERE currency IS NOT NULL AND currency <> '' AND currency <> $2`,
+      [orgId, base]
+    )).rows as any[];
+    return rows.map((r) => r.currency);
+  }
+
+  // Upsert an AUTOMATIC rate. Manual rates always win: an existing row whose
+  // source = 'manual' is never overwritten (enforced in the ON CONFLICT WHERE,
+  // so it is race-safe). Returns true if a row was written, false if skipped.
+  async upsertFxRateAuto(date: string, fromCode: string, toCode: string, rate: number): Promise<boolean> {
+    const r = await pool.query(
+      `INSERT INTO fx_rates (org_id, date, from_code, to_code, rate, source)
+       VALUES ($1, $2, $3, $4, $5, 'system')
+       ON CONFLICT (org_id, date, from_code, to_code)
+       DO UPDATE SET rate = EXCLUDED.rate, source = 'system'
+       WHERE fx_rates.source <> 'manual'`,
+      [currentOrgId(), date, fromCode, toCode, rate]
+    );
+    return (r.rowCount ?? 0) > 0;
+  }
+
+  // Fetch and upsert automatic rates for the org's document currencies. A
+  // provider failure returns { ok:false, error } and writes NOTHING — prior
+  // rates stay intact. Manual rates are preserved (upsertFxRateAuto). The
+  // provider is injected so the scheduler and tests supply their own.
+  async refreshFxRatesForOrg(
+    provider: { name: string; fetchRates: (base: string, symbols: string[], date?: string) => Promise<Record<string, number>> },
+    opts: { asOf?: string; currencies?: string[] } = {}
+  ): Promise<{ ok: boolean; provider: string; date: string; updated: number; skipped: number; currencies: string[]; error?: string }> {
+    const orgId = currentOrgId();
+    const base = (await pool.query(`SELECT base_currency AS b FROM organizations WHERE id = $1`, [orgId])).rows[0]?.b ?? "USD";
+    const date = opts.asOf && /^\d{4}-\d{2}-\d{2}$/.test(opts.asOf) ? opts.asOf : new Date().toISOString().slice(0, 10);
+    const currencies = (opts.currencies ?? await this.orgDocumentCurrencies()).filter((c) => c && c !== base);
+    if (currencies.length === 0) return { ok: true, provider: provider.name, date, updated: 0, skipped: 0, currencies: [] };
+    let rates: Record<string, number>;
+    try {
+      rates = await provider.fetchRates(base, currencies, date);
+    } catch (e: any) {
+      logger.warn("[fx] auto-refresh failed; keeping existing rates", { error: e?.message, provider: provider.name });
+      return { ok: false, provider: provider.name, date, updated: 0, skipped: 0, currencies, error: e?.message || "provider error" };
+    }
+    let updated = 0, skipped = 0;
+    for (const [foreign, rate] of Object.entries(rates)) {
+      if (!(rate > 0)) { skipped++; continue; }
+      const applied = await this.upsertFxRateAuto(date, foreign, base, rate);
+      if (applied) updated++; else skipped++;
+    }
+    if (updated > 0) await this.audit("upsert", "fx_rate", null, `Auto FX refresh (${provider.name}) for ${date}: ${updated} updated, ${skipped} kept manual/skipped`);
+    return { ok: true, provider: provider.name, date, updated, skipped, currencies };
+  }
+
+  // Daily scheduler entry: refresh every org's rates. System task (iterates all
+  // orgs under withOrg); a failure in one org is logged and does not stop others.
+  async refreshFxRatesAllOrgs(provider: { name: string; fetchRates: (base: string, symbols: string[], date?: string) => Promise<Record<string, number>> }): Promise<{ orgs: number; updated: number }> {
+    const orgIds = (await pool.query(`SELECT id FROM organizations ORDER BY id`)).rows.map((r: any) => r.id as number);
+    let updated = 0;
+    for (const orgId of orgIds) {
+      try {
+        const res = await withOrg({ orgId, userId: 0 }, () => this.refreshFxRatesForOrg(provider));
+        updated += res.updated;
+      } catch (e: any) {
+        logger.warn("[fx] org refresh failed", { orgId, error: e?.message });
+      }
+    }
+    return { orgs: orgIds.length, updated };
+  }
+
+  // Provider name + when auto rates were last written (for the Settings panel).
+  async fxAutoStatus(): Promise<{ lastFetchDate: string | null; systemRateCount: number }> {
+    const r = (await pool.query(
+      `SELECT MAX(date) AS "lastFetchDate", COUNT(*)::int AS "systemRateCount" FROM fx_rates WHERE org_id = $1 AND source = 'system'`,
+      [currentOrgId()]
+    )).rows[0] as any;
+    return { lastFetchDate: r.lastFetchDate ?? null, systemRateCount: r.systemRateCount ?? 0 };
+  }
+
   async listReportSchedules(): Promise<ReportSchedule[]> {
     return db.select().from(reportSchedules).where(eq(reportSchedules.orgId, currentOrgId())).orderBy(reportSchedules.nextRun);
   }

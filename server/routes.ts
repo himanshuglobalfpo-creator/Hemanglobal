@@ -90,6 +90,7 @@ import { fileDriver, ATTACHMENT_MAX_BYTES, ATTACHMENT_MIME_WHITELIST } from "./f
 import { encryptBlob, decryptBlob } from "./crypto-vault";
 import { toCsv, csvMoney, type CsvColumn } from "./csv";
 import { streamXlsx, wantsXlsx } from "./xlsx";
+import { getFxProvider } from "./fx-rates";
 import * as importers from "./importers";
 import * as migration from "./migration";
 import { assertSafeWebhookUrl, signWebhookPayload, startWebhookWorker } from "./webhooks";
@@ -717,6 +718,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       await storage.upsertFxRate(data);
       return { ok: true };
     })
+  );
+  // Automatic FX (P3.7): provider + last-fetch status, and a manual refresh.
+  app.get("/api/settings/fx-rates/status", (_req, res) =>
+    handle(res, async () => ({ provider: getFxProvider().name, ...(await storage.fxAutoStatus()) }))
+  );
+  app.post("/api/settings/fx-rates/refresh", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => storage.refreshFxRatesForOrg(getFxProvider(), { asOf: (req.body?.date as string) || undefined }))
   );
 
   // ---------- FX revaluation (period-end unrealized adjustment) ----------

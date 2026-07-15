@@ -21,7 +21,18 @@ type FxRate = { date: string; fromCode: string; toCode: string; rate: number; so
 export function FxRatesEditor() {
   const { toast } = useToast();
   const { data: rates = [] } = useQuery<FxRate[]>({ queryKey: ["/api/settings/fx-rates"] });
+  const { data: status } = useQuery<{ provider: string; lastFetchDate: string | null; systemRateCount: number }>({ queryKey: ["/api/settings/fx-rates/status"] });
   const [form, setForm] = useState({ date: todayISO(), fromCode: "EUR", toCode: "USD", rate: "" });
+
+  const refreshMut = useMutation({
+    mutationFn: async () => (await apiRequest("POST", "/api/settings/fx-rates/refresh", {})).json(),
+    onSuccess: (r: any) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/settings/fx-rates"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/settings/fx-rates/status"] });
+      toast({ title: r.ok ? "Rates refreshed" : "Refresh failed", description: r.ok ? `${r.updated} updated, ${r.skipped} kept manual/skipped` : r.error, variant: r.ok ? undefined : "destructive" });
+    },
+    onError: (e: any) => toast({ title: "Refresh failed", description: e.message, variant: "destructive" }),
+  });
 
   const saveMut = useMutation({
     mutationFn: async () => (await apiRequest("PUT", "/api/settings/fx-rates", {
@@ -37,6 +48,15 @@ export function FxRatesEditor() {
     <Card data-testid="card-fx-rates">
       <CardHeader><CardTitle className="flex items-center gap-2"><Globe className="h-5 w-5" /> FX rates</CardTitle></CardHeader>
       <CardContent className="space-y-3">
+        <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2 text-sm" data-testid="fx-auto-status">
+          <span className="text-muted-foreground">Auto source:</span>
+          <span className="font-medium">{status?.provider ?? "—"}</span>
+          <span className="text-muted-foreground">· last fetch: {status?.lastFetchDate ?? "never"}</span>
+          <button className="ml-auto rounded border px-2 py-1 text-xs hover-elevate disabled:opacity-60" disabled={refreshMut.isPending || status?.provider === "disabled"} onClick={() => refreshMut.mutate()} data-testid="button-fx-refresh">
+            {refreshMut.isPending ? "Refreshing…" : "Refresh now"}
+          </button>
+        </div>
+        <p className="text-xs text-muted-foreground">Automatic rates are fetched daily for currencies used in your documents. Manual rates below always win — an auto refresh never overwrites a rate you set for the same date.</p>
         <div className="flex items-end gap-2 flex-wrap">
           <div><Label>Date</Label><Input type="date" className="w-40" data-testid="input-fx-date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></div>
           <div><Label>From</Label><Input className="w-20 uppercase" maxLength={3} data-testid="input-fx-from" value={form.fromCode} onChange={(e) => setForm({ ...form, fromCode: e.target.value })} /></div>

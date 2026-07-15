@@ -203,6 +203,25 @@ app.use((req, res, next) => {
   const scheduleTimer = setInterval(fireDueSchedules, 3600_000);
   if (typeof scheduleTimer.unref === "function") scheduleTimer.unref();
 
+  // Automatic FX rates (P3.7): fetch daily for currencies present in each org's
+  // documents, upserting via the same path as manual edits. Manual rates always
+  // win; a provider failure leaves prior rates intact. Disabled when
+  // FX_RATES_PROVIDER=none. Runs at boot then daily.
+  const refreshFx = async () => {
+    try {
+      const { getFxProvider } = await import("./fx-rates");
+      const provider = getFxProvider();
+      if (provider.name === "disabled") return;
+      const r = await storage.refreshFxRatesAllOrgs(provider);
+      if (r.updated > 0) logger.info(`FX auto-refresh: ${r.updated} rate(s) across ${r.orgs} org(s) via ${provider.name}`);
+    } catch (e: any) {
+      logger.warn("FX auto-refresh tick failed", { error: e?.message });
+    }
+  };
+  refreshFx();
+  const fxTimer = setInterval(refreshFx, 24 * 3600_000);
+  if (typeof fxTimer.unref === "function") fxTimer.unref();
+
   // Run recurring transaction catch-up on server start
   try {
     const caught = await storage.runCatchUp();
