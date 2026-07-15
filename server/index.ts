@@ -188,6 +188,21 @@ app.use((req, res, next) => {
   const { startSessionCleanup } = await import("./auth");
   startSessionCleanup();
 
+  // Report-schedule tick (P3.6): fire any due schedules now, then hourly. Each
+  // schedule advances its next_run by one cadence period, so it fires ONCE per
+  // period regardless of tick frequency. System-wide (all orgs); idempotent.
+  const fireDueSchedules = async () => {
+    try {
+      const fired = await storage.runDueReportSchedules();
+      if (fired.length > 0) logger.info(`Report scheduler: fired ${fired.length} schedule(s)`);
+    } catch (e: any) {
+      logger.error("Report scheduler failed", { error: e.message });
+    }
+  };
+  await fireDueSchedules();
+  const scheduleTimer = setInterval(fireDueSchedules, 3600_000);
+  if (typeof scheduleTimer.unref === "function") scheduleTimer.unref();
+
   // Run recurring transaction catch-up on server start
   try {
     const caught = await storage.runCatchUp();

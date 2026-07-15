@@ -98,12 +98,15 @@ function ProfitLoss() {
   const [classId, setClassId] = useState<number | undefined>();
   const [locationId, setLocationId] = useState<number | undefined>();
   const [projectId, setProjectId] = useState<number | undefined>();
+  const [compare, setCompare] = useState<"none" | "prev_period" | "prev_year">("none");
+  const base = `from=${from}&to=${to}${dimQuery(classId, locationId, projectId)}`;
   const { data } = useQuery<any>({
-    queryKey: ["/api/reports/profit-loss", from, to, classId, locationId, projectId],
-    queryFn: async () => (await apiRequest("GET", `/api/reports/profit-loss?from=${from}&to=${to}${dimQuery(classId, locationId, projectId)}`)).json(),
+    queryKey: ["/api/reports/profit-loss", from, to, classId, locationId, projectId, compare],
+    queryFn: async () => (await apiRequest("GET", `/api/reports/profit-loss?${base}&compare=${compare}`)).json(),
   });
 
   if (!data) return <Loader />;
+  const cmp = compare !== "none" && data.totals; // comparison shape present
 
   return (
     <Card>
@@ -114,11 +117,37 @@ function ProfitLoss() {
           <DimensionSelect label="Class" items={classes} value={classId} onChange={setClassId} testid="select-pl-class" />
           <DimensionSelect label="Location" items={locations} value={locationId} onChange={setLocationId} testid="select-pl-location" />
           <DimensionSelect label="Project" items={projects} value={projectId} onChange={setProjectId} testid="select-pl-project" />
+          <div>
+            <Label>Compare</Label>
+            <select className="flex h-9 rounded-md border border-input bg-background px-2 text-sm" data-testid="select-pl-compare" value={compare} onChange={(e) => setCompare(e.target.value as any)}>
+              <option value="none">No comparison</option>
+              <option value="prev_period">Previous period</option>
+              <option value="prev_year">Previous year</option>
+            </select>
+          </div>
+          <div className="self-end">
+            <a href={`/api/reports/profit-loss?${base}&format=xlsx`} className="inline-flex h-9 items-center rounded-md border border-input bg-background px-3 text-sm hover-elevate" data-testid="link-pl-xlsx">Excel</a>
+          </div>
         </div>
         <div className="text-center mb-6">
           <h2 className="text-base font-semibold">Profit & Loss</h2>
-          <p className="text-xs text-muted-foreground">{fmtDate(from)} — {fmtDate(to)}</p>
+          <p className="text-xs text-muted-foreground">{fmtDate(from)} — {fmtDate(to)}{cmp ? ` · vs ${fmtDate(data.priorFrom)} — ${fmtDate(data.priorTo)}` : ""}</p>
         </div>
+        {cmp ? (
+          <table className="w-full text-sm" data-testid="table-pl-comparison">
+            <thead><tr className="border-b text-xs text-muted-foreground"><th className="px-3 py-2 text-left">Account</th><th className="px-3 py-2 text-right">Current</th><th className="px-3 py-2 text-right">Prior</th><th className="px-3 py-2 text-right">Δ</th><th className="px-3 py-2 text-right">% Δ</th><th className="px-3 py-2 text-right">% of income</th></tr></thead>
+            <tbody>
+              <tr className="border-b"><td colSpan={6} className="px-3 py-2 font-semibold uppercase tracking-wide text-xs text-muted-foreground">Income</td></tr>
+              {data.income.map((r: any) => <CmpRow key={r.accountId} r={r} />)}
+              <tr className="border-b bg-muted/30 font-medium"><td className="px-3 py-2">Total Income</td><td className="px-3 py-2 text-right tabular-nums">{fmtMoney(data.totals.income.current)}</td><td className="px-3 py-2 text-right tabular-nums">{fmtMoney(data.totals.income.prior)}</td><td className="px-3 py-2 text-right tabular-nums">{fmtMoney(data.totals.income.change)}</td><td colSpan={2}></td></tr>
+              <tr><td colSpan={6} className="h-3"></td></tr>
+              <tr className="border-b"><td colSpan={6} className="px-3 py-2 font-semibold uppercase tracking-wide text-xs text-muted-foreground">Expenses</td></tr>
+              {data.expenses.map((r: any) => <CmpRow key={r.accountId} r={r} />)}
+              <tr className="border-b bg-muted/30 font-medium"><td className="px-3 py-2">Total Expenses</td><td className="px-3 py-2 text-right tabular-nums">{fmtMoney(data.totals.expenses.current)}</td><td className="px-3 py-2 text-right tabular-nums">{fmtMoney(data.totals.expenses.prior)}</td><td className="px-3 py-2 text-right tabular-nums">{fmtMoney(data.totals.expenses.change)}</td><td colSpan={2}></td></tr>
+              <tr className="border-t-2 border-foreground font-semibold"><td className="px-3 py-3">Net Income</td><td className="px-3 py-3 text-right tabular-nums">{fmtMoney(data.totals.net.current)}</td><td className="px-3 py-3 text-right tabular-nums">{fmtMoney(data.totals.net.prior)}</td><td className="px-3 py-3 text-right tabular-nums">{fmtMoney(data.totals.net.change)}</td><td colSpan={2}></td></tr>
+            </tbody>
+          </table>
+        ) : (
         <table className="w-full text-sm">
           <tbody>
             <tr className="border-b border-border"><td colSpan={2} className="px-3 py-2 font-semibold uppercase tracking-wide text-xs text-muted-foreground">Income</td></tr>
@@ -136,8 +165,23 @@ function ProfitLoss() {
             <tr className="border-t-2 border-foreground font-semibold"><td className="px-3 py-3">Net Income</td><td className={`px-3 py-3 text-right tabular-nums ${data.netIncome >= 0 ? "text-primary" : "text-destructive"}`} data-testid="text-pl-net-income">{fmtMoney(data.netIncome)}</td></tr>
           </tbody>
         </table>
+        )}
       </CardContent>
     </Card>
+  );
+}
+
+// One comparison row: current, prior, Δ, %Δ, % of income.
+function CmpRow({ r }: { r: any }) {
+  return (
+    <tr className="border-b border-border/40">
+      <td className="px-3 py-1.5 pl-6">{r.code} {r.name}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.current)}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.prior)}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums">{fmtMoney(r.change)}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">{r.pctChange == null ? "—" : `${r.pctChange.toFixed(1)}%`}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">{r.pctOfIncome == null ? "—" : `${r.pctOfIncome.toFixed(1)}%`}</td>
+    </tr>
   );
 }
 

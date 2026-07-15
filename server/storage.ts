@@ -45,11 +45,15 @@ import {
   priceRuleItems,
   priceRuleCustomers,
   jobs,
+  reportSchedules,
   type PriceRule,
   type CreatePriceRuleInput,
   type Job,
   type JobItemResult,
   type BatchKind,
+  type ReportSchedule,
+  type CreateReportScheduleInput,
+  type ReportCadence,
   type OrgNexusState,
   type NexusStateInput,
   type Class,
@@ -283,6 +287,40 @@ const DEFAULT_COA: InsertAccount[] = [
 
 function nowIso(): string {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
+}
+
+// --- Report comparison / scheduling date helpers (P3.6) ---
+function ymdToUTC(d: string): Date { return new Date(d + "T00:00:00Z"); }
+function utcToYmd(d: Date): string { return d.toISOString().slice(0, 10); }
+function addDaysYmd(d: string, n: number): string { const x = ymdToUTC(d); x.setUTCDate(x.getUTCDate() + n); return utcToYmd(x); }
+function addMonthsYmd(d: string, n: number): string {
+  const x = ymdToUTC(d);
+  const day = x.getUTCDate();
+  x.setUTCDate(1);                       // avoid month-length overflow
+  x.setUTCMonth(x.getUTCMonth() + n);
+  const lastDay = new Date(Date.UTC(x.getUTCFullYear(), x.getUTCMonth() + 1, 0)).getUTCDate();
+  x.setUTCDate(Math.min(day, lastDay));  // clamp (e.g. Jan 31 + 1mo → Feb 28/29)
+  return utcToYmd(x);
+}
+// The comparison range for a [from,to] window.
+function priorRange(from: string, to: string, compare: "prev_period" | "prev_year"): [string, string] {
+  if (compare === "prev_year") return [addMonthsYmd(from, -12), addMonthsYmd(to, -12)];
+  // prev_period: same length immediately before `from`.
+  const days = Math.round((ymdToUTC(to).getTime() - ymdToUTC(from).getTime()) / 86400000);
+  const priorTo = addDaysYmd(from, -1);
+  const priorFrom = addDaysYmd(priorTo, -days);
+  return [priorFrom, priorTo];
+}
+// The next fire date after `d` for a cadence.
+function nextRunAfter(d: string, cadence: ReportCadence): string {
+  switch (cadence) {
+    case "daily": return addDaysYmd(d, 1);
+    case "weekly": return addDaysYmd(d, 7);
+    case "monthly": return addMonthsYmd(d, 1);
+    case "quarterly": return addMonthsYmd(d, 3);
+    case "annual": return addMonthsYmd(d, 12);
+    default: return addMonthsYmd(d, 1);
+  }
 }
 
 // Maps a computed payroll result onto the payroll_items money columns.
@@ -1748,6 +1786,97 @@ export class DatabaseStorage {
       default:
         throw new Error(`Unknown batch kind ${kind}`);
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // REPORT COMPARISON + SCHEDULING (P3.6)
+  // --------------------------------------------------------------------------
+  // P&L with an optional comparison column. Both ranges are computed and
+  // returned together; each is an independent profitAndLoss() pass, so the
+  // combined figures always equal the standalone reports (comparison property).
+  async profitAndLossComparison(fromDate: string, toDate: string, compare: "none" | "prev_period" | "prev_year", filter?: DimFilter) {
+    const current = await this.profitAndLoss(fromDate, toDate, filter);
+    if (compare === "none") {
+      return { fromDate, toDate, compare, current, prior: null, priorFrom: null, priorTo: null };
+    }
+    const [priorFrom, priorTo] = priorRange(fromDate, toDate, compare);
+    const prior = await this.profitAndLoss(priorFrom, priorTo, filter);
+
+    // Line-level merge by accountId → { current, prior, change, pctChange, pctOfIncome }.
+    const merge = (cur: any[], pri: any[], denom: number) => {
+      const byId = new Map<number, any>();
+      for (const r of cur) byId.set(r.accountId, { accountId: r.accountId, code: r.code, name: r.name, current: r.amount, prior: 0 });
+      for (const r of pri) {
+        const e = byId.get(r.accountId) ?? { accountId: r.accountId, code: r.code, name: r.name, current: 0, prior: 0 };
+        e.prior = r.amount; byId.set(r.accountId, e);
+      }
+      return [...byId.values()].map((e) => ({
+        ...e,
+        change: e.current - e.prior,
+        pctChange: e.prior !== 0 ? ((e.current - e.prior) / Math.abs(e.prior)) * 100 : null,
+        pctOfIncome: denom !== 0 ? (e.current / denom) * 100 : null,
+      })).sort((a, b) => a.code.localeCompare(b.code));
+    };
+    return {
+      fromDate, toDate, compare, priorFrom, priorTo,
+      current,
+      prior,
+      income: merge(current.income, prior.income, current.totalIncome),
+      expenses: merge(current.expenses, prior.expenses, current.totalIncome),
+      totals: {
+        income: { current: current.totalIncome, prior: prior.totalIncome, change: current.totalIncome - prior.totalIncome },
+        expenses: { current: current.totalExpenses, prior: prior.totalExpenses, change: current.totalExpenses - prior.totalExpenses },
+        net: { current: current.netIncome, prior: prior.netIncome, change: current.netIncome - prior.netIncome },
+      },
+    };
+  }
+
+  async listReportSchedules(): Promise<ReportSchedule[]> {
+    return db.select().from(reportSchedules).where(eq(reportSchedules.orgId, currentOrgId())).orderBy(reportSchedules.nextRun);
+  }
+  async createReportSchedule(input: CreateReportScheduleInput): Promise<ReportSchedule> {
+    const row = await db.insert(reportSchedules).values({
+      orgId: currentOrgId(), reportKey: input.reportKey, params: input.params, cadence: input.cadence,
+      recipients: input.recipients, nextRun: input.nextRun, isActive: input.isActive, createdBy: currentUserId() ?? null,
+    }).returning().then((r) => r[0]);
+    await this.audit("create", "report_schedule", row.id, `Scheduled ${row.reportKey} (${row.cadence})`);
+    return row;
+  }
+  async deleteReportSchedule(id: number): Promise<boolean> {
+    const r = await db.delete(reportSchedules).where(and(eq(reportSchedules.id, id), eq(reportSchedules.orgId, currentOrgId()))).returning();
+    return r.length > 0;
+  }
+
+  // Fire every schedule whose next_run is due (<= asOf). Advancing next_run by
+  // exactly one cadence period is what guarantees "fires once per period": a
+  // second tick in the same period finds nothing due. Returns fired schedule ids.
+  // Org-scoped by design: this sweeps ALL orgs (system task), so it does not use
+  // currentOrgId(). Each fire records last_run and the new next_run atomically.
+  async runDueReportSchedules(asOf?: string): Promise<Array<{ id: number; orgId: number; reportKey: string; nextRun: string }>> {
+    const today = asOf || new Date().toISOString().slice(0, 10);
+    const due = (await pool.query(
+      `SELECT id, org_id AS "orgId", report_key AS "reportKey", cadence, recipients, next_run AS "nextRun"
+         FROM report_schedules WHERE is_active = true AND next_run <= $1 ORDER BY id`,
+      [today]
+    )).rows as any[];
+    const fired: Array<{ id: number; orgId: number; reportKey: string; nextRun: string }> = [];
+    for (const s of due) {
+      // Advance from the SCHEDULED date (not today) so a missed tick doesn't
+      // drift the cadence, and never lands in the past.
+      let next = nextRunAfter(s.nextRun, s.cadence as ReportCadence);
+      while (next <= today) next = nextRunAfter(next, s.cadence as ReportCadence);
+      await pool.query(`UPDATE report_schedules SET last_run = $1, next_run = $2 WHERE id = $3`, [today, next, s.id]);
+      fired.push({ id: s.id, orgId: s.orgId, reportKey: s.reportKey, nextRun: next });
+      // Delivery (best-effort email) is intentionally out of the transaction so a
+      // mail hiccup never re-fires the schedule.
+      if (s.recipients) {
+        const subject = `Scheduled report: ${s.reportKey} (${today})`;
+        for (const to of String(s.recipients).split(",").map((x: string) => x.trim()).filter(Boolean)) {
+          sendEmail({ to, subject, text: `Your scheduled ${s.reportKey} report for ${today} is ready in LedgerLite.` }).catch(() => {});
+        }
+      }
+    }
+    return fired;
   }
   // Validate that every referenced class/location/project id exists in THIS org.
   // Nulls and undefineds are ignored (dimensions are optional). Cheap: at most

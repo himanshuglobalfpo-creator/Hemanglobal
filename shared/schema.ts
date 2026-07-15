@@ -572,6 +572,37 @@ export const createJobSchema = z.object({
 export type CreateJobInput = z.infer<typeof createJobSchema>;
 
 // ============================================================================
+// REPORT SCHEDULES (P3.6) — scheduled report delivery
+// ============================================================================
+export const REPORT_CADENCES = ["daily", "weekly", "monthly", "quarterly", "annual"] as const;
+export type ReportCadence = (typeof REPORT_CADENCES)[number];
+
+export const reportSchedules = pgTable("report_schedules", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull().default(1),
+  reportKey: text("report_key").notNull(),
+  params: jsonb("params").notNull().default({}),
+  cadence: text("cadence").notNull().default("monthly"),
+  recipients: text("recipients").notNull().default(""),
+  nextRun: text("next_run").notNull(),
+  lastRun: text("last_run"),
+  isActive: boolean("is_active").notNull().default(true),
+  createdBy: integer("created_by"),
+  createdAt: timestamp("created_at", { mode: "string" }).notNull().defaultNow(),
+});
+export type ReportSchedule = typeof reportSchedules.$inferSelect;
+
+export const createReportScheduleSchema = z.object({
+  reportKey: z.enum(["profit-loss", "balance-sheet", "trial-balance"]),
+  params: z.record(z.string(), z.any()).default({}),
+  cadence: z.enum(REPORT_CADENCES).default("monthly"),
+  recipients: z.string().max(2000).default(""),
+  nextRun: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  isActive: z.boolean().default(true),
+});
+export type CreateReportScheduleInput = z.infer<typeof createReportScheduleSchema>;
+
+// ============================================================================
 // INVENTORY MOVEMENTS — the append-only ledger behind quantity_on_hand
 // ============================================================================
 // One row per stock change. qty_delta is SIGNED whole units (+ on purchase,

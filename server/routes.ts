@@ -30,6 +30,7 @@ import {
   updateTimeEntrySchema,
   createPriceRuleSchema,
   createJobSchema,
+  createReportScheduleSchema,
   postJournalEntrySchema,
   createInvoiceSchema,
   createBillSchema,
@@ -88,6 +89,7 @@ import { metricsMiddleware, metricsHandler } from "./metrics";
 import { fileDriver, ATTACHMENT_MAX_BYTES, ATTACHMENT_MIME_WHITELIST } from "./files";
 import { encryptBlob, decryptBlob } from "./crypto-vault";
 import { toCsv, csvMoney, type CsvColumn } from "./csv";
+import { streamXlsx, wantsXlsx } from "./xlsx";
 import * as importers from "./importers";
 import * as migration from "./migration";
 import { assertSafeWebhookUrl, signWebhookPayload, startWebhookWorker } from "./webhooks";
@@ -1269,7 +1271,36 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     handle(res, async () => {
       const from = (req.query.from as string) || `${new Date().getFullYear()}-01-01`;
       const to = (req.query.to as string) || new Date().toISOString().slice(0, 10);
-      return storage.profitAndLoss(from, to, dimFilterFromQuery(req));
+      const filter = dimFilterFromQuery(req);
+      const compare = (["prev_period", "prev_year"].includes(String(req.query.compare)) ? req.query.compare : "none") as "none" | "prev_period" | "prev_year";
+      // Excel export of the flat current-period P&L.
+      if (wantsXlsx(req.query.format)) {
+        const pl = await storage.profitAndLoss(from, to, filter);
+        const rows = [
+          ...pl.income.map((r: any) => ({ section: "Income", code: r.code, name: r.name, amount: r.amount })),
+          ...pl.expenses.map((r: any) => ({ section: "Expense", code: r.code, name: r.name, amount: r.amount })),
+        ];
+        await streamXlsx(res, `profit-loss-${from}-to-${to}`, "Profit & Loss", [
+          { key: "section", header: "Section" }, { key: "code", header: "Code" }, { key: "name", header: "Account" },
+          { key: (r: any) => csvMoney(r.amount), header: "Amount" },
+        ], rows);
+        return undefined as any;
+      }
+      if (compare !== "none") return storage.profitAndLossComparison(from, to, compare, filter);
+      return storage.profitAndLoss(from, to, filter);
+    })
+  );
+
+  // ---------- Report schedules (P3.6) ----------
+  app.get("/api/report-schedules", (req, res) => handle(res, () => storage.listReportSchedules()));
+  app.post("/api/report-schedules", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, () => storage.createReportSchedule(createReportScheduleSchema.parse(req.body)))
+  );
+  app.delete("/api/report-schedules/:id", requireRole("owner", "admin", "accountant"), (req, res) =>
+    handle(res, async () => {
+      const ok = await storage.deleteReportSchedule(parseId(req.params.id));
+      if (!ok) throw new Error("Report schedule not found");
+      return { ok: true };
     })
   );
   app.get("/api/reports/balance-sheet", (req, res) =>
