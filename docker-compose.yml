@@ -40,5 +40,44 @@ services:
       retries: 5
       start_period: 5s
 
+  # S3-compatible object store for attachment blobs in local dev. The same
+  # server/files.ts S3Driver (SigV4, no SDK) talks to MinIO here, AWS S3, or
+  # Cloudflare R2 unchanged — only the S3_* env differs. Enable it by setting
+  # FILE_STORAGE=s3 and the S3_* vars in .env (see .env.example). The one-shot
+  # `minio-setup` service creates the bucket so uploads work on first boot.
+  minio:
+    image: minio/minio:latest
+    container_name: ledgerlite-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET:-minioadmin}
+    volumes:
+      - ledgerlite_minio:/data
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >-
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_KEY:-minioadmin} ${S3_SECRET:-minioadmin} &&
+      mc mb --ignore-existing local/${S3_BUCKET:-ledgerlite-attachments} &&
+      echo 'MinIO bucket ready';
+      "
+    restart: "no"
+
 volumes:
   ledgerlite_pgdata:
+  ledgerlite_minio:

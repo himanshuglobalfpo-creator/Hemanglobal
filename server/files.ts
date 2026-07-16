@@ -135,12 +135,35 @@ class S3Driver implements FileDriver {
   }
 }
 
-let driver: FileDriver | null = null;
-export function fileDriver(): FileDriver {
-  if (!driver) {
-    driver = process.env.FILE_STORAGE === "s3" ? new S3Driver() : new LocalDriver();
+export type StorageBackend = "local" | "s3";
+
+// The PRIMARY backend — where new uploads land. Reads, by contrast, resolve the
+// driver per attachment row (see getDriver), so a table half-migrated between
+// backends still serves every download from the store that actually holds it.
+export function primaryBackend(): StorageBackend {
+  return process.env.FILE_STORAGE === "s3" ? "s3" : "local";
+}
+
+// One cached driver instance per backend. Both drivers are byte-stores over the
+// SAME key space ("<orgId>/<uuid>"), so a blob can be copied between them under
+// an unchanged key — that is exactly what the migrator relies on.
+const drivers: Partial<Record<StorageBackend, FileDriver>> = {};
+export function getDriver(backend: StorageBackend): FileDriver {
+  if (!drivers[backend]) {
+    drivers[backend] = backend === "s3" ? new S3Driver() : new LocalDriver();
   }
-  return driver;
+  return drivers[backend]!;
+}
+
+// The primary driver — new uploads go here.
+export function fileDriver(): FileDriver {
+  return getDriver(primaryBackend());
+}
+
+// SHA-256 (hex) of stored bytes — the integrity anchor the migrator verifies a
+// cross-backend copy against before it flips the row and deletes the source.
+export function checksumBytes(data: Buffer): string {
+  return crypto.createHash("sha256").update(data).digest("hex");
 }
 
 // Attachment policy: whitelist + 10MB, enforced at the route.

@@ -7520,24 +7520,57 @@ export class DatabaseStorage {
 
   async createAttachment(input: {
     entityType: string; entityId: number; filename: string; mimeType: string; sizeBytes: number; storageKey: string;
+    storageBackend?: string; checksumSha256?: string;
   }): Promise<{ id: number }> {
     const r = (await pool.query(
-      `INSERT INTO attachments (org_id, entity_type, entity_id, filename, mime_type, size_bytes, storage_key, uploaded_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-      [currentOrgId(), input.entityType, input.entityId, input.filename, input.mimeType, input.sizeBytes, input.storageKey, currentUserId() ?? null]
+      `INSERT INTO attachments (org_id, entity_type, entity_id, filename, mime_type, size_bytes, storage_key, uploaded_by, storage_backend, checksum_sha256)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+      [currentOrgId(), input.entityType, input.entityId, input.filename, input.mimeType, input.sizeBytes, input.storageKey,
+       currentUserId() ?? null, input.storageBackend ?? "local", input.checksumSha256 ?? null]
     )).rows[0];
     await this.audit("upload", "attachment", Number(r.id), `Attached "${input.filename}" (${input.mimeType}, ${input.sizeBytes} bytes) to ${input.entityType} #${input.entityId}`);
     return { id: Number(r.id) };
   }
 
-  async getAttachment(id: number): Promise<{ id: number; entityType: string; entityId: number; filename: string; mimeType: string; sizeBytes: number; storageKey: string } | undefined> {
+  async getAttachment(id: number): Promise<{ id: number; entityType: string; entityId: number; filename: string; mimeType: string; sizeBytes: number; storageKey: string; storageBackend: string; checksumSha256: string | null } | undefined> {
     const r = (await pool.query(
       `SELECT id, entity_type AS "entityType", entity_id AS "entityId", filename, mime_type AS "mimeType",
-              size_bytes AS "sizeBytes", storage_key AS "storageKey"
+              size_bytes AS "sizeBytes", storage_key AS "storageKey",
+              storage_backend AS "storageBackend", checksum_sha256 AS "checksumSha256"
          FROM attachments WHERE id = $1 AND org_id = $2`,
       [id, currentOrgId()]
     )).rows[0];
     return r as any || undefined;
+  }
+
+  // --- Object-storage migration (org-scoped, resumable, checksum-verified) ---
+  // Rows whose blob is NOT yet on `targetBackend`, oldest first, for the current
+  // org. The migrator copies each to the target, verifies the read-back against
+  // checksum_sha256, then flips the row — so re-running simply continues.
+  async listAttachmentsPendingMigration(targetBackend: string, limit: number): Promise<
+    { id: number; storageKey: string; storageBackend: string; checksumSha256: string | null }[]
+  > {
+    return (await pool.query(
+      `SELECT id, storage_key AS "storageKey", storage_backend AS "storageBackend", checksum_sha256 AS "checksumSha256"
+         FROM attachments WHERE org_id = $1 AND storage_backend <> $2 ORDER BY id ASC LIMIT $3`,
+      [currentOrgId(), targetBackend, limit]
+    )).rows as any;
+  }
+
+  async setAttachmentBackend(id: number, backend: string, checksumSha256: string): Promise<void> {
+    await pool.query(
+      `UPDATE attachments SET storage_backend = $1, checksum_sha256 = $2 WHERE id = $3 AND org_id = $4`,
+      [backend, checksumSha256, id, currentOrgId()]
+    );
+  }
+
+  // Count of blobs per backend for the current org — powers the migration UI/API.
+  async attachmentStorageSummary(): Promise<{ backend: string; count: number }[]> {
+    return (await pool.query(
+      `SELECT storage_backend AS "backend", COUNT(*)::int AS "count"
+         FROM attachments WHERE org_id = $1 GROUP BY storage_backend ORDER BY storage_backend`,
+      [currentOrgId()]
+    )).rows as any;
   }
 
   async listAttachments(entityType: string, entityId: number): Promise<any[]> {
@@ -7548,14 +7581,14 @@ export class DatabaseStorage {
     )).rows;
   }
 
-  async deleteAttachment(id: number): Promise<{ storageKey: string }> {
+  async deleteAttachment(id: number): Promise<{ storageKey: string; storageBackend: string }> {
     const r = (await pool.query(
-      `DELETE FROM attachments WHERE id = $1 AND org_id = $2 RETURNING storage_key AS "storageKey", filename`,
+      `DELETE FROM attachments WHERE id = $1 AND org_id = $2 RETURNING storage_key AS "storageKey", storage_backend AS "storageBackend", filename`,
       [id, currentOrgId()]
     )).rows[0];
     if (!r) throw new Error("Attachment not found");
     await this.audit("delete", "attachment", id, `Deleted attachment "${r.filename}"`);
-    return { storageKey: r.storageKey };
+    return { storageKey: r.storageKey, storageBackend: r.storageBackend };
   }
 
   // ============================================================================

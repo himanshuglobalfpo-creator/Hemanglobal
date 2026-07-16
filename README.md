@@ -239,8 +239,17 @@ MIT
 | `METRICS_TOKEN` | no | Bearer for `GET /api/metrics` (`x-metrics-token`). Unset → 404. |
 | `FILE_STORAGE` | no | `local` (default) or `s3`. |
 | `FILE_DIR` | no | Local attachment root (default `./data/uploads`). |
-| `S3_ENDPOINT` / `S3_BUCKET` / `S3_KEY` / `S3_SECRET` / `S3_REGION` | s3 | S3-compatible storage (SigV4, no SDK). |
+| `S3_ENDPOINT` / `S3_BUCKET` / `S3_KEY` / `S3_SECRET` / `S3_REGION` | s3 | S3-compatible storage (AWS S3 / Cloudflare R2 / MinIO; SigV4, no SDK). Blobs are AES-256-GCM encrypted **before** upload — the store only ever holds ciphertext. |
 | `PORT` | no | HTTP port (default 5000). |
+
+**Migrating local → S3 (zero-downtime).** Set `FILE_STORAGE=s3` + the `S3_*`
+vars and deploy. Each attachment records which backend holds it, so downloads
+keep working while blobs are still on disk. An owner then drains the old store
+by POSTing `/api/attachments/migrate` (batched, resumable, SHA-256 read-back
+verified — a corrupt copy never replaces the source) until `remaining` is 0;
+`GET /api/attachments/storage` shows the per-backend counts. `docker-compose up`
+brings up a MinIO service + bucket for local dev, and CI runs the driver
+contract test (`tests/file_driver_test.ts`) against MinIO.
 
 ### Migrations (apply in order; runner is automatic at boot)
 

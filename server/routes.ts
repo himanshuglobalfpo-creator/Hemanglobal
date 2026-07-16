@@ -90,7 +90,8 @@ import { publicLimiter, writeLimiter, importLimiter } from "./rate-limit";
 import { logger } from "./logger";
 import { mapDbError } from "./db-errors";
 import { metricsMiddleware, metricsHandler } from "./metrics";
-import { fileDriver, ATTACHMENT_MAX_BYTES, ATTACHMENT_MIME_WHITELIST } from "./files";
+import { getDriver, primaryBackend, checksumBytes, type StorageBackend, ATTACHMENT_MAX_BYTES, ATTACHMENT_MIME_WHITELIST } from "./files";
+import { migrateAttachmentsBatch } from "./attachment-migration";
 import { encryptBlob, decryptBlob } from "./crypto-vault";
 import { toCsv, csvMoney, type CsvColumn } from "./csv";
 import { streamXlsx, wantsXlsx } from "./xlsx";
@@ -723,9 +724,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         // Encrypt the file bytes at rest (AES-256-GCM) before they touch disk
         // or S3. size_bytes below records the PLAINTEXT length — the user-facing
         // file size and the Content-Length served on download.
-        await fileDriver().put(storageKey, encryptBlob(body), mimeType);
+        const encrypted = encryptBlob(body);
+        const backend = primaryBackend();
+        await getDriver(backend).put(storageKey, encrypted, mimeType);
+        // checksum is over the STORED (encrypted) bytes — the integrity anchor a
+        // later cross-backend migration verifies its copy against.
         const { id } = await storage.createAttachment({
           entityType, entityId, filename, mimeType, sizeBytes: body.length, storageKey,
+          storageBackend: backend, checksumSha256: checksumBytes(encrypted),
         });
         return { id, filename, mimeType, sizeBytes: body.length };
       })
@@ -742,7 +748,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const att = await storage.getAttachment(parseId(req.params.id));
       if (!att) { res.status(404).json({ error: "Attachment not found" }); return; }
-      const data = decryptBlob(await fileDriver().get(att.storageKey));
+      // Resolve the driver from the row's OWN backend, not the global primary,
+      // so downloads keep working while a local→s3 migration is in flight.
+      const data = decryptBlob(await getDriver(att.storageBackend as StorageBackend).get(att.storageKey));
       res.setHeader("Content-Type", att.mimeType);
       res.setHeader("Content-Length", String(data.length));
       res.setHeader("Content-Disposition", `attachment; filename="${att.filename.replace(/"/g, "")}"`);
@@ -754,9 +762,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
   app.delete("/api/attachments/:id", (req, res) =>
     handle(res, async () => {
-      const { storageKey } = await storage.deleteAttachment(parseId(req.params.id));
-      await fileDriver().delete(storageKey); // row first, then blob — an orphan blob beats a dangling row
+      const { storageKey, storageBackend } = await storage.deleteAttachment(parseId(req.params.id));
+      await getDriver(storageBackend as StorageBackend).delete(storageKey); // row first, then blob — an orphan blob beats a dangling row
       return { ok: true };
+    })
+  );
+
+  // Object-storage migration (owner only). One-store-per-blob, resumable: each
+  // POST copies+verifies up to `batchSize` blobs to the primary backend and
+  // returns progress; the client (or an ops loop) re-POSTs until remaining=0.
+  app.get("/api/attachments/storage", requireRole("owner"), (_req, res) =>
+    handle(res, async () => ({
+      primaryBackend: primaryBackend(),
+      byBackend: await storage.attachmentStorageSummary(),
+    }))
+  );
+  app.post("/api/attachments/migrate", requireRole("owner"), (req, res) =>
+    handle(res, async () => {
+      const batchSize = Math.min(Math.max(parseInt(String(req.body?.batchSize ?? 25), 10) || 25, 1), 200);
+      return migrateAttachmentsBatch(storage, { target: primaryBackend(), batchSize });
     })
   );
 
