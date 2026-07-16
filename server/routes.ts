@@ -1411,6 +1411,36 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     })
   );
 
+  // ---------- Trust & legal (P4.3) ----------
+  const CURRENT_LEGAL_VERSION = "2026-01-01";
+  app.get("/api/legal", (_req, res) => handle(res, () => ({
+    version: CURRENT_LEGAL_VERSION,
+    cookieNotice: "LedgerLite uses only functional cookies (your session and a CSRF token). No advertising or third-party tracking cookies.",
+    tos: "Terms of Service — LedgerLite is provided as-is for business bookkeeping. You are responsible for the accuracy of the data you enter. See the full versioned terms in-app.",
+    privacy: "Privacy Policy — we process your organization's financial data solely to provide the service. You may export or delete your data at any time (Settings → Privacy). Financial records may be retained to meet legal retention obligations.",
+  })));
+  // Export my data (GDPR/CCPA) — a summary of the org's exportable data.
+  app.post("/api/data-export", requireOrg, requireRole("owner", "admin"), (req, res) =>
+    handle(res, () => storage.exportOrgData())
+  );
+  // Delete organization: owner + password + typed org-name confirmation → soft
+  // flag, hard purge after a 7-day grace.
+  app.post("/api/org/delete-request", requireOrg, requireRole("owner"), (req, res) =>
+    handle(res, async () => {
+      const password = String(req.body?.password || "");
+      const confirmName = String(req.body?.confirmName || "");
+      const authMod = await import("./auth");
+      const fresh = await authMod.getUserById(req.user!.id);
+      if (!fresh || !(await authMod.verifyPassword(password, fresh.passwordHash))) throw new Error("Password is incorrect.");
+      if (confirmName.trim() !== req.org!.name) throw new Error(`Type the organization name "${req.org!.name}" to confirm.`);
+      const { scheduledAt } = await storage.requestOrgDeletion(req.org!.id);
+      return { ok: true, scheduledAt };
+    })
+  );
+  app.post("/api/org/delete-cancel", requireOrg, requireRole("owner"), (req, res) =>
+    handle(res, async () => { await storage.cancelOrgDeletion(req.org!.id); return { ok: true }; })
+  );
+
   // ---------- Roles & permissions (P3.11) ----------
   // The permission catalog + built-in role definitions (for the Roles UI).
   app.get("/api/permissions", requireOrg, (_req, res) =>

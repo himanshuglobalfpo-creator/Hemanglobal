@@ -2241,6 +2241,80 @@ export class DatabaseStorage {
   }
 
   // --------------------------------------------------------------------------
+  // TRUST & LEGAL (P4.3) — ToS acceptance, org deletion + retention
+  // --------------------------------------------------------------------------
+  // A summary of the org's exportable data (GDPR/CCPA "export my data"). A full
+  // build zips these tables to CSV + attachments; this returns the manifest.
+  async exportOrgData(): Promise<{ generatedAt: string; org: number; tables: Record<string, number> }> {
+    const orgId = currentOrgId();
+    const tables = ["accounts", "customers", "vendors", "invoices", "bills", "journal_entries", "bank_transactions", "items", "time_entries"];
+    const counts: Record<string, number> = {};
+    for (const t of tables) counts[t] = Number((await pool.query(`SELECT COUNT(*)::int AS c FROM ${t} WHERE org_id=$1`, [orgId])).rows[0].c);
+    await this.audit("export", "organization", orgId, "Data export generated (GDPR/CCPA)");
+    return { generatedAt: new Date().toISOString(), org: orgId, tables: counts };
+  }
+
+  async recordTosAcceptance(userId: number, version: string): Promise<void> {
+    await pool.query(`UPDATE users SET tos_accepted_version=$2, tos_accepted_at=$3 WHERE id=$1`, [userId, version, new Date().toISOString()]);
+  }
+
+  // Soft-request org deletion: schedules a hard purge after a 7-day grace.
+  async requestOrgDeletion(orgId: number, graceDays = 7): Promise<{ scheduledAt: string }> {
+    const now = new Date();
+    const scheduledAt = new Date(now.getTime() + graceDays * 86400_000).toISOString();
+    await pool.query(`UPDATE organizations SET deletion_requested_at=$2, deletion_scheduled_at=$3 WHERE id=$1`, [orgId, now.toISOString(), scheduledAt]);
+    await this.audit("delete", "organization", orgId, `Organization deletion requested — hard purge scheduled for ${scheduledAt.slice(0, 10)}`);
+    return { scheduledAt };
+  }
+  async cancelOrgDeletion(orgId: number): Promise<void> {
+    await pool.query(`UPDATE organizations SET deletion_requested_at=NULL, deletion_scheduled_at=NULL WHERE id=$1`, [orgId]);
+    await this.audit("update", "organization", orgId, "Organization deletion canceled");
+  }
+
+  // Scheduler: hard-purge every org whose grace has elapsed. A financial-records
+  // hold EXCLUDES the audit log and closed-period journal entries from the
+  // purge (retained for the configured retention window); without the hold the
+  // org row itself is removed too. System task (all orgs) — returns purged ids.
+  async purgeDueOrgDeletions(asOf?: string): Promise<Array<{ orgId: number; hold: boolean }>> {
+    const now = asOf || new Date().toISOString();
+    const due = (await pool.query(
+      `SELECT id, financial_records_hold AS hold FROM organizations
+        WHERE deletion_scheduled_at IS NOT NULL AND deletion_scheduled_at <= $1 AND purged_at IS NULL`,
+      [now]
+    )).rows as any[];
+    const purged: Array<{ orgId: number; hold: boolean }> = [];
+    for (const o of due) {
+      const orgId = o.id as number; const hold = !!o.hold;
+      const maxLock = (await pool.query(`SELECT MAX(lock_date) AS d FROM period_locks WHERE org_id=$1`, [orgId])).rows[0]?.d ?? "0000-00-00";
+      // Journal entries: under a hold, keep CLOSED-period entries (date <= lock);
+      // purge only open-period ones. Without a hold, purge them all.
+      if (hold) {
+        await pool.query(`DELETE FROM journal_lines WHERE org_id=$1 AND entry_id IN (SELECT id FROM journal_entries WHERE org_id=$1 AND date > $2)`, [orgId, maxLock]);
+        await pool.query(`DELETE FROM journal_entries WHERE org_id=$1 AND date > $2`, [orgId, maxLock]);
+      } else {
+        await pool.query(`DELETE FROM journal_lines WHERE org_id=$1`, [orgId]);
+        await pool.query(`DELETE FROM journal_entries WHERE org_id=$1`, [orgId]);
+        await pool.query(`DELETE FROM audit_log WHERE org_id=$1`, [orgId]); // audit only removed WITHOUT a hold
+      }
+      // Business records (always purged).
+      for (const t of ["invoice_lines", "invoices", "bill_lines", "bills", "bank_transactions", "inventory_movements", "inventory_layers", "items", "time_entries", "price_rules", "estimates"]) {
+        await pool.query(`DELETE FROM ${t} WHERE org_id=$1`, [orgId]).catch(() => {});
+      }
+      await pool.query(`DELETE FROM customers WHERE org_id=$1`, [orgId]).catch(() => {});
+      await pool.query(`DELETE FROM vendors WHERE org_id=$1`, [orgId]).catch(() => {});
+      if (!hold) {
+        // No retained records need a home → remove the org shell + accounts.
+        for (const t of ["accounts", "org_memberships", "onboarding_events"]) await pool.query(`DELETE FROM ${t} WHERE org_id=$1`, [orgId]).catch(() => {});
+        await pool.query(`DELETE FROM organizations WHERE id=$1`, [orgId]).catch(() => {});
+      } else {
+        await pool.query(`UPDATE organizations SET purged_at=$2, billing_status='canceled' WHERE id=$1`, [orgId, now]);
+      }
+      purged.push({ orgId, hold });
+    }
+    return purged;
+  }
+
+  // --------------------------------------------------------------------------
   // CUSTOM ROLES (P3.11)
   // --------------------------------------------------------------------------
   async listOrgRoles(): Promise<Array<{ id: number; name: string; permissions: string[] }>> {

@@ -38,7 +38,7 @@ import {
 import { sendEmail, appBaseUrl } from "./email";
 import { startTrial, assertSeatAvailable } from "./billing";
 import { authLimiter } from "./rate-limit";
-import { seedOrgDefaults } from "./storage";
+import { seedOrgDefaults, storage } from "./storage";
 import { generateTotpSecret, verifyTotp, otpauthUri, generateRecoveryCodes } from "./totp";
 import { encryptSecret, decryptSecret } from "./crypto-vault";
 import { db, pool } from "./storage";
@@ -105,6 +105,9 @@ export function registerAuthRoutes(app: Express) {
     handle(res, async () => {
       const data = signupSchema.parse(req.body);
       const u = await createUser(data.email, data.password, data.name);
+      // P4.3: record acceptance of the current ToS/Privacy version (the signup
+      // checkbox is enforced client-side; the server stamps version + time).
+      await storage.recordTosAcceptance(u.id, String((req.body?.tosVersion) || "2026-01-01")).catch(() => {});
       await sendVerificationEmail(u);
       let slug = slugify(data.orgName);
       // Cheap collision avoidance: append random suffix if slug taken

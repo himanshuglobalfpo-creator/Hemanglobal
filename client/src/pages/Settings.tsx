@@ -446,6 +446,7 @@ export default function Settings() {
         <BillingCard />
         {canEdit && <FxRatesEditor />}
         {canEdit && <RolesManager />}
+        {canEdit && <PrivacyCard />}
         {canEdit && <YourAccountant />}
         {canEdit && (
           <Card data-testid="card-migrate-cta">
@@ -559,6 +560,35 @@ function BillingCard() {
         {data.configured
           ? <Button size="sm" variant="outline" onClick={() => portal.mutate()} disabled={portal.isPending} data-testid="button-billing-portal">Manage billing & invoices</Button>
           : <p className="text-xs text-muted-foreground">Platform billing is not configured in this environment.</p>}
+      </CardContent>
+    </Card>
+  );
+}
+
+// P4.3 — privacy & data rights: export, and delete-org danger zone.
+function PrivacyCard() {
+  const { toast } = useToast();
+  const { data: me } = useQuery<Me>({ queryKey: ["/api/auth/me"] });
+  const [pw, setPw] = useState("");
+  const [confirmName, setConfirmName] = useState("");
+  const exportMut = useMutation({ mutationFn: async () => (await apiRequest("POST", "/api/data-export", {})).json(), onSuccess: (r: any) => toast({ title: "Export ready", description: `Manifest generated (${Object.keys(r.tables || {}).length} datasets).` }), onError: (e: any) => toast({ title: "Export failed", description: e.message, variant: "destructive" }) });
+  const delMut = useMutation({ mutationFn: async () => (await apiRequest("POST", "/api/org/delete-request", { password: pw, confirmName })).json(), onSuccess: (r: any) => toast({ title: "Deletion scheduled", description: `Permanent deletion on ${String(r.scheduledAt).slice(0, 10)}. An owner can cancel before then.` }), onError: (e: any) => toast({ title: "Could not schedule deletion", description: e.message, variant: "destructive" }) });
+  const isOwner = me?.role === "owner";
+  return (
+    <Card data-testid="card-privacy">
+      <CardHeader><CardTitle>Privacy & data</CardTitle></CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-xs text-muted-foreground">LedgerLite uses only functional cookies (session + CSRF). Export your data anytime. Financial records may be retained to meet legal obligations (financial-records hold, default 7 years).</p>
+        <Button variant="outline" size="sm" onClick={() => exportMut.mutate()} disabled={exportMut.isPending} data-testid="button-export-data">Export my data</Button>
+        {isOwner && (
+          <div className="space-y-2 rounded-md border border-destructive/40 p-3">
+            <div className="text-sm font-medium text-destructive">Delete organization</div>
+            <p className="text-xs text-muted-foreground">Permanently deletes this organization after a 7-day grace period. Enter your password and type the organization name to confirm.</p>
+            <Input type="password" placeholder="Your password" value={pw} onChange={(e) => setPw(e.target.value)} className="max-w-xs" data-testid="input-delete-password" />
+            <Input placeholder={me?.org?.name || "Organization name"} value={confirmName} onChange={(e) => setConfirmName(e.target.value)} className="max-w-xs" data-testid="input-delete-confirm" />
+            <Button variant="outline" size="sm" className="text-destructive" disabled={!pw || !confirmName || delMut.isPending} onClick={() => delMut.mutate()} data-testid="button-delete-org">Schedule deletion</Button>
+          </div>
+        )}
       </CardContent>
     </Card>
   );

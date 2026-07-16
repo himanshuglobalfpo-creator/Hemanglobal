@@ -222,6 +222,21 @@ app.use((req, res, next) => {
   const fxTimer = setInterval(refreshFx, 24 * 3600_000);
   if (typeof fxTimer.unref === "function") fxTimer.unref();
 
+  // Org-deletion purge (P4.3): hard-delete orgs past their 7-day grace, honoring
+  // the financial-records hold (retains audit log + closed-period JEs). Runs at
+  // boot then daily; idempotent (purged orgs are skipped).
+  const purgeDeletions = async () => {
+    try {
+      const purged = await storage.purgeDueOrgDeletions();
+      if (purged.length > 0) logger.info(`Org-deletion purge: ${purged.length} org(s) purged`);
+    } catch (e: any) {
+      logger.warn("Org-deletion purge failed", { error: e?.message });
+    }
+  };
+  purgeDeletions();
+  const purgeTimer = setInterval(purgeDeletions, 24 * 3600_000);
+  if (typeof purgeTimer.unref === "function") purgeTimer.unref();
+
   // Run recurring transaction catch-up on server start
   try {
     const caught = await storage.runCatchUp();
