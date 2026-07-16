@@ -28,6 +28,7 @@ import { db, storage } from "./storage";
 import { appBaseUrl } from "./email";
 import { withOrg } from "./org-scope";
 import { logger } from "./logger";
+import { recordStripeSignatureFailure } from "./metrics";
 
 // ESM-safe require: the production bundle is ESM (dist/index.mjs), where the
 // global `require` doesn't exist. createRequire rebuilds it from this module's
@@ -295,6 +296,7 @@ export function registerStripeRoutes(app: Express) {
     try {
       event = stripe.webhooks.constructEvent(req.rawBody as Buffer, sig, secret);
     } catch (err: any) {
+      recordStripeSignatureFailure("app");
       logger.error("[stripe/webhook] signature verification failed", { error: err.message });
       res.status(400).send(`Webhook Error: ${err.message}`);
       return;

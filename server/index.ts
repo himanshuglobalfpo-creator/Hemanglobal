@@ -7,6 +7,8 @@ import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { storage, initDatabase, closeDatabase } from "./storage";
 import { logger } from "./logger";
+import { recordSchedulerRun } from "./metrics";
+import { initErrorTracking, captureException } from "./observability";
 import { mapDbError } from "./db-errors";
 
 const app = express();
@@ -178,6 +180,11 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  // Install process-level error handlers (unhandled rejection / uncaught
+  // exception) and, if SENTRY_DSN is set, error tracking — before anything that
+  // could throw during boot.
+  initErrorTracking();
+
   // PostgreSQL bootstrap MUST complete before any route can touch the DB:
   // runs pending migrations, then seeds the default chart of accounts.
   await initDatabase();
@@ -195,7 +202,9 @@ app.use((req, res, next) => {
     try {
       const fired = await storage.runDueReportSchedules();
       if (fired.length > 0) logger.info(`Report scheduler: fired ${fired.length} schedule(s)`);
+      recordSchedulerRun("report_schedules", "success");
     } catch (e: any) {
+      recordSchedulerRun("report_schedules", "failed");
       logger.error("Report scheduler failed", { error: e.message });
     }
   };
@@ -214,7 +223,9 @@ app.use((req, res, next) => {
       if (provider.name === "disabled") return;
       const r = await storage.refreshFxRatesAllOrgs(provider);
       if (r.updated > 0) logger.info(`FX auto-refresh: ${r.updated} rate(s) across ${r.orgs} org(s) via ${provider.name}`);
+      recordSchedulerRun("fx_refresh", "success");
     } catch (e: any) {
+      recordSchedulerRun("fx_refresh", "failed");
       logger.warn("FX auto-refresh tick failed", { error: e?.message });
     }
   };
@@ -229,7 +240,9 @@ app.use((req, res, next) => {
     try {
       const purged = await storage.purgeDueOrgDeletions();
       if (purged.length > 0) logger.info(`Org-deletion purge: ${purged.length} org(s) purged`);
+      recordSchedulerRun("org_purge", "success");
     } catch (e: any) {
+      recordSchedulerRun("org_purge", "failed");
       logger.warn("Org-deletion purge failed", { error: e?.message });
     }
   };
@@ -284,6 +297,13 @@ app.use((req, res, next) => {
       pgConstraint: err?.constraint ?? err?.cause?.constraint,
       stack: err?.stack?.split("\n").slice(0, 5).join(" | "),
     });
+
+    // Ship genuine server faults (5xx) to error tracking, correlated by reqId.
+    // Client errors (4xx: validation, auth, 402 billing) are expected and not
+    // reported. No-op unless SENTRY_DSN is set.
+    if (status >= 500) {
+      captureException(err, { reqId: req.reqId, tags: { route: req.path, method: req.method } });
+    }
 
     if (res.headersSent) {
       return next(err);

@@ -89,7 +89,7 @@ import { calculateSalesTax, validateAddress, taxjarStatus } from "./taxjar";
 import { publicLimiter, writeLimiter, importLimiter } from "./rate-limit";
 import { logger } from "./logger";
 import { mapDbError } from "./db-errors";
-import { metricsMiddleware, metricsHandler } from "./metrics";
+import { metricsMiddleware, metricsHandler, recordStripeSignatureFailure } from "./metrics";
 import { getDriver, primaryBackend, checksumBytes, type StorageBackend, ATTACHMENT_MAX_BYTES, ATTACHMENT_MIME_WHITELIST } from "./files";
 import { migrateAttachmentsBatch } from "./attachment-migration";
 import { encryptBlob, decryptBlob } from "./crypto-vault";
@@ -341,6 +341,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       try {
         event = stripe.webhooks.constructEvent((req as any).body, req.headers["stripe-signature"] as string, secret);
       } catch (e: any) {
+        recordStripeSignatureFailure("platform");
         res.status(400).json({ error: `Webhook signature verification failed: ${e.message}` });
         return;
       }

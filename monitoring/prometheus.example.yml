@@ -1,0 +1,46 @@
+# =============================================================================
+# Example Prometheus scrape config for LedgerLite
+# =============================================================================
+# GET /api/metrics is guarded by a bearer-style header: it 404s unless
+# METRICS_TOKEN is set on the app AND the request carries x-metrics-token with
+# the same value. Point Prometheus at it as below. Also add blackbox uptime
+# probes against the health endpoints (they need no token).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: ledgerlite
+    metrics_path: /api/metrics
+    scheme: https
+    static_configs:
+      - targets: ["app.example.com"]
+    # METRICS_TOKEN is passed in the header the handler checks.
+    authorization:
+      type: ""       # unused; token goes in a custom header below
+    # Prometheus sends custom scrape headers via `authorization` or relabeling;
+    # the simplest portable option is a reverse-proxy that injects the header,
+    # or use the newer `http_headers` (Prometheus ≥ 2.51):
+    # http_headers:
+    #   x-metrics-token:
+    #     values: ["<METRICS_TOKEN>"]
+
+  # External uptime — liveness and readiness. Use the blackbox_exporter so a
+  # probe failure is independent of the app's own metrics pipeline.
+  - job_name: ledgerlite-health
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets:
+          - https://app.example.com/api/health/live
+          - https://app.example.com/api/health/ready
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115

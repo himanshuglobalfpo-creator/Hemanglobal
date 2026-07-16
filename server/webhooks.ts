@@ -21,6 +21,7 @@ import dns from "node:dns/promises";
 import { pool } from "./storage";
 import { currentOrgId } from "./org-scope";
 import { logger } from "./logger";
+import { recordWebhookDelivery, recordSchedulerRun } from "./metrics";
 
 export const WEBHOOK_EVENTS = [
   "invoice.created", "invoice.paid", "invoice.voided",
@@ -153,6 +154,7 @@ async function deliverOne(d: {
     logger.warn("webhook delivery error", { deliveryId: d.id, attempt: attemptNo, error: e.message });
   }
 
+  recordWebhookDelivery(ok ? "success" : "failed");
   if (ok) {
     await pool.query(
       `UPDATE webhook_deliveries SET status = 'success', attempts = $2, response_code = $3 WHERE id = $1`,
@@ -194,7 +196,9 @@ export function startWebhookWorker(): void {
         [MAX_ATTEMPTS]
       )).rows as any[];
       for (const d of due) await deliverOne(d);
+      recordSchedulerRun("webhook_worker", "success");
     } catch (e: any) {
+      recordSchedulerRun("webhook_worker", "failed");
       logger.warn("webhook worker tick failed", { error: e.message });
     }
   };

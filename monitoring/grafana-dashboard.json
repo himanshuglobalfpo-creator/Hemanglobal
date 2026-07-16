@@ -1,0 +1,77 @@
+{
+  "__inputs": [
+    { "name": "DS_PROMETHEUS", "label": "Prometheus", "type": "datasource", "pluginId": "prometheus", "pluginName": "Prometheus" }
+  ],
+  "title": "LedgerLite — Service Health",
+  "uid": "ledgerlite-health",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Request rate by status",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "sum by (status) (rate(ledgerlite_http_requests_total[5m]))", "legendFormat": "{{status}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "5xx error ratio",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.05 } ] } }, "overrides": [] },
+      "targets": [
+        { "expr": "sum(rate(ledgerlite_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(ledgerlite_http_requests_total[5m])), 0.001)", "legendFormat": "5xx ratio", "refId": "A" }
+      ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "p95 latency (s)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(ledgerlite_http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95", "refId": "A" }
+      ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "DB pool (waiting / idle / total)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "ledgerlite_pg_pool_waiting", "legendFormat": "waiting", "refId": "A" },
+        { "expr": "ledgerlite_pg_pool_idle", "legendFormat": "idle", "refId": "B" },
+        { "expr": "ledgerlite_pg_pool_total", "legendFormat": "total", "refId": "C" }
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Failed logins / s",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "sum(rate(ledgerlite_auth_logins_total{result=\"failed\"}[5m]))", "legendFormat": "failed/s", "refId": "A" }
+      ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Webhook delivery failure ratio",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        { "expr": "sum(rate(ledgerlite_webhook_deliveries_total{result=\"failed\"}[15m])) / clamp_min(sum(rate(ledgerlite_webhook_deliveries_total[15m])), 0.001)", "legendFormat": "failed ratio", "refId": "A" }
+      ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Stripe signature failures & scheduler failures",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "sum by (source) (increase(ledgerlite_stripe_webhook_signature_failures_total[15m]))", "legendFormat": "stripe {{source}}", "refId": "A" },
+        { "expr": "sum by (job) (increase(ledgerlite_scheduler_runs_total{result=\"failed\"}[1h]))", "legendFormat": "job {{job}}", "refId": "B" }
+      ]
+    }
+  ]
+}

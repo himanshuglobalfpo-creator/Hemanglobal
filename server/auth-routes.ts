@@ -43,6 +43,7 @@ import { generateTotpSecret, verifyTotp, otpauthUri, generateRecoveryCodes } fro
 import { encryptSecret, decryptSecret } from "./crypto-vault";
 import { db, pool } from "./storage";
 import { logger } from "./logger";
+import { recordAuthLogin } from "./metrics";
 
 // Same patterns as routes.ts — keep duplicates minimal but localized.
 function handle<T>(res: Response, fn: () => Promise<T> | T) {
@@ -142,16 +143,19 @@ export function registerAuthRoutes(app: Express) {
       const u = await getUserByEmail(data.email);
       // Generic error: do not leak whether the email exists
       const generic = "Email or password is incorrect";
-      if (!u) throw new Error(generic);
+      if (!u) { recordAuthLogin("failed"); throw new Error(generic); }
       if (isLocked(u)) {
+        recordAuthLogin("failed");
         throw new Error(`Account temporarily locked due to failed login attempts. Try again in a few minutes.`);
       }
       const ok = await verifyPassword(data.password, u.passwordHash);
       if (!ok) {
         await recordFailedLogin(u.id);
+        recordAuthLogin("failed");
         throw new Error(generic);
       }
       await clearFailedLogins(u.id);
+      recordAuthLogin("success");
       // MFA branch: correct password but TOTP enabled → hand back a short-lived
       // single-use challenge token instead of a session. The challenge is NOT
       // a session — it can only be exchanged at /api/auth/mfa/verify.
