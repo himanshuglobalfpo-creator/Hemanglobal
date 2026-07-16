@@ -19,11 +19,19 @@
 import crypto from "node:crypto";
 import type { Request, Response, NextFunction } from "express";
 
+// Same gate as auth.ts cookieHardeningEnabled() — inlined to avoid a circular
+// import (auth.ts imports this module). Hardening (the __Host- prefix + Secure)
+// is on in production, minus the ALLOW_INSECURE_DEFAULTS throwaway/test hatch.
+function cookieHardeningEnabled(): boolean {
+  return process.env.NODE_ENV === "production" && process.env.ALLOW_INSECURE_DEFAULTS !== "1";
+}
+
 export const CSRF_COOKIE = "ll_csrf";
-// Production uses the __Host- prefix (Secure + Path=/ + no Domain). The client
-// reads either name (see client/src/lib/queryClient.ts).
+// Uses the __Host- prefix (Secure + Path=/ + no Domain) when cookie hardening is
+// on — production, minus the ALLOW_INSECURE_DEFAULTS throwaway/test escape hatch
+// (shares auth.ts's exact gate). The client reads either name (queryClient.ts).
 export function csrfCookieName(): string {
-  return process.env.NODE_ENV === "production" ? "__Host-" + CSRF_COOKIE : CSRF_COOKIE;
+  return cookieHardeningEnabled() ? "__Host-" + CSRF_COOKIE : CSRF_COOKIE;
 }
 const CSRF_HEADER = "x-csrf-token";
 const TOKEN_BYTES = 32; // 32 random bytes → 64 hex chars

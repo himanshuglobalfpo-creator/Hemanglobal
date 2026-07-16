@@ -345,12 +345,20 @@ declare global {
   }
 }
 
-// Cookie name. In production we use the __Host- prefix, which the browser only
+// Cookie hardening (the __Host- prefix + Secure) is ON in production, EXCEPT when
+// ALLOW_INSECURE_DEFAULTS=1 — the documented throwaway/test escape hatch (E2E and
+// prod-smoke), which run the production build over plain http://localhost where a
+// Secure/__Host- cookie can't round-trip. Real production never sets that flag,
+// so it stays fully hardened. Exported so csrf.ts shares the exact same gate.
+export function cookieHardeningEnabled(): boolean {
+  return process.env.NODE_ENV === "production" && process.env.ALLOW_INSECURE_DEFAULTS !== "1";
+}
+
+// Cookie name. When hardened we use the __Host- prefix, which the browser only
 // honors when the cookie is Secure, Path=/, and has NO Domain — a hard guarantee
-// against a subdomain overwriting the session (cookie fixation). Dev/test keep
-// the bare name (no HTTPS, so __Host- would be rejected).
+// against a subdomain overwriting the session (cookie fixation).
 export function sessionCookieName(): string {
-  return process.env.NODE_ENV === "production" ? "__Host-" + SESSION_COOKIE : SESSION_COOKIE;
+  return cookieHardeningEnabled() ? "__Host-" + SESSION_COOKIE : SESSION_COOKIE;
 }
 
 // Reads session ID from cookie or Authorization: Bearer header.
@@ -372,7 +380,6 @@ function readSessionId(req: Request): string | undefined {
 // ALSO issues the CSRF double-submit cookie: every response that establishes a
 // session must give the client a fresh readable token (see server/csrf.ts).
 export function setSessionCookie(res: Response, sessionId: string) {
-  const isProd = process.env.NODE_ENV === "production";
   const parts = [
     `${sessionCookieName()}=${encodeURIComponent(sessionId)}`,
     "HttpOnly",
@@ -380,14 +387,13 @@ export function setSessionCookie(res: Response, sessionId: string) {
     `Max-Age=${SESSION_TTL_DAYS * 86400}`,
     "SameSite=Lax",
   ];
-  if (isProd) parts.push("Secure"); // required for the __Host- prefix
+  if (cookieHardeningEnabled()) parts.push("Secure"); // required for the __Host- prefix
   res.setHeader("Set-Cookie", [parts.join("; "), buildCsrfCookie(generateCsrfToken())]);
 }
 
 export function clearSessionCookie(res: Response) {
-  const isProd = process.env.NODE_ENV === "production";
   // A __Host- cookie can only be cleared with a Secure attribute, so mirror it.
-  const clear = `${sessionCookieName()}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${isProd ? "; Secure" : ""}`;
+  const clear = `${sessionCookieName()}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${cookieHardeningEnabled() ? "; Secure" : ""}`;
   res.setHeader("Set-Cookie", [clear, buildClearCsrfCookie()]);
 }
 

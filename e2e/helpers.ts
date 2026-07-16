@@ -31,7 +31,8 @@ export async function signup(page: Page, user: { name: string; org: string; emai
 
 export async function csrfHeaders(context: BrowserContext): Promise<Record<string, string>> {
   const cookies = await context.cookies();
-  const csrf = cookies.find((c) => c.name === "ll_csrf")?.value;
+  // Production hardening prefixes the cookie (__Host-ll_csrf); read either name.
+  const csrf = cookies.find((c) => c.name === "__Host-ll_csrf" || c.name === "ll_csrf")?.value;
   return csrf ? { "x-csrf-token": csrf, "content-type": "application/json" } : { "content-type": "application/json" };
 }
 
