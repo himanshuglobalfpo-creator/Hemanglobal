@@ -64,6 +64,10 @@ async function main() {
       // Deterministic secrets so the app boots without external config.
       SESSION_SECRET: process.env.SESSION_SECRET || "e2e-session-secret-0123456789",
       APP_ENCRYPTION_KEY: process.env.APP_ENCRYPTION_KEY || "a".repeat(64),
+      // This is a throwaway E2E database, and CI injects the all-zero placeholder
+      // key — exactly the case the production boot guard is meant to reject. Opt
+      // out of that guard here (same escape hatch as the prod-smoke CI job).
+      ALLOW_INSECURE_DEFAULTS: "1",
       // Keep CSP report-only during E2E so nothing is blocked by the browser.
       CSP_ENFORCE: "false",
     },
