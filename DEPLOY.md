@@ -55,6 +55,34 @@ any schema change.
   the old code already works against the new (additive) schema.
 - **Data issue:** see RUNBOOK.md (PITR / logical restore).
 
+## Email deliverability (production)
+
+Outgoing mail (invoices, statements, reminders) needs the sending domain
+authenticated, or it lands in spam. Configure DNS **before** going live:
+
+| Record | Type | Value (example — use your ESP's exact values) |
+|---|---|---|
+| SPF | TXT `@` | `v=spf1 include:amazonses.com ~all` (or your ESP's include) |
+| DKIM | CNAME ×3 | the selector CNAMEs your ESP (SES/Postmark) gives you |
+| DMARC | TXT `_dmarc` | `v=DMARC1; p=quarantine; rua=mailto:dmarc@yourdomain; adkim=s; aspf=s` |
+
+App-side alignment (already handled in `server/email.ts`):
+- **Envelope-from alignment** — the SMTP return-path (`MAIL FROM`) is set to the
+  `From:` domain (override with `SMTP_ENVELOPE_FROM`, same domain), so SPF/DMARC
+  alignment passes.
+- **List-Unsubscribe** — reminder/statement mail carries `List-Unsubscribe` +
+  `List-Unsubscribe-Post: One-Click` (RFC 8058). Point `SMTP_UNSUBSCRIBE` at a
+  monitored inbox.
+- **Bounce/complaint suppression** — configure your ESP to POST bounce &
+  complaint events to `POST /api/email/webhook?token=$EMAIL_WEBHOOK_TOKEN` (SES
+  via SNS, or Postmark). Hard bounces and complaints are added to a global
+  suppression list that `sendEmail` consults before every send, so a dead or
+  complaining address is never mailed again — protecting sender reputation.
+  Set `EMAIL_WEBHOOK_TOKEN` to a strong random value.
+
+The Settings page shows a banner when `SMTP_*` is unconfigured (mail is logged,
+not delivered).
+
 ## Health endpoints
 
 - `GET /api/health/live` — liveness (no DB).

@@ -162,7 +162,7 @@ import { encryptSecret, decryptSecret, isLegacyPlaintext, encryptionAvailable, a
 import { logger } from "./logger";
 import { emitWebhookEvent } from "./webhooks";
 import { calculateSalesTax, taxjarConfigured, type CalculateSalesTaxResult } from "./taxjar";
-import { sendEmail, smtpStatus, appBaseUrl } from "./email";
+import { sendEmail, smtpStatus, appBaseUrl, unsubscribeMailto } from "./email";
 
 // ----------------------------------------------------------------------------
 // PostgreSQL connection — SINGLE shared pool for the entire app.
@@ -2376,7 +2376,7 @@ export class DatabaseStorage {
       if (s.recipients) {
         const subject = `Scheduled report: ${s.reportKey} (${today})`;
         for (const to of String(s.recipients).split(",").map((x: string) => x.trim()).filter(Boolean)) {
-          sendEmail({ to, subject, text: `Your scheduled ${s.reportKey} report for ${today} is ready in LedgerLite.` }).catch(() => {});
+          sendEmail({ to, subject, text: `Your scheduled ${s.reportKey} report for ${today} is ready in LedgerLite.`, listUnsubscribe: unsubscribeMailto() }).catch(() => {});
         }
       }
     }
@@ -6226,7 +6226,7 @@ export class DatabaseStorage {
       const html = `<p>Hi ${customerName},</p><p>Your invoice <strong>${inv.number}</strong> is ready.</p>`
         + `<ul><li>Amount due: <strong>${formatMoney(amountDue)}</strong></li><li>Due date: ${inv.dueDate}</li></ul>`
         + `<p><a href="${url}">View invoice</a> &nbsp; <a href="${url}/pdf">Download PDF</a></p><p>Thanks,<br/>LedgerLite</p>`;
-      const sendResult = await sendEmail({ to, subject: `Invoice ${inv.number} from LedgerLite`, text, html });
+      const sendResult = await sendEmail({ to, subject: `Invoice ${inv.number} from LedgerLite`, text, html, listUnsubscribe: unsubscribeMailto() });
       await this.markShareSent(share.id, sendResult.ok ? "sent" : "failed", sendResult.ok ? undefined : sendResult.error);
       await this.audit("send", "invoice", invoiceId, `Emailed invoice ${inv.number} to ${to}`, { shareId: share.id, mode: sendResult.mode });
       return { emailed: sendResult.ok, mode: sendResult.mode };

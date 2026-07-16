@@ -58,6 +58,8 @@ const EXEMPT_PATHS = new Set([
   "/api/auth/otp/verify",
   "/api/stripe/webhook",
   "/api/plaid/webhook",
+  // Provider bounce/complaint callback — authenticated by EMAIL_WEBHOOK_TOKEN.
+  "/api/email/webhook",
 ]);
 
 export function generateCsrfToken(): string {

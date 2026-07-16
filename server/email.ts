@@ -14,6 +14,7 @@
 
 import nodemailer from "nodemailer";
 import { logger } from "./logger";
+import { isSuppressed } from "./email-suppression";
 
 export type SendOpts = {
   to: string;
@@ -21,11 +22,16 @@ export type SendOpts = {
   text: string;
   html?: string;
   cc?: string;
+  // When set, adds RFC 8058 List-Unsubscribe headers — used for
+  // reminder/statement style mail so recipients (and inbox providers) get a
+  // one-click unsubscribe, which improves deliverability and is expected for
+  // any non-transactional send.
+  listUnsubscribe?: string; // a URL or "mailto:" target
 };
 
 export type SendResult = {
   ok: boolean;
-  mode: "smtp" | "dev";
+  mode: "smtp" | "dev" | "suppressed";
   messageId?: string;
   error?: string;
 };
@@ -63,17 +69,62 @@ export function appBaseUrl(): string {
   return (process.env.APP_BASE_URL || "http://localhost:5000").replace(/\/$/, "");
 }
 
+// A List-Unsubscribe mailto target for reminder/statement-style mail. Defaults
+// to the sending address; override with SMTP_UNSUBSCRIBE for a dedicated inbox.
+export function unsubscribeMailto(): string {
+  const addr = process.env.SMTP_UNSUBSCRIBE || bareAddress(process.env.SMTP_FROM || process.env.SMTP_USER || "noreply@ledgerlite.local");
+  return `mailto:${addr}?subject=Unsubscribe`;
+}
+
+function fromAddress(): string {
+  return process.env.SMTP_FROM || process.env.SMTP_USER || "noreply@ledgerlite.local";
+}
+
+// Bare address inside a possibly-decorated From ("Name <a@b>") → "a@b".
+function bareAddress(v: string): string {
+  const m = v.match(/<([^>]+)>/);
+  return (m ? m[1] : v).trim();
+}
+
+// The SMTP envelope MAIL FROM (return-path). Aligning it with the From: domain
+// is what SPF/DMARC check — a mismatch fails alignment and lands in spam. Defaults
+// to the From address; override with SMTP_ENVELOPE_FROM if bounces should go
+// elsewhere (still on the SAME domain to keep DMARC alignment).
+function envelopeFrom(): string {
+  return process.env.SMTP_ENVELOPE_FROM || bareAddress(fromAddress());
+}
+
 export function smtpStatus() {
+  const configured = !!getTransporter();
   return {
-    configured: !!getTransporter(),
-    from: process.env.SMTP_FROM || process.env.SMTP_USER || "noreply@ledgerlite.local",
+    configured,
+    from: fromAddress(),
+    envelopeFrom: envelopeFrom(),
     host: process.env.SMTP_HOST || null,
+    // Surfaced by the Settings banner: an unconfigured SMTP means invoice/
+    // reminder emails are only logged, not delivered.
+    warning: configured ? null : "SMTP is not configured — outgoing email is logged, not delivered.",
   };
 }
 
 export async function sendEmail(opts: SendOpts): Promise<SendResult> {
   const transporter = getTransporter();
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER || "noreply@ledgerlite.local";
+  const from = fromAddress();
+
+  // Deliverability guardrail: never send to a hard-bounced/complained address.
+  // Checked in every mode so the dev log reflects reality too.
+  if (await isSuppressed(opts.to).catch(() => false)) {
+    logger.info("[email] skipped — recipient is suppressed", { to: opts.to, subject: opts.subject });
+    return { ok: false, mode: "suppressed", error: "recipient is on the suppression list" };
+  }
+
+  const headers: Record<string, string> = {};
+  if (opts.listUnsubscribe) {
+    headers["List-Unsubscribe"] = opts.listUnsubscribe.startsWith("mailto:") || opts.listUnsubscribe.startsWith("<")
+      ? opts.listUnsubscribe
+      : `<${opts.listUnsubscribe}>`;
+    headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click";
+  }
 
   if (!transporter) {
     // Dev mode: log it and pretend it worked so the share flow still completes.
@@ -95,6 +146,9 @@ export async function sendEmail(opts: SendOpts): Promise<SendResult> {
       subject: opts.subject,
       text: opts.text,
       html: opts.html,
+      headers: Object.keys(headers).length ? headers : undefined,
+      // Align the envelope (return-path) with the From domain for SPF/DMARC.
+      envelope: { from: envelopeFrom(), to: opts.to, cc: opts.cc },
     });
     return { ok: true, mode: "smtp", messageId: info.messageId };
   } catch (e: any) {

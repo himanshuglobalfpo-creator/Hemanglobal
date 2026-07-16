@@ -231,6 +231,7 @@ export default function Settings() {
   }) | null }>({ queryKey: ["/api/auth/me"] });
   const { data: accounts = [] } = useQuery<Account[]>({ queryKey: ["/api/accounts"] });
   const { data: stripe } = useQuery<StripeStatus>({ queryKey: ["/api/stripe/status"] });
+  const { data: emailStatus } = useQuery<{ configured: boolean; warning: string | null; from: string; suppressedCount: number }>({ queryKey: ["/api/email/status"] });
 
   const org = me?.org ?? null;
   const canEdit = me?.role === "owner" || me?.role === "admin";
@@ -296,6 +297,11 @@ export default function Settings() {
     <Layout>
       <PageHeader title="Settings" description="Organization settings" />
       <div className="grid gap-6 max-w-2xl">
+        {emailStatus && !emailStatus.configured && (
+          <div className="rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900" data-testid="banner-email-unconfigured">
+            <strong>Email is not configured.</strong> {emailStatus.warning || "Outgoing email (invoices, reminders) is logged but not delivered."} Set the <code>SMTP_*</code> environment variables to enable delivery.
+          </div>
+        )}
         <Card data-testid="card-online-payments">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">

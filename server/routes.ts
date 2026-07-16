@@ -79,6 +79,7 @@ import * as noteService from "./creditNoteService";
 import { plaidStatus, createLinkToken, exchangePublicToken, syncTransactions, handlePlaidWebhook, getAccountBalances, pickFeedBalance } from "./plaid";
 import { streamInvoicePdf, streamBillPdf, streamCustomerStatementPdf, streamVendorStatementPdf, streamCreditNotePdf, streamDebitNotePdf } from "./pdf";
 import { sendEmail, smtpStatus, appBaseUrl } from "./email";
+import { parseBounceWebhook, addSuppression, suppressionCount } from "./email-suppression";
 import { attachSession, requireAuth, requireOrg, requireRole, requirePermission, startSessionCleanup } from "./auth";
 import { csrfProtect } from "./csrf";
 import { orgScopeMiddleware, currentOrgId, currentUserId } from "./org-scope";
@@ -368,6 +369,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (req.path === "/stripe/webhook") return next();    // Stripe signs the body
     if (req.path === "/platform-stripe/webhook") return next(); // platform billing → us
     if (req.path === "/plaid/webhook") return next();     // Plaid → us
+    if (req.path === "/email/webhook") return next();     // SES/Postmark bounce+complaint → us
     if (!req.user) {
       res.status(401).json({ error: "Authentication required. POST /api/auth/login." });
       return;
@@ -2391,7 +2393,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ============================================================================
   // Sprint C: Email status
   // ============================================================================
-  app.get("/api/email/status", (_req, res) => handle(res, () => smtpStatus()));
+  app.get("/api/email/status", (_req, res) =>
+    handle(res, async () => ({ ...smtpStatus(), suppressedCount: await suppressionCount() }))
+  );
+
+  // Provider bounce/complaint webhook (SES via SNS, or Postmark). Public but
+  // token-gated: EMAIL_WEBHOOK_TOKEN must match ?token= or x-email-webhook-token.
+  // Hard bounces + complaints are added to the global suppression list so we
+  // stop mailing dead/complaining addresses (protects sender reputation).
+  app.post("/api/email/webhook", async (req, res) => {
+    try {
+      const expected = process.env.EMAIL_WEBHOOK_TOKEN;
+      const supplied = (req.query.token as string) || (req.headers["x-email-webhook-token"] as string) || "";
+      if (!expected || supplied !== expected) { res.status(404).json({ error: "Not found" }); return; }
+      const events = parseBounceWebhook(req.body);
+      for (const e of events) await addSuppression(e.email, e.reason, e.source, e.detail);
+      res.json({ ok: true, suppressed: events.length });
+    } catch (e: any) {
+      logger.error("[email/webhook] processing error", { error: e?.message });
+      res.status(400).json({ error: "Invalid payload" });
+    }
+  });
 
   // ============================================================================
   // Sprint C: Invoice Sharing — create share link, send via email
