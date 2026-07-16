@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   Wallet,
   ArrowDownToLine,
@@ -17,6 +17,7 @@ import {
   Tooltip,
 } from "recharts";
 import type { Invoice, Bill } from "@shared/schema";
+import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Layout, PageHeader } from "@/components/Layout";
 import { fmtMoney, startOfYearISO, todayISO } from "@/lib/format";
@@ -264,6 +265,7 @@ export default function Dashboard() {
           </CardContent>
         </Card>
       )}
+      <ActivationChecklist />
       <LowStockCard />
     </Layout>
   );
@@ -287,5 +289,36 @@ function LowStockCard() {
         ))}
       </CardContent>
     </Card>
+  );
+}
+
+// P4.2 — activation checklist + demo-mode banner.
+function ActivationChecklist() {
+  const { data } = useQuery<{ tasks: Array<{ step: string; done: boolean }>; complete: boolean }>({ queryKey: ["/api/onboarding"] });
+  const { data: demo } = useQuery<{ isDemo: boolean }>({ queryKey: ["/api/demo/status"] });
+  const clear = useMutation({ mutationFn: async () => (await apiRequest("POST", "/api/demo/clear", {})).json(), onSuccess: () => queryClient.invalidateQueries() });
+  const LABELS: Record<string, string> = { profile: "Set up your business profile", bank: "Connect a bank account", import: "Import or start fresh", invite: "Invite your team", first_invoice: "Create your first invoice" };
+  return (
+    <>
+      {demo?.isDemo && (
+        <div className="mt-6 flex items-center gap-2 rounded-md border border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900" data-testid="banner-demo">
+          <span>You're viewing <strong>demo data</strong>.</span>
+          <button className="ml-auto rounded border bg-white px-2 py-1 text-xs" onClick={() => { if (window.confirm("Clear all demo data and start fresh?")) clear.mutate(); }} data-testid="button-clear-demo">Clear demo data</button>
+        </div>
+      )}
+      {data && !data.complete && (
+        <Card className="mt-6" data-testid="card-activation">
+          <CardHeader><CardTitle className="text-base">Get started ({data.tasks.filter((t) => t.done).length}/{data.tasks.length})</CardTitle></CardHeader>
+          <CardContent className="space-y-1">
+            {data.tasks.map((t) => (
+              <div key={t.step} className="flex items-center gap-2 text-sm" data-testid={`activation-${t.step}`}>
+                <span className={t.done ? "text-green-600" : "text-muted-foreground"}>{t.done ? "✓" : "○"}</span>
+                <span className={t.done ? "text-muted-foreground line-through" : ""}>{LABELS[t.step] ?? t.step}</span>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+    </>
   );
 }

@@ -553,6 +553,23 @@ export const createPriceRuleSchema = z.object({
 export type CreatePriceRuleInput = z.infer<typeof createPriceRuleSchema>;
 
 // ============================================================================
+// ONBOARDING (P4.2) — activation funnel events
+// ============================================================================
+export const ONBOARDING_STEPS = ["profile", "bank", "import", "invite", "first_invoice"] as const;
+export type OnboardingStep = (typeof ONBOARDING_STEPS)[number];
+export const INDUSTRY_PRESETS = ["services", "retail", "contractor"] as const;
+export type IndustryPreset = (typeof INDUSTRY_PRESETS)[number];
+
+export const onboardingEvents = pgTable("onboarding_events", {
+  id: serial("id").primaryKey(),
+  orgId: integer("org_id").notNull(),
+  step: text("step").notNull(),
+  completedAt: text("completed_at").notNull(),
+  userId: integer("user_id"),
+});
+export type OnboardingEvent = typeof onboardingEvents.$inferSelect;
+
+// ============================================================================
 // CUSTOM ROLES (P3.11) — per-org named permission sets
 // ============================================================================
 export const orgRoles = pgTable("org_roles", {

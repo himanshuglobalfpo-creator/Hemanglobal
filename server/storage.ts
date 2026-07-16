@@ -46,6 +46,8 @@ import {
   priceRuleCustomers,
   jobs,
   orgRoles,
+  onboardingEvents,
+  type IndustryPreset,
   reportSchedules,
   taxFilingPeriods,
   bundleComponents,
@@ -2139,6 +2141,103 @@ export class DatabaseStorage {
       await this.audit("pay", "tax_filing_period", id, `Paid ${p.stateCode} sales tax ${formatMoney(liability)} for ${p.periodStart}..${p.periodEnd}`);
       return row;
     });
+  }
+
+  // --------------------------------------------------------------------------
+  // ONBOARDING & ACTIVATION (P4.2)
+  // --------------------------------------------------------------------------
+  // Record the FIRST completion of a wizard step (idempotent — a repeat keeps
+  // the original timestamp, so the funnel measures first-touch).
+  async recordOnboardingEvent(step: string, userId?: number): Promise<void> {
+    await pool.query(
+      `INSERT INTO onboarding_events (org_id, step, completed_at, user_id) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (org_id, step) DO NOTHING`,
+      [currentOrgId(), step, new Date().toISOString(), userId ?? currentUserId() ?? null]
+    );
+  }
+  async listOnboardingEvents(): Promise<Array<{ step: string; completedAt: string }>> {
+    return (await pool.query(`SELECT step, completed_at AS "completedAt" FROM onboarding_events WHERE org_id=$1 ORDER BY completed_at`, [currentOrgId()])).rows as any[];
+  }
+
+  // Activation checklist: 5 tasks, each done via a recorded event OR real data,
+  // so the widget reflects reality even if a step was completed outside the wizard.
+  async activationChecklist(): Promise<{ tasks: Array<{ step: string; done: boolean; completedAt: string | null }>; complete: boolean }> {
+    const orgId = currentOrgId();
+    const events = new Map((await this.listOnboardingEvents()).map((e) => [e.step, e.completedAt]));
+    const count = async (t: string) => Number((await pool.query(`SELECT COUNT(*)::int AS c FROM ${t} WHERE org_id=$1`, [orgId])).rows[0].c);
+    const [members, invoices, banks, industry] = await Promise.all([
+      count("org_memberships"), count("invoices"), count("bank_transactions"),
+      pool.query(`SELECT industry FROM organizations WHERE id=$1`, [orgId]).then((r) => r.rows[0]?.industry),
+    ]);
+    const done: Record<string, boolean> = {
+      profile: events.has("profile") || !!industry,
+      bank: events.has("bank") || banks > 0,
+      import: events.has("import"),
+      invite: events.has("invite") || members > 1,
+      first_invoice: events.has("first_invoice") || invoices > 0,
+    };
+    const tasks = ["profile", "bank", "import", "invite", "first_invoice"].map((step) => ({
+      step, done: done[step], completedAt: events.get(step) ?? null,
+    }));
+    return { tasks, complete: tasks.every((t) => t.done) };
+  }
+
+  // Industry preset: adds a few tailored accounts on top of the default COA.
+  async applyIndustryPreset(preset: IndustryPreset): Promise<number> {
+    const orgId = currentOrgId();
+    const EXTRA: Record<string, Array<{ code: string; name: string; type: string; subtype: string }>> = {
+      services: [
+        { code: "4200", name: "Consulting Income", type: "income", subtype: "operating_income" },
+        { code: "5100", name: "Subcontractor Costs", type: "expense", subtype: "cogs" },
+      ],
+      retail: [
+        { code: "4300", name: "Merchandise Sales", type: "income", subtype: "operating_income" },
+        { code: "4310", name: "Sales Discounts", type: "income", subtype: "operating_income" },
+        { code: "5200", name: "Freight & Shipping", type: "expense", subtype: "cogs" },
+      ],
+      contractor: [
+        { code: "5300", name: "Job Materials", type: "expense", subtype: "cogs" },
+        { code: "6110", name: "Equipment Rental", type: "expense", subtype: "operating_expense" },
+        { code: "6120", name: "Permits & Fees", type: "expense", subtype: "operating_expense" },
+      ],
+    };
+    const rows = EXTRA[preset] ?? [];
+    let added = 0;
+    for (const a of rows) {
+      const r = await pool.query(
+        `INSERT INTO accounts (org_id, code, name, type, subtype, is_active) VALUES ($1,$2,$3,$4,$5,true)
+         ON CONFLICT DO NOTHING`, [orgId, a.code, a.name, a.type, a.subtype]
+      ).catch(() => ({ rowCount: 0 }));
+      added += r.rowCount ?? 0;
+    }
+    await pool.query(`UPDATE organizations SET industry=$2 WHERE id=$1`, [orgId, preset]);
+    await this.recordOnboardingEvent("profile");
+    return added;
+  }
+
+  async markDemoSeeded(): Promise<void> {
+    await pool.query(`UPDATE organizations SET demo_seeded_at=$2 WHERE id=$1`, [currentOrgId(), new Date().toISOString()]);
+  }
+  async demoStatus(): Promise<{ isDemo: boolean; seededAt: string | null }> {
+    const r = (await pool.query(`SELECT demo_seeded_at FROM organizations WHERE id=$1`, [currentOrgId()])).rows[0];
+    return { isDemo: !!r?.demo_seeded_at, seededAt: r?.demo_seeded_at ?? null };
+  }
+  // Wipe the org's transactional data back to a fresh set of books (keeps the
+  // chart of accounts, settings, members). Dev/demo only.
+  async clearDemoData(): Promise<void> {
+    const orgId = currentOrgId();
+    const tables = [
+      "journal_lines", "journal_entries", "invoice_lines", "invoices",
+      "bill_lines", "bills", "bank_transactions", "inventory_movements",
+      "inventory_layers", "items", "time_entries", "customers", "vendors",
+    ];
+    await db.transaction(async () => {
+      for (const t of tables) {
+        await pool.query(`DELETE FROM ${t} WHERE org_id=$1`, [orgId]).catch(() => {});
+      }
+      await pool.query(`UPDATE organizations SET demo_seeded_at=NULL WHERE id=$1`, [orgId]);
+    });
+    await this.audit("delete", "organization", orgId, "Cleared demo data (books reset)");
   }
 
   // --------------------------------------------------------------------------

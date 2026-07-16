@@ -1434,6 +1434,31 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     })
   );
 
+  // ---------- Onboarding & activation (P4.2) ----------
+  app.get("/api/onboarding", requireOrg, (_req, res) =>
+    handle(res, async () => ({ ...(await storage.activationChecklist()), events: await storage.listOnboardingEvents() }))
+  );
+  app.post("/api/onboarding/step", requireOrg, (req, res) =>
+    handle(res, async () => {
+      const step = String(req.body?.step || "");
+      if (!(["profile", "bank", "import", "invite", "first_invoice"] as string[]).includes(step)) throw new Error("invalid onboarding step");
+      await storage.recordOnboardingEvent(step);
+      return storage.activationChecklist();
+    })
+  );
+  app.post("/api/onboarding/preset", requireOrg, requireRole("owner", "admin"), (req, res) =>
+    handle(res, async () => {
+      const preset = String(req.body?.preset || "");
+      if (!(["services", "retail", "contractor"] as string[]).includes(preset)) throw new Error("invalid industry preset");
+      const added = await storage.applyIndustryPreset(preset as any);
+      return { ok: true, accountsAdded: added };
+    })
+  );
+  app.get("/api/demo/status", requireOrg, (_req, res) => handle(res, () => storage.demoStatus()));
+  app.post("/api/demo/clear", requireOrg, requireRole("owner", "admin"), (_req, res) =>
+    handle(res, async () => { await storage.clearDemoData(); return { ok: true }; })
+  );
+
   // ---------- Report schedules (P3.6) ----------
   app.get("/api/report-schedules", (req, res) => handle(res, () => storage.listReportSchedules()));
   app.post("/api/report-schedules", requireRole("owner", "admin", "accountant"), (req, res) =>
@@ -2802,6 +2827,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         memo: "Rent payment",
       });
 
+      await storage.markDemoSeeded(); // P4.2: flag org so the demo banner + one-click clear appear
       return { ok: true, message: "Demo data seeded" };
     });
   });
