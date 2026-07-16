@@ -11,11 +11,31 @@ export default function Security() {
   const [msg, setMsg] = useState("");
   const [disablePw, setDisablePw] = useState("");
   const [disableCode, setDisableCode] = useState("");
+  const [sessions, setSessions] = useState<Array<{ id: string; current: boolean; lastSeenAt: string; ipAddress: string | null; userAgent: string | null }>>([]);
 
+  const loadSessions = async () => {
+    try {
+      const r = await apiRequest("GET", "/api/auth/sessions");
+      setSessions(await r.json());
+    } catch { /* not signed in */ }
+  };
   useEffect(() => {
     // /api/auth/me doesn't expose totpEnabled; infer from setup flow. Keep it simple:
     // the section always offers setup; enable/disable calls report their own errors.
+    loadSessions();
   }, []);
+
+  const signOutOthers = async () => {
+    setMsg("");
+    try {
+      const r = await apiRequest("POST", "/api/auth/sessions/revoke-others", {});
+      const b = await r.json();
+      setMsg(`Signed out ${b.revoked} other device(s).`);
+      await loadSessions();
+    } catch (e: any) {
+      setMsg(String(e.message || e));
+    }
+  };
 
   const setup = async () => {
     setMsg("");
@@ -106,6 +126,28 @@ export default function Security() {
           <button onClick={disable} disabled={!disablePw || !disableCode}
             className="rounded border px-4 py-2 text-sm disabled:opacity-60">Disable</button>
         </div>
+      </div>
+
+      <div className="rounded-lg border p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-medium">Active sessions</h2>
+          <button onClick={signOutOthers} disabled={sessions.length <= 1}
+            className="rounded border px-3 py-1.5 text-xs disabled:opacity-60">Sign out all other devices</button>
+        </div>
+        {sessions.length === 0 && <p className="text-xs text-muted-foreground">No active sessions.</p>}
+        <ul className="space-y-1 text-sm">
+          {sessions.map((s, i) => (
+            <li key={i} className="flex items-center justify-between rounded border px-3 py-2">
+              <span className="truncate mr-2">
+                {s.current && <span className="mr-2 rounded bg-green-100 text-green-800 px-1.5 py-0.5 text-xs">This device</span>}
+                <span className="text-muted-foreground">{s.userAgent?.slice(0, 60) || "Unknown device"}</span>
+              </span>
+              <span className="text-xs text-muted-foreground whitespace-nowrap">
+                {s.ipAddress || "?"} · {s.lastSeenAt ? new Date(s.lastSeenAt).toLocaleString() : ""}
+              </span>
+            </li>
+          ))}
+        </ul>
       </div>
     </div>
   );

@@ -20,6 +20,11 @@ import crypto from "node:crypto";
 import type { Request, Response, NextFunction } from "express";
 
 export const CSRF_COOKIE = "ll_csrf";
+// Production uses the __Host- prefix (Secure + Path=/ + no Domain). The client
+// reads either name (see client/src/lib/queryClient.ts).
+export function csrfCookieName(): string {
+  return process.env.NODE_ENV === "production" ? "__Host-" + CSRF_COOKIE : CSRF_COOKIE;
+}
 const CSRF_HEADER = "x-csrf-token";
 const TOKEN_BYTES = 32; // 32 random bytes → 64 hex chars
 
@@ -58,17 +63,18 @@ export function generateCsrfToken(): string {
 export function buildCsrfCookie(token: string): string {
   const isProd = process.env.NODE_ENV === "production";
   const parts = [
-    `${CSRF_COOKIE}=${token}`,
+    `${csrfCookieName()}=${token}`,
     "Path=/",
     "SameSite=Lax",
     `Max-Age=${30 * 86400}`,
   ];
-  if (isProd) parts.push("Secure");
+  if (isProd) parts.push("Secure"); // required for the __Host- prefix
   return parts.join("; ");
 }
 
 export function buildClearCsrfCookie(): string {
-  return `${CSRF_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax`;
+  const isProd = process.env.NODE_ENV === "production";
+  return `${csrfCookieName()}=; Path=/; Max-Age=0; SameSite=Lax${isProd ? "; Secure" : ""}`;
 }
 
 function readCookie(req: Request, name: string): string | undefined {
@@ -100,7 +106,7 @@ export function csrfProtect(req: Request, res: Response, next: NextFunction): vo
   const auth = req.headers.authorization;
   if (auth && auth.startsWith("Bearer ")) return next();
 
-  const cookieToken = readCookie(req, CSRF_COOKIE);
+  const cookieToken = readCookie(req, csrfCookieName()) ?? readCookie(req, CSRF_COOKIE);
   const headerToken = req.headers[CSRF_HEADER];
 
   if (

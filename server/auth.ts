@@ -16,7 +16,7 @@
 import bcrypt from "bcryptjs";
 import crypto from "node:crypto";
 import type { Request, Response, NextFunction } from "express";
-import { eq, and, lt, gt } from "drizzle-orm";
+import { eq, and, lt, gt, ne } from "drizzle-orm";
 import {
   users, sessions, organizations, orgMemberships, firmClientAccess,
   type User, type Session, type Organization, type OrgRole,
@@ -36,6 +36,10 @@ import { logger } from "./logger";
 // ----------------------------------------------------------------------------
 const BCRYPT_ROUNDS = 10;
 const SESSION_TTL_DAYS = 30;
+// Hard cap on how long a single session id may live, measured from creation,
+// regardless of activity. Equal to the TTL today (sessions aren't extended on
+// use), but enforced independently so the guarantee survives future changes.
+const SESSION_ABSOLUTE_DAYS = 30;
 const SESSION_COOKIE = "ll_session";
 const MAX_FAILED_LOGINS = 5;
 const LOCKOUT_MINUTES = 15;
@@ -237,12 +241,40 @@ export async function getSession(id: string): Promise<Session | undefined> {
   if (!id || typeof id !== "string") return undefined;
   const s = await db.select().from(sessions).where(eq(sessions.id, id)).then((r: any[]) => r[0]);
   if (!s) return undefined;
-  if (new Date(s.expiresAt).getTime() < Date.now()) {
-    // Expired — delete and return nothing
+  // Rolling expiry (idle) OR the absolute lifetime cap (measured from
+  // createdAt) — whichever comes first. The absolute cap bounds how long a
+  // single credential can live even if it were kept perpetually active, which
+  // rolling expiry alone can't guarantee.
+  const absoluteExpired = !!s.createdAt &&
+    Date.now() - new Date(s.createdAt).getTime() > SESSION_ABSOLUTE_DAYS * 86400_000;
+  if (new Date(s.expiresAt).getTime() < Date.now() || absoluteExpired) {
     await db.delete(sessions).where(eq(sessions.id, id));
     return undefined;
   }
   return s;
+}
+
+// Rotate the session id, preserving the user (and optionally moving to a new
+// active org). Called on any PRIVILEGE CHANGE — org switch, MFA enable — so a
+// session id captured before the change cannot be replayed after it (session
+// fixation defense). Returns the NEW session; the caller re-sets the cookie.
+export async function rotateSession(oldId: string, userId: number, orgId: number | null, req: Request): Promise<Session> {
+  const fresh = await createSession(userId, orgId, req);
+  await revokeSession(oldId);
+  return fresh;
+}
+
+// Sign out every OTHER session for the user, keeping the current one. Powers
+// "sign out all other devices" on the Security page.
+export async function revokeOtherSessionsForUser(userId: number, keepId: string): Promise<number> {
+  const res: any = await db.delete(sessions).where(and(eq(sessions.userId, userId), ne(sessions.id, keepId)));
+  return res?.rowCount ?? 0;
+}
+
+// Active sessions for a user, newest first — for the Security page device list.
+export async function listSessionsForUser(userId: number): Promise<Session[]> {
+  return db.select().from(sessions).where(eq(sessions.userId, userId)).then((r: any[]) =>
+    r.sort((a, b) => new Date(b.lastSeenAt || b.createdAt).getTime() - new Date(a.lastSeenAt || a.createdAt).getTime()));
 }
 
 export async function touchSession(id: string) {
@@ -313,12 +345,23 @@ declare global {
   }
 }
 
+// Cookie name. In production we use the __Host- prefix, which the browser only
+// honors when the cookie is Secure, Path=/, and has NO Domain — a hard guarantee
+// against a subdomain overwriting the session (cookie fixation). Dev/test keep
+// the bare name (no HTTPS, so __Host- would be rejected).
+export function sessionCookieName(): string {
+  return process.env.NODE_ENV === "production" ? "__Host-" + SESSION_COOKIE : SESSION_COOKIE;
+}
+
 // Reads session ID from cookie or Authorization: Bearer header.
 function readSessionId(req: Request): string | undefined {
-  // Prefer cookie (browser flow)
+  // Prefer cookie (browser flow). Accept the prefixed OR bare name so a client
+  // built before this change still authenticates.
   const cookies = req.headers.cookie || "";
-  const m = cookies.match(new RegExp(`(?:^|; )${SESSION_COOKIE}=([^;]+)`));
-  if (m) return decodeURIComponent(m[1]);
+  for (const name of [sessionCookieName(), SESSION_COOKIE]) {
+    const m = cookies.match(new RegExp(`(?:^|; )${name}=([^;]+)`));
+    if (m) return decodeURIComponent(m[1]);
+  }
   // Fallback: Bearer token (for API clients / tests)
   const auth = req.headers.authorization;
   if (auth && auth.startsWith("Bearer ")) return auth.slice(7);
@@ -331,21 +374,21 @@ function readSessionId(req: Request): string | undefined {
 export function setSessionCookie(res: Response, sessionId: string) {
   const isProd = process.env.NODE_ENV === "production";
   const parts = [
-    `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}`,
+    `${sessionCookieName()}=${encodeURIComponent(sessionId)}`,
     "HttpOnly",
     "Path=/",
     `Max-Age=${SESSION_TTL_DAYS * 86400}`,
     "SameSite=Lax",
   ];
-  if (isProd) parts.push("Secure");
+  if (isProd) parts.push("Secure"); // required for the __Host- prefix
   res.setHeader("Set-Cookie", [parts.join("; "), buildCsrfCookie(generateCsrfToken())]);
 }
 
 export function clearSessionCookie(res: Response) {
-  res.setHeader("Set-Cookie", [
-    `${SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`,
-    buildClearCsrfCookie(),
-  ]);
+  const isProd = process.env.NODE_ENV === "production";
+  // A __Host- cookie can only be cleared with a Secure attribute, so mirror it.
+  const clear = `${sessionCookieName()}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${isProd ? "; Secure" : ""}`;
+  res.setHeader("Set-Cookie", [clear, buildClearCsrfCookie()]);
 }
 
 // Loads session/user/org if present, but does NOT enforce auth.

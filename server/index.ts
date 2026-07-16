@@ -70,6 +70,12 @@ const CSP_POLICY = [
   "object-src 'none'",
   "base-uri 'self'",
   "form-action 'self'",
+  // Defense-in-depth twin of X-Frame-Options: DENY — nothing may frame the app.
+  // The public invoice share pages (/p/invoice/:token) are standalone and are
+  // never framed either, so they share this policy rather than needing a relaxed
+  // one; if you ever need to embed a share page, serve those specific routes a
+  // policy with an explicit frame-ancestors allow-list instead of loosening this.
+  "frame-ancestors 'none'",
 ].join("; ");
 
 // CSP enforcement policy:
@@ -96,7 +102,8 @@ app.use((req, res, next) => {
     : "Content-Security-Policy-Report-Only";
   res.setHeader(cspHeader, CSP_POLICY);
   if (process.env.NODE_ENV === "production" && req.secure) {
-    res.setHeader("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
+    // 1 year + preload (submit the domain to hstspreload.org to bake it in).
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
   }
   next();
 });

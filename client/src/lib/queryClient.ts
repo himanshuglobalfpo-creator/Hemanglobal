@@ -11,8 +11,13 @@ const CSRF_COOKIE = "ll_csrf";
 const MUTATING = new Set(["POST", "PATCH", "PUT", "DELETE"]);
 
 export function readCsrfToken(): string | undefined {
-  const m = document.cookie.match(new RegExp(`(?:^|; )${CSRF_COOKIE}=([^;]+)`));
-  return m ? decodeURIComponent(m[1]) : undefined;
+  // Production sets the cookie under the __Host- prefix (Secure + Path=/); dev
+  // uses the bare name. Read either so one client build works in both.
+  for (const name of [`__Host-${CSRF_COOKIE}`, CSRF_COOKIE]) {
+    const m = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]+)`));
+    if (m) return decodeURIComponent(m[1]);
+  }
+  return undefined;
 }
 
 function csrfHeaders(method: string): Record<string, string> {

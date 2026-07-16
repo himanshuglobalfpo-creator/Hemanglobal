@@ -30,10 +30,11 @@ import { users, organizations, accounts } from "@shared/schema";
 import {
   createUser, getUserByEmail, getUserById, verifyPassword,
   createOrg, addMember, listOrgsForUser, getMembership,
-  createSession, revokeSession, setActiveOrg,
+  createSession, revokeSession,
   setSessionCookie, clearSessionCookie,
   recordFailedLogin, clearFailedLogins, isLocked,
   hashPassword, resolveOrgAccess, listAccessibleOrgs,
+  rotateSession, revokeOtherSessionsForUser, listSessionsForUser,
 } from "./auth";
 import { sendEmail, appBaseUrl } from "./email";
 import { startTrial, assertSeatAvailable } from "./billing";
@@ -301,6 +302,11 @@ export function registerAuthRoutes(app: Express) {
         .set({ totpEnabled: true, recoveryCodes: JSON.stringify(hashes) })
         .where(eq(users.id, req.user.id))
         ;
+      // Enabling MFA is a privilege change → rotate the session id.
+      if (req.session) {
+        const rotated = await rotateSession(req.session.id, req.user.id, req.session.activeOrgId ?? null, req);
+        setSessionCookie(res, rotated.id);
+      }
       return {
         ok: true,
         recoveryCodes: recovery,
@@ -331,6 +337,30 @@ export function registerAuthRoutes(app: Express) {
         .where(eq(users.id, req.user.id))
         ;
       return { ok: true, message: "MFA disabled." };
+    })
+  );
+
+  // ------ ACTIVE SESSIONS (device list + sign out all others) ----------------
+  app.get("/api/auth/sessions", (req, res) =>
+    handle(res, async () => {
+      if (!req.user || !req.session) throw new Error("Authentication required");
+      const rows = await listSessionsForUser(req.user.id);
+      return rows.map((s: any) => ({
+        id: s.id === req.session!.id ? "current" : String(s.id).slice(0, 8), // never expose other ids in full
+        current: s.id === req.session!.id,
+        createdAt: s.createdAt,
+        lastSeenAt: s.lastSeenAt,
+        ipAddress: s.ipAddress,
+        userAgent: s.userAgent,
+      }));
+    })
+  );
+  // Sign out everywhere except this device — the standard "I lost my laptop" action.
+  app.post("/api/auth/sessions/revoke-others", (req, res) =>
+    handle(res, async () => {
+      if (!req.user || !req.session) throw new Error("Authentication required");
+      const revoked = await revokeOtherSessionsForUser(req.user.id, req.session.id);
+      return { ok: true, revoked };
     })
   );
 
@@ -446,7 +476,10 @@ export function registerAuthRoutes(app: Express) {
       // Accept a direct membership OR active firm access to a client org.
       const access = await resolveOrgAccess(req.user.id, orgId);
       if (!access) throw new Error("You do not have access to this organization.");
-      await setActiveOrg(req.session.id, orgId);
+      // Switching org is a privilege change → rotate the session id (fixation
+      // defense) and re-issue the cookie, carrying the new active org.
+      const rotated = await rotateSession(req.session.id, req.user.id, orgId, req);
+      setSessionCookie(res, rotated.id);
       // Cross-org access is auditable: record every time a firm user enters a
       // client org, attributed to the acting firm user in the CLIENT's log.
       if (access.viaFirm) {

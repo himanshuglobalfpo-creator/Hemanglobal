@@ -47,13 +47,27 @@ function loadKey(): Buffer | null {
 // Production: hard fail on missing/malformed key.
 // Dev/test: warn once and fall back to storing plaintext (prefix-less), so
 // local hacking without the env var still works — decryptSecret() handles it.
+// Known placeholder/weak keys that must NEVER protect real data. The all-zero
+// and all-f keys are the obvious "forgot to set it" values (and are what CI
+// uses for throwaway databases). Refused in production unless the operator
+// explicitly sets ALLOW_INSECURE_DEFAULTS=1 (documented as CI/test-only).
+const WEAK_KEYS = new Set(["0".repeat(64), "f".repeat(64), "f".repeat(64).toUpperCase()]);
+
 export function assertEncryptionKey(): void {
   const hex = process.env.APP_ENCRYPTION_KEY;
   const valid = !!hex && /^[0-9a-fA-F]{64}$/.test(hex);
-  if (process.env.NODE_ENV === "production" && !valid) {
+  const isProd = process.env.NODE_ENV === "production";
+  const allowInsecure = process.env.ALLOW_INSECURE_DEFAULTS === "1";
+  if (isProd && !valid) {
     throw new Error(
       "APP_ENCRYPTION_KEY is missing or malformed (need exactly 64 hex chars = 32 bytes). " +
       "Generate one with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
+    );
+  }
+  if (isProd && valid && WEAK_KEYS.has(hex!.toLowerCase()) && !allowInsecure) {
+    throw new Error(
+      "APP_ENCRYPTION_KEY is a well-known placeholder value — refusing to boot production with it. " +
+      "Set a real 32-byte random key, or ALLOW_INSECURE_DEFAULTS=1 for throwaway/CI environments only."
     );
   }
   if (!valid && hex) {
