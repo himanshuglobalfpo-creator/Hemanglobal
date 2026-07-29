@@ -1,0 +1,249 @@
+---
+name: clarify
+description: "Identify and improve unclear, confusing, or poorly written interface text to make the product easier to understand and use."
+version: 1.6.0
+---
+
+> **Additional context needed**: audience technical level and users' mental state in context.
+
+Identify and improve unclear, confusing, or poorly written interface text to make the product easier to understand and use.
+
+
+---
+
+## Assess Current Copy
+
+Identify what makes the text unclear or ineffective:
+
+1. **Find clarity problems**:
+   - **Jargon**: Technical terms users won't understand
+   - **Ambiguity**: Multiple interpretations possible
+   - **Passive voice**: "Your file has been uploaded" vs "We uploaded your file"
+   - **Length**: Too wordy or too terse
+   - **Assumptions**: Assuming user knowledge they don't have
+   - **Missing context**: Users don't know what to do or why
+   - **Tone mismatch**: Too formal, too casual, or inappropriate for situation
+
+2. **Understand the context**:
+   - Who's the audience? (Technical? General? First-time users?)
+   - What's the user's mental state? (Stressed during error? Confident during success?)
+   - What's the action? (What do we want users to do?)
+   - What's the constraint? (Character limits? Space limitations?)
+
+**CRITICAL**: Clear copy helps users succeed. Unclear copy creates frustration, errors, and support tickets.
+
+## Plan Copy Improvements
+
+Create a strategy for clearer communication:
+
+- **Primary message**: What's the ONE thing users need to know?
+- **Action needed**: What should users do next (if anything)?
+- **Tone**: How should this feel? (Helpful? Apologetic? Encouraging?)
+- **Constraints**: Length limits, brand voice, localization considerations
+
+**IMPORTANT**: Good UX writing is invisible. Users should understand immediately without noticing the words.
+
+## Improve Copy Systematically
+
+Work in passes, one dimension at a time, and re-check the earlier passes after each one.
+A single sweep that tries to fix clarity, proof and emotion at once fixes none of them:
+tightening a sentence for clarity often removes the specific number that was carrying the
+proof, which is exactly what the return pass is for.
+
+| Pass | Question it asks | What it kills |
+|------|------------------|---------------|
+| 1. Clarity | Can a first-time reader say what this is, in their own words | Jargon, abstraction, sentences carrying two ideas |
+| 2. Voice and tone | Does this sound like the same product throughout | Register drift, borrowed startup cadence |
+| 3. So what | For each claim, ask "ok, and so what" until a benefit answers | Features stated with no consequence attached |
+| 4. Prove it | What makes this believable to someone who does not trust us yet | Adjectives standing in for evidence |
+| 5. Specificity | Replace every vague quantity with the real one | "Save time" where "save 4 hours a week" was available |
+| 6. Emotion | Does the copy name the frustration the reader actually has | Neutral description of a painful situation |
+| 7. Zero risk | What is the reader afraid of, and does the page answer it | Unanswered objections next to the buy button |
+
+After each pass, return to the passes before it. The sequence matters: specificity added
+in pass 5 frequently breaks the voice set in pass 2.
+
+Passes 3, 4 and 7 have their own references. The claim and evidence work belongs to
+[../../../agents/siteasy-agent-claims.md](../../../agents/siteasy-agent-claims.md), the
+objection inventory to [objections.md](objections.md), and the risk reversal to
+[offer-diagnostic.md](offer-diagnostic.md).
+
+
+
+Refine text across these common areas:
+
+### Error Messages
+**Bad**: "Error 403: Forbidden"
+**Good**: "You don't have permission to view this page. Contact your admin for access."
+
+**Bad**: "Invalid input"
+**Good**: "Email addresses need an @ symbol. Try: name@example.com"
+
+**Principles**:
+- Explain what went wrong in plain language
+- Suggest how to fix it
+- Don't blame the user
+- Include examples when helpful
+- Link to help/support if applicable
+
+### Form Labels & Instructions
+**Bad**: "DOB (MM/DD/YYYY)"
+**Good**: "Date of birth" (with placeholder showing format)
+
+**Bad**: "Enter value here"
+**Good**: "Your email address" or "Company name"
+
+**Principles**:
+- Use clear, specific labels (not generic placeholders)
+- Show format expectations with examples
+- Explain why you're asking (when not obvious)
+- Put instructions before the field, not after
+- Keep required field indicators clear
+
+### Button & CTA Text
+**Bad**: "Click here" | "Submit" | "OK"
+**Good**: "Create account" | "Save changes" | "Got it, thanks"
+
+**Principles**:
+- Describe the action specifically
+- Use active voice (verb + noun)
+- Match user's mental model
+- Be specific ("Save" is better than "OK")
+
+### Help Text & Tooltips
+**Bad**: "This is the username field"
+**Good**: "Choose a username. You can change this later in Settings."
+
+**Principles**:
+- Add value (don't just repeat the label)
+- Answer the implicit question ("What is this?" or "Why do you need this?")
+- Keep it brief but complete
+- Link to detailed docs if needed
+
+### Empty States
+**Bad**: "No items"
+**Good**: "No projects yet. Create your first project to get started."
+
+**Principles**:
+- Explain why it's empty (if not obvious)
+- Show next action clearly
+- Make it welcoming, not dead-end
+
+### Success Messages
+**Bad**: "Success"
+**Good**: "Settings saved! Your changes will take effect immediately."
+
+**Principles**:
+- Confirm what happened
+- Explain what happens next (if relevant)
+- Be brief but complete
+- Match the user's emotional moment (celebrate big wins)
+
+### Loading States
+**Bad**: "Loading..." (for 30+ seconds)
+**Good**: "Analyzing your data... this usually takes 30-60 seconds"
+
+**Principles**:
+- Set expectations (how long?)
+- Explain what's happening (when it's not obvious)
+- Show progress when possible
+- Offer escape hatch if appropriate ("Cancel")
+
+### Confirmation Dialogs
+**Bad**: "Are you sure?"
+**Good**: "Delete 'Project Alpha'? This can't be undone."
+
+**Principles**:
+- State the specific action
+- Explain consequences (especially for destructive actions)
+- Use clear button labels ("Delete project" not "Yes")
+- Don't overuse confirmations (only for risky actions)
+
+### Navigation & Wayfinding
+**Bad**: Generic labels like "Items" | "Things" | "Stuff"
+**Good**: Specific labels like "Your projects" | "Team members" | "Settings"
+
+**Principles**:
+- Be specific and descriptive
+- Use language users understand (not internal jargon)
+- Make hierarchy clear
+- Consider information scent (breadcrumbs, current location)
+
+## Apply Clarity Principles
+
+Every piece of copy should follow these rules:
+
+1. **Be specific**: "Enter email" not "Enter value"
+2. **Be concise**: Cut unnecessary words (but don't sacrifice clarity)
+3. **Be active**: "Save changes" not "Changes will be saved"
+4. **Be human**: "Oops, something went wrong" not "System error encountered"
+5. **Be helpful**: Tell users what to do, not just what happened
+6. **Be consistent**: Use same terms throughout (don't vary for variety)
+
+**NEVER**:
+- Use jargon without explanation
+- Blame users ("You made an error" → "This field is required")
+- Be vague ("Something went wrong" without explanation)
+- Use passive voice unnecessarily
+- Write overly long explanations (be concise)
+- Use humor for errors (be empathetic instead)
+- Assume technical knowledge
+- Vary terminology (pick one term and stick with it)
+- Repeat information (headers restating intros, redundant explanations)
+- Use placeholders as the only labels (they disappear when users type)
+
+## Verify Improvements
+
+Test that copy improvements work:
+
+- **Comprehension**: Can users understand without context?
+- **Actionability**: Do users know what to do next?
+- **Brevity**: Is it as short as possible while remaining clear?
+- **Consistency**: Does it match terminology elsewhere?
+- **Tone**: Is it appropriate for the situation?
+
+Remember: You're a clarity expert with excellent communication skills. Write like you're explaining to a smart friend who's unfamiliar with the product. Be clear, be helpful, be human.
+
+## UX copy patterns
+
+Microcopy is interface. The same rules every time: clear, concise, consistent, useful, human.
+
+### Error messages
+
+Structure every error as what happened, why, and how to fix it: "Payment declined. Your bank rejected the charge. Try another card or contact your bank." Not "Error 402". Name the problem in the reader's terms, never the system's.
+
+### Calls to action
+
+Label the outcome, not the mechanism: "Start the trial", "Send the invite", "Delete account". Avoid "Submit", "OK" and "Click here". The label should make sense read alone.
+
+### Empty states
+
+An empty state is a first impression, not a dead end. Say what goes here, why it is empty, and the one action that fills it: "No projects yet. Create your first to get started." plus the button.
+
+### Confirmations and destructive actions
+
+Name the specific consequence and object: "Delete the Q3 report? This cannot be undone." The confirming button repeats the verb ("Delete"), never a generic "Yes".
+
+### Tone
+
+Write like a competent person, not a mascot and not a manual. Drop filler ("please note that", "in order to"). Match the moment: plain in errors, warmer in success, never jokey in a failure the reader did not cause.
+
+## Spotting machine-written copy
+
+The rhythm-level tells are below. The lexical tells, with a penalty per pattern and a
+banded score, are in [slop-patterns.md](slop-patterns.md), and the deterministic
+measurement of sentence rhythm and phrase density is
+[../../../tools/content/score.mjs](../../../tools/content/score.mjs). This section is the
+short read; that pair is the scored version.
+
+
+Generated copy has tells. When auditing or editing site text, watch for and remove these:
+
+- Uniform sentence rhythm, every sentence the same length. Break it with a short one.
+- Repetitive openings, many sentences starting with the same word ("Moreover", "Additionally"). Vary the first word.
+- Overused connectors ("moreover", "furthermore", "in addition", "as such") on most sentences. Cut the mechanical ones, keep the load-bearing ones.
+- The rule of three on autopilot, where every list is three items. Vary it to one, two or four.
+- Contrastive amplification, "not only X but also Y". Replace with a direct statement.
+- A two-word phrase repeated several times on one page. Reword the reprises.
+
+These are form, not fact. Fix the wording, never the meaning, and re-read aloud: copy that sounds like a person passes.

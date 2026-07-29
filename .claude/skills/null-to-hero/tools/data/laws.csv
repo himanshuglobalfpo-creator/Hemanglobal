@@ -1,0 +1,25 @@
+id,area,name,value,statement,anchor
+L-MOTION-1,motion,UI feedback duration,150-300ms (large surfaces up to 500ms),UI feedback animates between 150 and 300ms; modals and drawers may take up to 500ms.,skills/siteasy/references/animation-engineering.md
+L-MOTION-2,motion,Decorative loop budget,2 per view,"At most two infinite decorative loops per view, each guarded for reduced motion.",skills/siteasy/references/delight.md
+L-MOTION-3,motion,Scrub easing,linear,Scrubbed tweens use linear easing; perceived easing comes from the visitor's scroll.,skills/siteasy/references/parallax.md
+L-TOUCH-1,touch,Tap target size,44x44px,Tap targets are at least 44 by 44 CSS pixels.,skills/siteasy/references/mobile-ergonomics.md
+L-TOUCH-2,touch,Target spacing,8px,Adjacent tap targets keep at least 8px of separation.,skills/siteasy/references/mobile-ergonomics.md
+L-MEDIA-1,media,Referenced video budget,10MB warn / 30MB fail,Referenced video stays under 10 MB; 30 MB is the hard failure line.,skills/siteasy/references/parallax.md
+L-MEDIA-2,media,3D model budget,5MB,A 3D model stays under 5 MB or ships Draco/meshopt compression.,skills/siteasy/references/overdrive.md
+L-MEDIA-3,media,Frame sequence staging,50 warn / 150 fail,Fifty-plus eagerly loaded sequential frames is a burst; stage in a window around the scroll position.,skills/siteasy/references/parallax.md
+L-TYPE-1,typography,Body size,16px,Base body text is at least 16px.,skills/siteasy/references/typography.md
+L-TYPE-2,typography,Measure,65-75ch,Body line length sits between 65 and 75 characters.,skills/siteasy/references/typography.md
+L-CONTRAST-1,color,Text contrast,4.5:1 (3:1 large),Body text hits 4.5:1 against its background; 3:1 for large or bold-large text.,skills/siteasy/references/color-and-contrast.md
+L-PERF-1,performance,LCP,2.5s,Largest Contentful Paint under 2.5 seconds on a mid-range mobile.,skills/siteasy/references/optimize.md
+L-PERF-2,performance,CLS,0.1,Cumulative Layout Shift under 0.1.,skills/siteasy/references/optimize.md
+L-PERF-3,performance,INP,200ms,Interaction to Next Paint under 200ms at p75.,skills/siteasy/references/optimize.md
+L-WEBGL-1,webgl,Draw call ceiling,~300 target / 1000 max,A WebGL scene aims for a few hundred draw calls and never exceeds 1000; instancing beyond.,skills/siteasy/references/overdrive.md
+L-WEBGL-2,webgl,Pixel ratio cap,2,Renderer pixel ratio is capped at 2.,skills/siteasy/references/overdrive.md
+L-CONTENT-1,content,Editorial quality gate,70/100,"Composite editorial quality reaches 70 out of 100 before publication, on the five weighted dimensions.",skills/siteasy/references/slop-patterns.md
+L-CONTENT-2,content,Sentence rhythm,std dev 8-15 words,"Sentence-length standard deviation sits between 8 and 15 words, peaking near 10; flat rhythm is the most reliable tell of unedited generation.",skills/siteasy/references/slop-patterns.md
+L-CONTENT-3,content,Prose to structure balance,50-75% prose,"Between half and three quarters of a document is prose; over-listing is penalised harder than under-listing.",skills/siteasy/references/slop-patterns.md
+L-CONTENT-4,content,Keyword density ceiling,3%,"Main keyword occupies under 3 percent of the words, measured as words covered by matches and not as occurrences over word count.",skills/seo/references/content.md
+L-GEO-1,geo,Tier 1 AI crawler access,all reachable,"Every tier 1 AI crawler reaches the site; a blocked search or user fetcher costs citations, unlike a blocked training crawler.",skills/seo/references/geo.md
+L-GEO-2,geo,Crawler access is HTTP-level,browser parity,"Bot user-agents receive the same HTTP status as a browser; robots.txt states intent and the edge decides outcome.",skills/seo/references/geo.md
+L-DATA-1,measurement,Aligned comparison windows,equal length,"Two compared periods are of strictly equal length and end at least three days back, because Search Console has no data for the current day.",skills/seo/references/search-console.md
+L-DATA-2,measurement,Refusal to score,half the inputs,"No numeric score is emitted for a dimension with fewer than half its inputs available; report insufficient data instead.",skills/audit/references/full.md
