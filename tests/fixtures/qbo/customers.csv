@@ -1,0 +1,4 @@
+Customer,Email,Phone,Billing Address,Shipping City,Shipping State,Shipping Zip
+Acme Corp,ap@acme.test,555-0100,100 Main St,Denver,CO,80202
+Globex LLC,billing@globex.test,555-0111,200 Oak Ave,Austin,TX,73301
+Initech,accounts@initech.test,555-0122,300 Pine Rd,Reno,NV,89501

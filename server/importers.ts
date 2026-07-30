@@ -1,345 +1,626 @@
-/**
- * server/importers.ts — TASK 5: CSV-first data import.
- * - csv-parse (sync API) does the parsing; every importer runs inside ONE
- *   transaction per file. dryRun=true executes the full import then rolls
- *   the transaction back, so the validation report is exactly what a real
- *   run would do.
- * - partial=true (invoices) wraps each invoice group in a nested
- *   db.transaction — better-sqlite3 implements nested transactions as
- *   SAVEPOINTs, so one bad group rolls back alone.
- * - Every importer returns { inserted, skipped, errors:[{row,message}] }
- *   and writes one audit summary entry (real runs only).
- */
+// ============================================================================
+// DATA IMPORT — CSV-first migration path
+// ============================================================================
+// Five importers (customers, vendors, chart of accounts, invoices, opening
+// balances). Contracts shared by all:
+//   - ?dryRun=true → full validation, ZERO writes, same report shape.
+//   - Response: { inserted, skipped, errors: [{ row, message }] }.
+//   - One transaction per file. Invoice import with ?partial=true wraps each
+//     invoice group in a nested transaction (PostgreSQL savepoint via
+//     drizzle's tx.transaction) so one bad group doesn't sink the file.
+//   - Row numbers in errors are 1-based DATA rows (header = row 0).
+// Parsing: csv-parse/sync (already a dependency).
+
 import { parse } from "csv-parse/sync";
-import { z } from "zod";
-import { db } from "./db.js";
-import { ACCOUNT_TYPES, ACCOUNT_SUBTYPES, type ImportResult, type ImportRowError } from "../shared/schema.js";
-import { dollarsToCents } from "../shared/money.js";
-import { accountByCode, audit, createInvoice, postJournalEntry, assertPeriodOpen, HttpError } from "./storage.js";
-import { bankImportHash } from "./bank.js";
+import { toCents } from "@shared/money";
+import { ACCOUNT_TYPES, ACCOUNT_SUBTYPES } from "@shared/schema";
+import { db, pool, storage } from "./storage";
+import { currentOrgId } from "./org-scope";
 
-class DryRunRollback extends Error {}
+export type ImportReport = {
+  inserted: number;
+  skipped: number;
+  errors: Array<{ row: number; message: string }>;
+  dryRun: boolean;
+  // Migration extras (populated by the QBO/Xero wizard path; optional so the
+  // five legacy importers keep their exact response shape).
+  updated?: number;
+  // Per-row disposition for the downloadable dry-run report.
+  rows?: Array<{ row: number; status: "created" | "updated" | "skipped" | "error"; message?: string; key?: string }>;
+};
 
-type CsvRow = Record<string, string>;
+function emptyReport(dryRun: boolean): ImportReport {
+  return { inserted: 0, skipped: 0, errors: [], dryRun };
+}
 
-function parseCsv(text: string): CsvRow[] {
-  return parse(text, {
-    columns: (header: string[]) => header.map((h) => h.trim().toLowerCase()),
+function parseCsv(csvText: string): Record<string, string>[] {
+  return parse(csvText, {
+    columns: (h: string[]) => h.map((c) => c.trim().toLowerCase()),
     skip_empty_lines: true,
     trim: true,
     bom: true,
-  }) as CsvRow[];
+    relax_column_count: true,
+  }) as Record<string, string>[];
 }
 
-/** Data rows start at line 2 (line 1 is the header). */
-const rowNum = (index: number): number => index + 2;
-
-function runFileTransaction(work: () => void, dryRun: boolean): void {
-  const tx = db.transaction(() => {
-    work();
-    if (dryRun) throw new DryRunRollback();
-  });
-  try {
-    tx();
-  } catch (err) {
-    if (!(err instanceof DryRunRollback)) throw err;
-  }
-}
-
-/* --------------------- 5a/5b: customers & vendors ------------------ */
-
-function importParties(table: "customers" | "vendors", orgId: number, userId: number, csvText: string, dryRun: boolean): ImportResult {
+// ---------------------------------------------------------------------------
+// 5a/5b — customers & vendors (same pattern, parameterized)
+// ---------------------------------------------------------------------------
+async function importParties(
+  table: "customers" | "vendors",
+  csvText: string,
+  dryRun: boolean
+): Promise<ImportReport> {
   const rows = parseCsv(csvText);
-  const errors: ImportRowError[] = [];
-  let inserted = 0;
-  let skipped = 0;
+  const report: ImportReport = { inserted: 0, skipped: 0, errors: [], dryRun };
+  const orgId = currentOrgId();
 
-  runFileTransaction(() => {
-    const existsStmt = db.prepare(`SELECT 1 FROM ${table} WHERE org_id = ? AND lower(name) = lower(?)`);
-    const insertStmt = db.prepare(
-      `INSERT INTO ${table} (org_id, name, email, phone, address, shipping_city, shipping_state, shipping_zip)
-       VALUES (?,?,?,?,?,?,?,?)`,
-    );
-    const seenInFile = new Set<string>();
-    rows.forEach((r, i) => {
-      const name = (r.name ?? "").trim();
-      if (!name) {
-        errors.push({ row: rowNum(i), message: "name is required" });
-        return;
-      }
-      const key = name.toLowerCase();
-      // Dedup case-insensitively against the org AND earlier rows in this file.
-      if (seenInFile.has(key) || existsStmt.get(orgId, name)) {
-        skipped++;
-        return;
-      }
-      seenInFile.add(key);
-      insertStmt.run(orgId, name, r.email || null, r.phone || null, r.address || null, r.shipping_city || null, r.shipping_state || null, r.shipping_zip || null);
-      inserted++;
-    });
-    if (!dryRun) audit(orgId, userId, "import", table === "customers" ? "customer" : "vendor", null, `CSV import: ${inserted} inserted, ${skipped} skipped, ${errors.length} errors`);
-  }, dryRun);
+  // Case-insensitive dedup set: existing names in the org + names seen in file.
+  const existing = new Set(
+    ((await pool.query(`SELECT lower(name) AS n FROM ${table} WHERE org_id = $1`, [orgId])).rows as any[]).map((r) => r.n)
+  );
 
-  return { inserted, skipped, errors, dryRun };
-}
-
-export const importCustomers = (orgId: number, userId: number, csv: string, dryRun: boolean): ImportResult =>
-  importParties("customers", orgId, userId, csv, dryRun);
-export const importVendors = (orgId: number, userId: number, csv: string, dryRun: boolean): ImportResult =>
-  importParties("vendors", orgId, userId, csv, dryRun);
-
-/* --------------------- 5c: chart of accounts ----------------------- */
-
-export function importChartOfAccounts(orgId: number, userId: number, csvText: string, dryRun: boolean): ImportResult {
-  const rows = parseCsv(csvText);
-  const errors: ImportRowError[] = [];
-  let inserted = 0;
-  let skipped = 0;
-
-  runFileTransaction(() => {
-    const existsStmt = db.prepare("SELECT 1 FROM accounts WHERE org_id = ? AND code = ?");
-    const insertStmt = db.prepare("INSERT INTO accounts (org_id, code, name, type, subtype) VALUES (?,?,?,?,?)");
-    rows.forEach((r, i) => {
-      const code = (r.code ?? "").trim();
-      const name = (r.name ?? "").trim();
-      const type = (r.type ?? "").trim().toLowerCase();
-      const subtype = (r.subtype ?? "").trim().toLowerCase();
-      if (!/^\d{4}$/.test(code)) return void errors.push({ row: rowNum(i), message: `invalid account code "${code}" (4 digits required)` });
-      if (!name) return void errors.push({ row: rowNum(i), message: "name is required" });
-      if (!(ACCOUNT_TYPES as readonly string[]).includes(type)) {
-        return void errors.push({ row: rowNum(i), message: `invalid type "${type}" (expected one of ${ACCOUNT_TYPES.join(", ")})` });
-      }
-      if (!(ACCOUNT_SUBTYPES as readonly string[]).includes(subtype)) {
-        return void errors.push({ row: rowNum(i), message: `invalid subtype "${subtype}"` });
-      }
-      if (existsStmt.get(orgId, code)) {
-        skipped++;
-        return;
-      }
-      insertStmt.run(orgId, code, name, type, subtype);
-      inserted++;
-    });
-    if (!dryRun) audit(orgId, userId, "import", "account", null, `COA import: ${inserted} inserted, ${skipped} skipped, ${errors.length} errors`);
-  }, dryRun);
-
-  return { inserted, skipped, errors, dryRun };
-}
-
-/* --------------------- 5d: invoices -------------------------------- */
-
-interface InvoiceGroup {
-  number: string;
-  firstRow: number;
-  customerName: string;
-  date: string;
-  dueDate: string;
-  lines: Array<{ description: string; quantity: number; rate: number; accountCode: string; taxRate: number }>;
-}
-
-export function importInvoices(orgId: number, userId: number, csvText: string, dryRun: boolean, partial: boolean): ImportResult {
-  const rows = parseCsv(csvText);
-  const errors: ImportRowError[] = [];
-  const groups = new Map<string, InvoiceGroup>();
-
+  type Row = { name: string; email: string | null; phone: string | null; address: string | null; shipping_city: string | null; shipping_state: string | null; shipping_zip: string | null };
+  const toInsert: Row[] = [];
   rows.forEach((r, i) => {
-    const number = (r.number ?? "").trim();
-    if (!number) return void errors.push({ row: rowNum(i), message: "number is required" });
-    let g = groups.get(number);
-    if (!g) {
-      g = {
-        number,
-        firstRow: rowNum(i),
-        customerName: (r.customer_name ?? "").trim(),
-        date: (r.date ?? "").trim(),
-        dueDate: (r.due_date ?? r.date ?? "").trim(),
-        lines: [],
-      };
-      groups.set(number, g);
+    const rowNum = i + 1;
+    const name = (r.name || "").trim();
+    if (!name) {
+      report.errors.push({ row: rowNum, message: "name is required" });
+      return;
     }
-    const quantity = Number(r.quantity ?? "1");
-    const rate = r.rate !== undefined && r.rate !== "" ? dollarsSafe(r.rate) : NaN;
-    if (!Number.isFinite(quantity) || quantity <= 0) return void errors.push({ row: rowNum(i), message: `invalid quantity "${r.quantity}"` });
-    if (!Number.isFinite(rate)) return void errors.push({ row: rowNum(i), message: `invalid rate "${r.rate}"` });
-    g.lines.push({
-      description: (r.line_description ?? "").trim() || "Imported line",
-      quantity,
-      rate,
-      accountCode: (r.income_account_code ?? "").trim(),
-      taxRate: Number(r.tax_rate ?? "0") || 0,
+    if (existing.has(name.toLowerCase())) {
+      report.skipped++; // dedup by case-insensitive name within org
+      return;
+    }
+    if (r.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(r.email)) {
+      report.errors.push({ row: rowNum, message: `invalid email "${r.email}"` });
+      return;
+    }
+    existing.add(name.toLowerCase()); // dedup within the file too
+    toInsert.push({
+      name,
+      email: r.email || null,
+      phone: r.phone || null,
+      address: r.address || null,
+      shipping_city: r.shipping_city || null,
+      shipping_state: r.shipping_state || null,
+      shipping_zip: r.shipping_zip || null,
     });
   });
 
-  let inserted = 0;
-  let skipped = 0;
-  let rejected = false;
-
-  const work = () => {
-    const customerStmt = db.prepare("SELECT id FROM customers WHERE org_id = ? AND lower(name) = lower(?)");
-    const accountStmt = db.prepare("SELECT id FROM accounts WHERE org_id = ? AND code = ?");
-    const invoiceExists = db.prepare("SELECT 1 FROM invoices WHERE org_id = ? AND number = ?");
-
-    for (const g of groups.values()) {
-      const groupErrors: string[] = [];
-      const customer = customerStmt.get(orgId, g.customerName) as { id: number } | undefined;
-      if (!customer) groupErrors.push(`customer "${g.customerName}" not found`);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(g.date)) groupErrors.push(`invalid date "${g.date}"`);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(g.dueDate)) groupErrors.push(`invalid due_date "${g.dueDate}"`);
-      const lineInputs = g.lines.map((l) => {
-        const acct = accountStmt.get(orgId, l.accountCode) as { id: number } | undefined;
-        if (!acct) groupErrors.push(`income_account_code "${l.accountCode}" not found`);
-        return { description: l.description, quantity: l.quantity, rate: l.rate, accountId: acct?.id ?? 0, taxRate: l.taxRate };
-      });
-      if (invoiceExists.get(orgId, g.number)) {
-        skipped++;
-        continue;
-      }
-      if (groupErrors.length > 0) {
-        errors.push({ row: g.firstRow, message: `invoice ${g.number}: ${groupErrors.join("; ")}` });
-        continue;
-      }
-      const create = () =>
-        createInvoice(orgId, userId, {
-          customerId: customer!.id,
-          date: g.date,
-          dueDate: g.dueDate,
-          number: g.number,
-          lines: lineInputs,
-        });
-      // Nested db.transaction => SAVEPOINT: one bad invoice rolls back alone.
-      // Both modes catch per group so ANY failure (including Zod rejections
-      // that pass the cheap regex pre-check, e.g. date "2026-13-40") lands in
-      // the structured {row, message} report instead of leaking a raw error;
-      // strict mode then rejects the whole file below.
-      try {
-        db.transaction(create)();
-        inserted++;
-      } catch (err) {
-        const message = err instanceof z.ZodError
-          ? err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")
-          : (err as Error).message;
-        errors.push({ row: g.firstRow, message: `invoice ${g.number}: ${message}` });
-      }
-    }
-
-    // Whole-file rejection unless ?partial=true.
-    if (!partial && errors.length > 0) {
-      throw new HttpError(400, "import rejected: fix row errors or retry with ?partial=true");
-    }
-    if (!dryRun) audit(orgId, userId, "import", "invoice", null, `Invoice import: ${inserted} inserted, ${skipped} skipped, ${errors.length} errors`);
-  };
-
-  try {
-    runFileTransaction(work, dryRun);
-  } catch (err) {
-    if (!(err instanceof HttpError)) throw err;
-    rejected = true; // whole file rolled back; report the row errors
+  if (report.errors.length > 0 || dryRun) {
+    report.inserted = toInsert.length; // what WOULD be inserted
+    return report;
   }
 
-  return { inserted: rejected ? 0 : inserted, skipped, errors, dryRun };
+  await db.transaction(async () => {
+    for (const p of toInsert) {
+      // Only the customers table carries shipping_* columns; vendors is
+      // name/email/phone/address only, so branch the INSERT by table.
+      if (table === "customers") {
+        await pool.query(
+          `INSERT INTO customers (org_id, name, email, phone, address, shipping_city, shipping_state, shipping_zip)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [orgId, p.name, p.email, p.phone, p.address, p.shipping_city, p.shipping_state, p.shipping_zip]
+        );
+      } else {
+        await pool.query(
+          `INSERT INTO vendors (org_id, name, email, phone, address) VALUES ($1,$2,$3,$4,$5)`,
+          [orgId, p.name, p.email, p.phone, p.address]
+        );
+      }
+      report.inserted++;
+    }
+  });
+  await storage.audit("import", table === "customers" ? "customer" : "vendor", null,
+    `CSV import: ${report.inserted} inserted, ${report.skipped} skipped (duplicates)`);
+  return report;
 }
 
-function dollarsSafe(v: string): number {
-  try {
-    return dollarsToCents(v);
-  } catch {
-    return NaN;
-  }
-}
+export const importCustomers = (csv: string, dryRun: boolean) => importParties("customers", csv, dryRun);
+export const importVendors = (csv: string, dryRun: boolean) => importParties("vendors", csv, dryRun);
 
-/* --------------------- 5e: opening balances ------------------------ */
-
-export function importOpeningBalances(orgId: number, userId: number, csvText: string, asOfDate: string, dryRun: boolean): ImportResult {
+// ---------------------------------------------------------------------------
+// 5c — chart of accounts
+// ---------------------------------------------------------------------------
+export async function importChartOfAccounts(csvText: string, dryRun: boolean): Promise<ImportReport> {
   const rows = parseCsv(csvText);
-  const errors: ImportRowError[] = [];
-  const lines: Array<{ accountId: number; debit: number; credit: number }> = [];
+  const report: ImportReport = { inserted: 0, skipped: 0, errors: [], dryRun };
+  const orgId = currentOrgId();
+  const existingCodes = new Set(
+    ((await pool.query(`SELECT code FROM accounts WHERE org_id = $1`, [orgId])).rows as any[]).map((r) => r.code)
+  );
+  const types = new Set(ACCOUNT_TYPES as readonly string[]);
+  // ACCOUNT_SUBTYPES is a map { type: readonly subtype[] } — validate the
+  // subtype against ITS declared type, not a flat pool.
+  const subtypesFor = (t: string): Set<string> => new Set(((ACCOUNT_SUBTYPES as any)[t] ?? []) as string[]);
+
+  const toInsert: Array<{ code: string; name: string; type: string; subtype: string | null }> = [];
+  rows.forEach((r, i) => {
+    const rowNum = i + 1;
+    const code = (r.code || "").trim();
+    const name = (r.name || "").trim();
+    const type = (r.type || "").trim().toLowerCase();
+    const subtype = (r.subtype || "").trim().toLowerCase() || null;
+    if (!code || !name || !type) {
+      report.errors.push({ row: rowNum, message: "code, name and type are required" });
+      return;
+    }
+    if (!types.has(type)) {
+      report.errors.push({ row: rowNum, message: `invalid type "${type}" (allowed: ${[...types].join(", ")})` });
+      return;
+    }
+    if (subtype && !subtypesFor(type).has(subtype)) {
+      report.errors.push({ row: rowNum, message: `invalid subtype "${subtype}" for type "${type}"` });
+      return;
+    }
+    if (existingCodes.has(code)) {
+      report.skipped++; // skip existing codes
+      return;
+    }
+    existingCodes.add(code);
+    toInsert.push({ code, name, type, subtype });
+  });
+
+  if (report.errors.length > 0 || dryRun) {
+    report.inserted = toInsert.length;
+    return report;
+  }
+  await db.transaction(async () => {
+    for (const a of toInsert) {
+      await pool.query(
+        `INSERT INTO accounts (org_id, code, name, type, subtype, is_active) VALUES ($1,$2,$3,$4,$5,true)`,
+        [orgId, a.code, a.name, a.type, a.subtype]
+      );
+      report.inserted++;
+    }
+  });
+  await storage.audit("import", "account", null, `CSV import: ${report.inserted} accounts inserted, ${report.skipped} skipped`);
+  return report;
+}
+
+// ---------------------------------------------------------------------------
+// 5d — invoices (flat rows grouped by number)
+// ---------------------------------------------------------------------------
+export async function importInvoices(csvText: string, dryRun: boolean, partial: boolean): Promise<ImportReport> {
+  const rows = parseCsv(csvText);
+  const report: ImportReport = { inserted: 0, skipped: 0, errors: [], dryRun };
+  const orgId = currentOrgId();
+
+  const customers = (await pool.query(`SELECT id, lower(name) AS name FROM customers WHERE org_id = $1`, [orgId])).rows as any[];
+  const custByName = new Map(customers.map((c) => [c.name, c.id]));
+  const accounts = (await pool.query(`SELECT id, code FROM accounts WHERE org_id = $1`, [orgId])).rows as any[];
+  const acctByCode = new Map(accounts.map((a) => [a.code, a.id]));
+  const existingNumbers = new Set(
+    ((await pool.query(`SELECT number FROM invoices WHERE org_id = $1`, [orgId])).rows as any[]).map((r) => r.number)
+  );
+
+  // Group flat rows by invoice number, preserving row numbers for errors.
+  type Group = { number: string; rows: Array<{ rowNum: number; r: Record<string, string> }> };
+  const groups = new Map<string, Group>();
+  rows.forEach((r, i) => {
+    const number = (r.number || "").trim();
+    if (!number) {
+      report.errors.push({ row: i + 1, message: "number is required" });
+      return;
+    }
+    if (!groups.has(number)) groups.set(number, { number, rows: [] });
+    groups.get(number)!.rows.push({ rowNum: i + 1, r });
+  });
+
+  type Prepared = {
+    number: string;
+    customerId: number;
+    date: string; dueDate: string; taxRate: number;
+    lines: Array<{ description: string; quantity: number; rate: number; incomeAccountId: number }>;
+  };
+  const prepared: Prepared[] = [];
+
+  for (const g of groups.values()) {
+    if (existingNumbers.has(g.number)) {
+      report.skipped++;
+      continue;
+    }
+    const head = g.rows[0];
+    const custName = (head.r.customer_name || "").trim().toLowerCase();
+    const customerId = custByName.get(custName);
+    const groupErrors: Array<{ row: number; message: string }> = [];
+    if (!customerId) groupErrors.push({ row: head.rowNum, message: `unresolved customer_name "${head.r.customer_name}"` });
+    const date = (head.r.date || "").trim();
+    const dueDate = (head.r.due_date || date).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) groupErrors.push({ row: head.rowNum, message: `invalid date "${date}" (YYYY-MM-DD)` });
+    const taxRate = Number(head.r.tax_rate || 0);
+    if (!(taxRate >= 0 && taxRate <= 100)) groupErrors.push({ row: head.rowNum, message: `invalid tax_rate "${head.r.tax_rate}"` });
+
+    const lines: Prepared["lines"] = [];
+    for (const { rowNum, r } of g.rows) {
+      const qty = Number(r.quantity);
+      const rate = Number(r.rate);
+      const acctId = acctByCode.get((r.income_account_code || "").trim());
+      if (!r.line_description) groupErrors.push({ row: rowNum, message: "line_description is required" });
+      if (!(qty > 0)) groupErrors.push({ row: rowNum, message: `invalid quantity "${r.quantity}"` });
+      if (!Number.isFinite(rate)) groupErrors.push({ row: rowNum, message: `invalid rate "${r.rate}"` });
+      if (!acctId) groupErrors.push({ row: rowNum, message: `unresolved income_account_code "${r.income_account_code}"` });
+      if (acctId) lines.push({ description: r.line_description, quantity: qty, rate, incomeAccountId: acctId });
+    }
+    if (groupErrors.length > 0) {
+      report.errors.push(...groupErrors);
+      continue;
+    }
+    prepared.push({ number: g.number, customerId: customerId!, date, dueDate, taxRate, lines });
+  }
+
+  // Whole file rejected on any error unless ?partial=true.
+  if ((report.errors.length > 0 && !partial) || dryRun) {
+    report.inserted = prepared.length;
+    return report;
+  }
+
+  // partial=true → per-group savepoint (nested transaction) so a surprise
+  // runtime failure in one group (e.g. a period lock) doesn't sink the rest.
+  await db.transaction(async (tx) => {
+    for (const p of prepared) {
+      try {
+        await tx.transaction(async () => {
+          await storage.createInvoice({
+            number: p.number,
+            customerId: p.customerId,
+            date: p.date,
+            dueDate: p.dueDate,
+            taxRate: p.taxRate,
+            lines: p.lines,
+          } as any);
+        });
+        report.inserted++;
+      } catch (e: any) {
+        if (!partial) throw e;
+        report.errors.push({ row: 0, message: `invoice ${p.number}: ${e.message}` });
+      }
+    }
+  });
+  await storage.audit("import", "invoice", null,
+    `CSV import: ${report.inserted} invoices inserted, ${report.skipped} skipped, ${report.errors.length} errors`);
+  return report;
+}
+
+// ---------------------------------------------------------------------------
+// 5e — opening balances (one balanced JE)
+// ---------------------------------------------------------------------------
+export async function importOpeningBalances(csvText: string, asOfDate: string, dryRun: boolean): Promise<ImportReport> {
+  const rows = parseCsv(csvText);
+  const report: ImportReport = { inserted: 0, skipped: 0, errors: [], dryRun };
+  const orgId = currentOrgId();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(asOfDate || "")) {
+    report.errors.push({ row: 0, message: "asOfDate (YYYY-MM-DD) is required in the request body" });
+    return report;
+  }
+  const accounts = (await pool.query(`SELECT id, code FROM accounts WHERE org_id = $1`, [orgId])).rows as any[];
+  const acctByCode = new Map(accounts.map((a) => [a.code, a.id]));
+
+  const jeLines: Array<{ accountId: number; debit: number; credit: number; description: string }> = [];
   let totalDr = 0;
   let totalCr = 0;
-
   rows.forEach((r, i) => {
-    const code = (r.account_code ?? "").trim();
-    let acctId: number;
-    try {
-      acctId = accountByCode(orgId, code).id;
-    } catch {
-      return void errors.push({ row: rowNum(i), message: `account_code "${code}" not found` });
+    const rowNum = i + 1;
+    const acctId = acctByCode.get((r.account_code || "").trim());
+    if (!acctId) {
+      report.errors.push({ row: rowNum, message: `unresolved account_code "${r.account_code}"` });
+      return;
     }
-    const debit = r.debit ? dollarsSafe(r.debit) : 0;
-    const credit = r.credit ? dollarsSafe(r.credit) : 0;
-    if (!Number.isFinite(debit) || !Number.isFinite(credit) || debit < 0 || credit < 0) {
-      return void errors.push({ row: rowNum(i), message: `invalid debit/credit on account ${code}` });
+    // Dollars in the file → integer cents ONCE at this boundary.
+    const debit = r.debit ? toCents(Number(r.debit)) : 0;
+    const credit = r.credit ? toCents(Number(r.credit)) : 0;
+    if (debit < 0 || credit < 0 || (debit > 0 && credit > 0)) {
+      report.errors.push({ row: rowNum, message: "each row needs debit OR credit (non-negative, not both)" });
+      return;
     }
+    if (debit === 0 && credit === 0) return; // blank row — ignore
     totalDr += debit;
     totalCr += credit;
-    lines.push({ accountId: acctId, debit, credit });
+    jeLines.push({ accountId: acctId, debit, credit, description: "Opening balance" });
   });
 
   if (totalDr !== totalCr) {
-    errors.push({
+    const diff = totalDr - totalCr;
+    report.errors.push({
       row: 0,
-      message: `file does not balance: debits ${(totalDr / 100).toFixed(2)} != credits ${(totalCr / 100).toFixed(2)} (difference ${((totalDr - totalCr) / 100).toFixed(2)})`,
+      message: `Opening balances do not balance: debits ${(totalDr / 100).toFixed(2)} vs credits ${(totalCr / 100).toFixed(2)} — difference ${(diff / 100).toFixed(2)} (debits ${diff > 0 ? "exceed" : "fall short of"} credits).`,
     });
   }
-  if (errors.length > 0) return { inserted: 0, skipped: 0, errors, dryRun };
+  if (jeLines.length < 2) {
+    report.errors.push({ row: 0, message: "at least two non-zero rows are required" });
+  }
+  if (report.errors.length > 0 || dryRun) {
+    report.inserted = report.errors.length === 0 ? 1 : 0; // one JE would be posted
+    return report;
+  }
 
-  assertPeriodOpen(orgId, asOfDate);
-  runFileTransaction(() => {
-    // Exactly ONE journal entry for the whole file.
-    postJournalEntry(orgId, asOfDate, "Opening balances", "opening_balance", null, lines);
-    if (!dryRun) audit(orgId, userId, "import", "journal_entry", null, `Opening balances as of ${asOfDate}: ${lines.length} lines`);
-  }, dryRun);
-
-  return { inserted: lines.length, skipped: 0, errors, dryRun };
+  await storage.postJournalEntry({
+    date: asOfDate,
+    memo: "Opening balances (imported)",
+    reference: "OPENING",
+    source: "opening_balance",
+    lines: jeLines,
+  } as any);
+  report.inserted = 1;
+  await storage.audit("import", "journal_entry", null,
+    `Opening balances imported as of ${asOfDate}: ${jeLines.length} lines, ${(totalDr / 100).toFixed(2)} each side`);
+  return report;
 }
 
-/* --------------------- Phase 3: bank statement import -------------- */
+// ===========================================================================
+// MIGRATION SUITE — QBO/Xero switcher path (Products/Services, open Bills,
+// Trial Balance as opening balances). These run behind the guided wizard at
+// /settings/import; the wizard canonicalizes each source CSV into the header
+// shapes below before calling in, so QBO and Xero exports share one code path.
+// ===========================================================================
 
-/**
- * Statement lines (date, description, amount as signed dollars) land in
- * bank_transactions as unreconciled rows. Matching them to journal activity
- * is a follow-up step — this importer only stages the statement.
- */
-export function importBankTransactions(orgId: number, userId: number, accountId: number, csvText: string, dryRun: boolean): ImportResult {
+const OPENING_BALANCE_EQUITY_CODE = "3900";
+const OPENING_BALANCE_EQUITY_NAME = "Opening Balance Equity";
+
+// Find (or, on commit, create) the Opening Balance Equity account — the QBO
+// convention for the contra side of every conversion balance. Matched by code
+// 3900 first, then by name, so an org that already has one is reused.
+async function resolveOpeningBalanceEquity(orgId: number, create: boolean): Promise<number | null> {
+  const found = (await pool.query(
+    `SELECT id FROM accounts WHERE org_id = $1 AND (code = $2 OR lower(name) = lower($3)) ORDER BY (code = $2) DESC LIMIT 1`,
+    [orgId, OPENING_BALANCE_EQUITY_CODE, OPENING_BALANCE_EQUITY_NAME]
+  )).rows[0] as { id: number } | undefined;
+  if (found) return found.id;
+  if (!create) return null;
+  const inserted = (await pool.query(
+    `INSERT INTO accounts (org_id, code, name, type, subtype, is_active) VALUES ($1,$2,$3,'equity','equity',true) RETURNING id`,
+    [orgId, OPENING_BALANCE_EQUITY_CODE, OPENING_BALANCE_EQUITY_NAME]
+  )).rows[0] as { id: number };
+  return inserted.id;
+}
+
+// ---------------------------------------------------------------------------
+// Products / Services (catalog items)
+// Canonical headers: sku,name,type,income_account_code,expense_account_code,
+//                    cogs_account_code,inventory_account_code,description
+// ---------------------------------------------------------------------------
+export async function importItems(csvText: string, dryRun: boolean): Promise<ImportReport> {
   const rows = parseCsv(csvText);
-  const errors: ImportRowError[] = [];
-  let inserted = 0;
+  const report = emptyReport(dryRun);
+  const orgId = currentOrgId();
+  const accounts = (await pool.query(`SELECT id, code FROM accounts WHERE org_id = $1`, [orgId])).rows as any[];
+  const acctByCode = new Map(accounts.map((a) => [String(a.code), a.id]));
+  const existingSkus = new Set(
+    ((await pool.query(`SELECT lower(sku) AS sku FROM items WHERE org_id = $1`, [orgId])).rows as any[]).map((r) => r.sku)
+  );
+  const ITEM_TYPES = new Set(["inventory", "service", "noninventory"]);
 
-  let skipped = 0;
-  runFileTransaction(() => {
-    const ins = db.prepare(
-      "INSERT INTO bank_transactions (org_id, account_id, date, description, amount, import_hash) VALUES (?,?,?,?,?,?)",
-    );
-    const countByHash = db.prepare(
-      "SELECT COUNT(*) AS n FROM bank_transactions WHERE org_id = ? AND import_hash = ?",
-    );
-    // Duplicate rule: identical lines WITHIN one file are legitimate (two
-    // equal card charges the same day), but a line already imported by a
-    // PREVIOUS run is a duplicate. So each hash may only be inserted up to
-    // (occurrences in this file) minus (rows already in the DB).
-    const seenInFile = new Map<string, number>();
-    rows.forEach((r, i) => {
-      const date = (r.date ?? "").trim();
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date + "T00:00:00Z"))) {
-        return void errors.push({ row: rowNum(i), message: `invalid date "${date}"` });
-      }
-      const amount = dollarsSafe(r.amount ?? "");
-      if (!Number.isFinite(amount) || amount === 0) {
-        return void errors.push({ row: rowNum(i), message: `invalid amount "${r.amount}" (signed dollars, non-zero)` });
-      }
-      const description = (r.description ?? "").trim();
-      const hash = bankImportHash(accountId, date, amount, description);
-      const occurrence = (seenInFile.get(hash) ?? 0) + 1;
-      seenInFile.set(hash, occurrence);
-      const existing = (countByHash.get(orgId, hash) as { n: number }).n;
-      if (occurrence <= existing) {
-        skipped++; // this exact line was already imported by an earlier run
-        return;
-      }
-      ins.run(orgId, accountId, date, description, amount, hash);
-      inserted++;
-    });
-    if (errors.length > 0) throw new HttpError(400, "bank import rejected: fix row errors");
-    if (!dryRun) audit(orgId, userId, "import", "bank_transaction", null, `Bank statement import: ${inserted} inserted, ${skipped} duplicates skipped (account ${accountId})`);
-  }, dryRun);
+  type Prepared = {
+    sku: string; name: string; type: string; description: string | null;
+    salesAccountId: number; expenseAccountId: number; cogsAccountId: number; inventoryAssetAccountId: number | null;
+  };
+  const prepared: Prepared[] = [];
 
-  return { inserted, skipped, errors, dryRun };
+  rows.forEach((r, i) => {
+    const rowNum = i + 1;
+    const name = (r.name || "").trim();
+    const sku = (r.sku || name).trim();
+    if (!name) { report.errors.push({ row: rowNum, message: "name is required" }); return; }
+    // Normalize the source type ("Inventory"/"Non-inventory"/"Service") to ours.
+    const rawType = (r.type || "service").trim().toLowerCase().replace(/[\s-]/g, "");
+    const type = rawType.startsWith("inventor") ? "inventory" : rawType.startsWith("noninventor") ? "noninventory" : "service";
+    if (!ITEM_TYPES.has(type)) { report.errors.push({ row: rowNum, message: `invalid item type "${r.type}"` }); return; }
+    if (existingSkus.has(sku.toLowerCase())) { report.skipped++; return; }
+
+    const salesAccountId = acctByCode.get((r.income_account_code || "").trim());
+    if (!salesAccountId) { report.errors.push({ row: rowNum, message: `unresolved income_account_code "${r.income_account_code}"` }); return; }
+    // Expense/COGS fall back to each other so a minimal export (income + expense
+    // only) still imports; inventory additionally needs an asset account.
+    const expenseAccountId = acctByCode.get((r.expense_account_code || "").trim()) ?? acctByCode.get((r.cogs_account_code || "").trim());
+    if (!expenseAccountId) { report.errors.push({ row: rowNum, message: `unresolved expense_account_code "${r.expense_account_code}"` }); return; }
+    const cogsAccountId = acctByCode.get((r.cogs_account_code || "").trim()) ?? expenseAccountId;
+    const inventoryAssetAccountId: number | null = acctByCode.get((r.inventory_account_code || "").trim()) ?? null;
+    if (type === "inventory" && !inventoryAssetAccountId) {
+      report.errors.push({ row: rowNum, message: `inventory item "${name}" needs inventory_account_code` });
+      return;
+    }
+    existingSkus.add(sku.toLowerCase());
+    prepared.push({ sku, name, type, description: (r.description || "").trim() || null, salesAccountId, expenseAccountId, cogsAccountId, inventoryAssetAccountId });
+  });
+
+  if (report.errors.length > 0 || dryRun) {
+    report.inserted = prepared.length;
+    return report;
+  }
+  // One transaction per file: direct inserts keep every item in the same tx
+  // (createItem is not tx-aware). quantity/cost stay zero — stock only moves
+  // through inventory_movements, never a seeded import.
+  await db.transaction(async () => {
+    for (const p of prepared) {
+      await pool.query(
+        `INSERT INTO items (org_id, sku, name, description, type, sales_account_id, expense_account_id, inventory_asset_account_id, cogs_account_id, quantity_on_hand, avg_cost_cents, is_active, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,0,true,now())`,
+        [orgId, p.sku, p.name, p.description, p.type, p.salesAccountId, p.expenseAccountId, p.inventoryAssetAccountId, p.cogsAccountId]
+      );
+      report.inserted++;
+    }
+  });
+  await storage.audit("import", "item", null, `CSV import: ${report.inserted} items inserted, ${report.skipped} skipped`);
+  return report;
+}
+
+// ---------------------------------------------------------------------------
+// Open Bills (flat rows grouped by number) — mirror of importInvoices.
+// Canonical headers: number,vendor_name,date,due_date,tax_rate,line_description,
+//                    quantity,rate,expense_account_code
+// ---------------------------------------------------------------------------
+export async function importBills(csvText: string, dryRun: boolean, partial: boolean): Promise<ImportReport> {
+  const rows = parseCsv(csvText);
+  const report = emptyReport(dryRun);
+  const orgId = currentOrgId();
+
+  const vendors = (await pool.query(`SELECT id, lower(name) AS name FROM vendors WHERE org_id = $1`, [orgId])).rows as any[];
+  const vendorByName = new Map(vendors.map((v) => [v.name, v.id]));
+  const accounts = (await pool.query(`SELECT id, code FROM accounts WHERE org_id = $1`, [orgId])).rows as any[];
+  const acctByCode = new Map(accounts.map((a) => [String(a.code), a.id]));
+  const existingNumbers = new Set(
+    ((await pool.query(`SELECT number FROM bills WHERE org_id = $1`, [orgId])).rows as any[]).map((r) => r.number)
+  );
+
+  type Group = { number: string; rows: Array<{ rowNum: number; r: Record<string, string> }> };
+  const groups = new Map<string, Group>();
+  rows.forEach((r, i) => {
+    const number = (r.number || "").trim();
+    if (!number) { report.errors.push({ row: i + 1, message: "number is required" }); return; }
+    if (!groups.has(number)) groups.set(number, { number, rows: [] });
+    groups.get(number)!.rows.push({ rowNum: i + 1, r });
+  });
+
+  type Prepared = {
+    number: string; vendorId: number; date: string; dueDate: string; taxRate: number;
+    lines: Array<{ description: string; quantity: number; rate: number; expenseAccountId: number }>;
+  };
+  const prepared: Prepared[] = [];
+
+  for (const g of groups.values()) {
+    if (existingNumbers.has(g.number)) { report.skipped++; continue; }
+    const head = g.rows[0];
+    const vendorName = (head.r.vendor_name || "").trim().toLowerCase();
+    const vendorId = vendorByName.get(vendorName);
+    const groupErrors: Array<{ row: number; message: string }> = [];
+    if (!vendorId) groupErrors.push({ row: head.rowNum, message: `unresolved vendor_name "${head.r.vendor_name}"` });
+    const date = (head.r.date || "").trim();
+    const dueDate = (head.r.due_date || date).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) groupErrors.push({ row: head.rowNum, message: `invalid date "${date}" (YYYY-MM-DD)` });
+    const taxRate = Number(head.r.tax_rate || 0);
+    if (!(taxRate >= 0 && taxRate <= 100)) groupErrors.push({ row: head.rowNum, message: `invalid tax_rate "${head.r.tax_rate}"` });
+
+    const lines: Prepared["lines"] = [];
+    for (const { rowNum, r } of g.rows) {
+      const qty = Number(r.quantity);
+      const rate = Number(r.rate);
+      const acctId = acctByCode.get((r.expense_account_code || "").trim());
+      if (!r.line_description) groupErrors.push({ row: rowNum, message: "line_description is required" });
+      if (!(qty > 0)) groupErrors.push({ row: rowNum, message: `invalid quantity "${r.quantity}"` });
+      if (!(rate >= 0) || !Number.isFinite(rate)) groupErrors.push({ row: rowNum, message: `invalid rate "${r.rate}"` });
+      if (!acctId) groupErrors.push({ row: rowNum, message: `unresolved expense_account_code "${r.expense_account_code}"` });
+      if (acctId) lines.push({ description: r.line_description, quantity: qty, rate, expenseAccountId: acctId });
+    }
+    if (groupErrors.length > 0) { report.errors.push(...groupErrors); continue; }
+    prepared.push({ number: g.number, vendorId: vendorId!, date, dueDate, taxRate, lines });
+  }
+
+  if ((report.errors.length > 0 && !partial) || dryRun) {
+    report.inserted = prepared.length;
+    return report;
+  }
+
+  await db.transaction(async (tx) => {
+    for (const p of prepared) {
+      try {
+        await tx.transaction(async (sp) => {
+          await storage.createBill({
+            number: p.number,
+            vendorId: p.vendorId,
+            date: p.date,
+            dueDate: p.dueDate,
+            taxRate: p.taxRate,
+            lines: p.lines,
+          } as any, { _tx: sp });
+        });
+        report.inserted++;
+      } catch (e: any) {
+        if (!partial) throw e;
+        report.errors.push({ row: 0, message: `bill ${p.number}: ${e.message}` });
+      }
+    }
+  });
+  await storage.audit("import", "bill", null,
+    `CSV import: ${report.inserted} bills inserted, ${report.skipped} skipped, ${report.errors.length} errors`);
+  return report;
+}
+
+// ---------------------------------------------------------------------------
+// Trial Balance → opening balances (single balanced JE against OBE)
+// Canonical headers: account_code,account_name,debit,credit
+// Accounts resolve by code first, then case-insensitive name (QBO/Xero trial
+// balances export names, not codes). Any residual imbalance is absorbed by
+// Opening Balance Equity so the posted JE ALWAYS balances; a source trial
+// balance that already balances posts verbatim (OBE plug = 0), so the trial
+// balance after import equals the source to the cent.
+// ---------------------------------------------------------------------------
+export async function importTrialBalance(csvText: string, conversionDate: string, dryRun: boolean): Promise<ImportReport> {
+  const rows = parseCsv(csvText);
+  const report = emptyReport(dryRun);
+  const orgId = currentOrgId();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(conversionDate || "")) {
+    report.errors.push({ row: 0, message: "conversionDate (YYYY-MM-DD) is required" });
+    return report;
+  }
+  const accounts = (await pool.query(`SELECT id, code, lower(name) AS name FROM accounts WHERE org_id = $1`, [orgId])).rows as any[];
+  const acctByCode = new Map(accounts.map((a) => [String(a.code), a.id]));
+  const acctByName = new Map(accounts.map((a) => [a.name, a.id]));
+  const obeId = accounts.find((a) => String(a.code) === OPENING_BALANCE_EQUITY_CODE || a.name === OPENING_BALANCE_EQUITY_NAME.toLowerCase())?.id ?? null;
+
+  const jeLines: Array<{ accountId: number; debit: number; credit: number; description: string }> = [];
+  let totalDr = 0;
+  let totalCr = 0;
+  rows.forEach((r, i) => {
+    const rowNum = i + 1;
+    const code = (r.account_code || "").trim();
+    const name = (r.account_name || "").trim().toLowerCase();
+    const acctId = acctByCode.get(code) ?? (name ? acctByName.get(name) : undefined);
+    if (!acctId) {
+      report.errors.push({ row: rowNum, message: `unresolved account "${r.account_code || r.account_name}"` });
+      return;
+    }
+    const debit = r.debit ? toCents(Number(r.debit)) : 0;
+    const credit = r.credit ? toCents(Number(r.credit)) : 0;
+    if (debit < 0 || credit < 0 || (debit > 0 && credit > 0)) {
+      report.errors.push({ row: rowNum, message: "each row needs debit OR credit (non-negative, not both)" });
+      return;
+    }
+    if (debit === 0 && credit === 0) return; // blank row — ignore
+    totalDr += debit;
+    totalCr += credit;
+    jeLines.push({ accountId: acctId, debit, credit, description: "Opening balance" });
+  });
+
+  // Balancing plug to Opening Balance Equity for any residual. On a balanced
+  // trial balance the plug is zero and no OBE line is added.
+  const plug = totalDr - totalCr;
+  if (plug !== 0) {
+    if (obeId) {
+      // debits exceed credits → credit OBE, and vice versa.
+      jeLines.push({ accountId: obeId, debit: plug < 0 ? -plug : 0, credit: plug > 0 ? plug : 0, description: "Opening Balance Equity (plug)" });
+    }
+    // else: OBE is auto-created on commit (below); dry run reports the plug amount.
+  }
+
+  if (jeLines.length < 1 && plug === 0) {
+    report.errors.push({ row: 0, message: "no non-zero trial balance rows found" });
+  }
+  if (report.errors.length > 0 || dryRun) {
+    report.inserted = report.errors.length === 0 ? 1 : 0;
+    if (plug !== 0 && report.errors.length === 0) {
+      report.rows = [{ row: 0, status: "created", message: `Opening Balance Equity plug of ${(Math.abs(plug) / 100).toFixed(2)} will balance the entry`, key: "OBE" }];
+    }
+    return report;
+  }
+
+  // Commit path: ensure OBE exists if a plug is needed, then post one JE.
+  let lines = jeLines;
+  if (plug !== 0 && !obeId) {
+    const createdObe = await resolveOpeningBalanceEquity(orgId, true);
+    lines = [...jeLines, { accountId: createdObe!, debit: plug < 0 ? -plug : 0, credit: plug > 0 ? plug : 0, description: "Opening Balance Equity (plug)" }];
+  }
+
+  await storage.postJournalEntry({
+    date: conversionDate,
+    memo: "Opening balances (migrated)",
+    reference: "MIGRATION",
+    source: "opening_balance",
+    lines,
+  } as any);
+  report.inserted = 1;
+  await storage.audit("import", "journal_entry", null,
+    `Trial balance migrated as of ${conversionDate}: ${lines.length} lines, ${(Math.max(totalDr, totalCr) / 100).toFixed(2)} each side`);
+  return report;
 }

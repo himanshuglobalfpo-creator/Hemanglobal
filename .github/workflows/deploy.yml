@@ -1,0 +1,75 @@
+name: Deploy
+
+# Release pipeline. The full quality gate (lint → tsc → unit/integration →
+# build → prod-smoke → e2e) lives in ci.yml and is a REQUIRED status check via
+# branch protection, so nothing reaches `main` without it passing. This workflow
+# handles what happens AFTER a change is on main or a release tag is cut:
+#
+#   push to main   → deploy STAGING (seeded demo org, Stripe/Plaid SANDBOX keys)
+#   tag v*         → deploy PRODUCTION (blue-green, gated on /api/health/ready),
+#                    behind a manual approval on the `production` environment.
+#
+# The deploy steps below are intentionally provider-agnostic placeholders — wire
+# them to your host (Fly, Render, ECS, K8s…). Migrations run automatically at
+# boot and are transactional + tracked (server/storage.ts runMigrations), so a
+# rolling/blue-green swap needs no separate migration step (see DEPLOY.md and the
+# additive-migration rule in CONTRIBUTING.md).
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false   # never interrupt an in-flight deploy
+
+jobs:
+  deploy-staging:
+    name: Deploy staging
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.ledgerlite.example
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Build production artifact
+        run: npm run build
+      - name: Deploy to staging
+        # Staging uses SANDBOX Stripe/Plaid keys and a seeded demo org (see
+        # DEPLOY.md). Replace with your host's deploy command.
+        run: echo "→ deploying $GITHUB_SHA to staging (placeholder)"
+      - name: Post-deploy readiness gate
+        run: |
+          echo "→ would poll https://staging.ledgerlite.example/api/health/ready until 200"
+          # ./scripts/wait-for-ready.sh https://staging.ledgerlite.example
+
+  deploy-production:
+    name: Deploy production
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # The `production` environment carries a required-reviewers protection rule,
+    # so this job PAUSES for manual approval before any step runs.
+    environment:
+      name: production
+      url: https://app.ledgerlite.example
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Build production artifact
+        run: npm run build
+      - name: Blue-green deploy
+        # Bring up the new color, let boot run migrations, then wait for /ready
+        # on the new color BEFORE shifting traffic; keep the old color for a fast
+        # rollback. Replace with your host's blue-green primitive.
+        run: echo "→ blue-green deploying ${GITHUB_REF_NAME} (placeholder)"
+      - name: Readiness gate on the new color
+        run: |
+          echo "→ would poll the new color's /api/health/ready until 200, then shift traffic"
+          # ./scripts/wait-for-ready.sh https://green.app.ledgerlite.example

@@ -1,4 +1,15 @@
 node_modules/
-data/
+dist/
 *.log
 .env
+.env.local
+data.db
+data.db-wal
+data.db-shm
+.DS_Store
+
+# Playwright / Vitest
+playwright-report/
+test-results/
+coverage/
+.pg-e2e/

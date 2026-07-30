@@ -1,0 +1,9 @@
+*Code,*Name,*Type,Description,*Tax Code
+1000,Checking Account,Bank,Operating cash,Tax Exempt
+1100,Accounts Receivable,Current Asset,,No VAT
+4000,Sales Revenue,Revenue,Product sales,20% (VAT on Income)
+4900,Interest Income,Other Income,,No VAT
+2000,Accounts Payable,Current Liability,,No VAT
+3000,Owner's Equity,Equity,,No VAT
+5000,Cost of Goods Sold,Direct Costs,,No VAT
+6000,Rent Expense,Overhead,,No VAT

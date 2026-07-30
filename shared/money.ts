@@ -1,40 +1,76 @@
+// ============================================================================
+// MONEY — integer cents everywhere
+// ============================================================================
+// All monetary values in the database and in server-side math are INTEGER
+// CENTS ($10.99 = 1099). Never use REAL/float for money. Floating point math
+// is only permitted at the two boundaries:
+//   IN:  user-submitted dollars → toCents() → Math.round(dollars * 100)
+//   OUT: display formatting     → formatMoney(cents) → "$1,234.56"
+//
+// Shared by server (storage, PDFs, statements, audit strings) and client.
+
+// Upper bound for a single monetary amount, in INTEGER CENTS. Money columns are
+// BIGINT so the DB can hold very large values, but every value must still stay a
+// JS-safe integer (< 2^53) for exact server-side math, and an absurd amount is
+// almost always an input error. Default: $1 trillion. Configurable via the
+// MAX_TX_CENTS env var (server) — kept well below Number.MAX_SAFE_INTEGER so
+// sums of many amounts also stay exact.
+export const DEFAULT_MAX_TX_CENTS = 1_000_000_000_000_00; // $1,000,000,000,000.00
+
+export const MAX_TX_CENTS: number = (() => {
+  // `process` may be undefined in the browser bundle — guard the access.
+  const raw = typeof process !== "undefined" ? Number(process.env?.MAX_TX_CENTS) : NaN;
+  return Number.isSafeInteger(raw) && raw > 0 ? raw : DEFAULT_MAX_TX_CENTS;
+})();
+
 /**
- * shared/money.ts — integer-cents money helpers.
- * TASK 1: formatMoney takes an optional ISO currency code (default "USD")
- * so document views/PDFs/statements can render the DOCUMENT currency while
- * the GL stays 100% base currency.
+ * Convert user-input dollars (possibly fractional/float) to integer cents.
+ * Throws above `maxCents` (default MAX_TX_CENTS) so an out-of-range amount fails
+ * loudly at the API boundary instead of silently overflowing downstream math.
  */
+export function toCents(dollars: number, maxCents: number = MAX_TX_CENTS): number {
+  if (!Number.isFinite(dollars)) throw new Error(`Invalid money amount: ${dollars}`);
+  const cents = Math.round(dollars * 100);
+  if (Math.abs(cents) > maxCents) {
+    throw new Error(
+      `Amount ${dollars} exceeds the maximum allowed of ${maxCents / 100} ` +
+        `(${maxCents} cents). Raise MAX_TX_CENTS if this is intentional.`
+    );
+  }
+  return cents;
+}
 
-// Storage rule: EVERY currency is stored in 1/100 units (dollarsToCents and
-// the client both multiply user input by 100), including zero-decimal ones
-// like JPY. Zero-decimal codes only affect DISPLAY precision — so server
-// documents and the client always agree on the stored value.
-const ZERO_DECIMAL = new Set(["JPY"]);
-
+/** Format integer cents as "$X,XXX.XX" (negative → "-$X,XXX.XX").
+ *  Optional currency code (ISO 4217) defaults to USD, so every existing call
+ *  site keeps its behavior; FX documents pass their own code ("EUR" → "€…").
+ *  Unknown codes fall back to a plain "CODE 1,234.56" render rather than throw. */
 export function formatMoney(cents: number, currency: string = "USD"): string {
-  const decimals = ZERO_DECIMAL.has(currency) ? 0 : 2;
-  const amount = cents / 100;
+  if (!Number.isFinite(cents)) cents = 0;
+  const c = Math.round(cents); // guard: caller should already pass an integer
   try {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency,
-      minimumFractionDigits: decimals,
-      maximumFractionDigits: decimals,
-    }).format(amount);
+    return (c / 100).toLocaleString("en-US", { style: "currency", currency });
   } catch {
-    // Unknown code: fall back to plain formatting with the code as prefix.
-    return `${currency} ${amount.toFixed(decimals)}`;
+    return `${currency} ${(c / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   }
 }
 
-/** Convert foreign cents to base cents at a document/payment rate. */
-export function convertCents(foreignCents: number, rate: number): number {
-  return Math.round(foreignCents * rate);
+/** API response shape for a money value: exact cents + human display string. */
+export function moneyField(cents: number): { cents: number; display: string } {
+  return { cents: Math.round(cents), display: formatMoney(cents) };
 }
 
-/** Dollars (string or number, e.g. "12.34") to integer cents; throws on bad input. */
-export function dollarsToCents(v: string | number): number {
-  const n = typeof v === "number" ? v : Number(String(v).replace(/[$,\s]/g, ""));
-  if (!Number.isFinite(n)) throw new Error(`invalid money value: ${v}`);
-  return Math.round(n * 100);
+/**
+ * Multiply cents by a percentage rate (e.g. tax), returning integer cents.
+ * Example: taxCents(10000, 8.875) = Math.round(10000 * 0.08875) = 888
+ */
+export function pctOfCents(cents: number, ratePercent: number): number {
+  return Math.round((cents * ratePercent) / 100);
+}
+
+/** Assert a value is integer cents (catches float leakage in dev/tests). */
+export function assertCents(v: number, label = "amount"): number {
+  if (!Number.isInteger(v)) {
+    throw new Error(`${label} must be integer cents, got ${v}`);
+  }
+  return v;
 }

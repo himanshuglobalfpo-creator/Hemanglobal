@@ -1,0 +1,49 @@
+name: Restore Drill
+
+# Prove recoverability weekly (and on demand): dump a seeded database, restore
+# it into a scratch DB, and assert the recovered ledger still obeys double-entry
+# (scripts/restore-drill.sh → scripts/verify-accounting-identity.ts). A backup
+# that has never been restored is not a backup — this is the proof.
+on:
+  schedule:
+    - cron: "17 6 * * 1"   # 06:17 UTC every Monday
+  workflow_dispatch: {}
+
+jobs:
+  restore-drill:
+    name: Dump → restore → verify identity
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      APP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      SESSION_SECRET: ci-session-secret-0123456789
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Ensure Postgres client tools (pg_dump/pg_restore/psql 16)
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update && sudo apt-get install -y postgresql-client-16
+      - name: Seed a balanced ledger (migrations + demo entry)
+        run: npx tsx scripts/seed-drill-data.ts
+      - name: Run restore drill (self-contained dump → restore → verify)
+        run: bash scripts/restore-drill.sh

@@ -1,146 +1,178 @@
-/**
- * server/files.ts — TASK 3: file storage abstraction.
- * Driver selected by env FILE_STORAGE:
- *   "local" (default) — blobs under FILE_DIR (default ./data/uploads)/<orgId>/<uuid>
- *   "s3"              — S3-compatible store via plain fetch + AWS Signature V4
- *                       (env S3_ENDPOINT, S3_BUCKET, S3_KEY, S3_SECRET, S3_REGION).
- * No AWS SDK — SigV4 is ~60 lines of crypto and keeps the dependency tree flat.
- */
+// ============================================================================
+// FILE STORAGE — driver abstraction for attachments
+// ============================================================================
+// The driver is a dumb byte store: the attachment route encrypts payloads with
+// AES-256-GCM (crypto-vault encryptBlob) BEFORE calling put(), and decrypts
+// after get(), so every blob is encrypted at rest whether it lands on local
+// disk or in S3 — the driver never sees plaintext file bytes in production.
+//
+// FILE_STORAGE=local (default): blobs under FILE_DIR (default ./data/uploads)
+//   at <orgId>/<uuid> — org prefix keeps tenant blobs physically separated.
+// FILE_STORAGE=s3: S3-compatible store via plain fetch + AWS Signature V4
+//   (no SDK). Env: S3_ENDPOINT (e.g. https://s3.us-east-1.amazonaws.com or a
+//   MinIO/R2 endpoint), S3_BUCKET, S3_KEY, S3_SECRET, optional S3_REGION
+//   (default us-east-1).
+
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export interface FileDriver {
-  put(key: string, data: Buffer, mime: string): Promise<void>;
+  put(key: string, data: Buffer, contentType: string): Promise<void>;
   get(key: string): Promise<Buffer>;
   delete(key: string): Promise<void>;
 }
 
-/* ----------------------------- local ------------------------------ */
-
-const FILE_DIR = process.env.FILE_DIR ?? path.join(__dirname, "..", "data", "uploads");
-
-/** storage keys are "<orgId>/<uuid>"; resolve safely under FILE_DIR. */
-function localPath(key: string): string {
-  const resolved = path.resolve(FILE_DIR, key);
-  if (!resolved.startsWith(path.resolve(FILE_DIR) + path.sep)) {
-    throw new Error("invalid storage key");
+// ---------------------------------------------------------------------------
+// Local driver
+// ---------------------------------------------------------------------------
+class LocalDriver implements FileDriver {
+  private root: string;
+  constructor() {
+    this.root = process.env.FILE_DIR || path.join(process.cwd(), "data", "uploads");
   }
-  return resolved;
-}
-
-const localDriver: FileDriver = {
-  async put(key, data) {
-    const p = localPath(key);
+  private resolve(key: string): string {
+    // key is "<orgId>/<uuid>" — both components are server-generated, but
+    // normalize + verify anyway so a corrupted key can never traverse out.
+    const p = path.normalize(path.join(this.root, key));
+    if (!p.startsWith(path.normalize(this.root))) throw new Error("Invalid storage key");
+    return p;
+  }
+  async put(key: string, data: Buffer): Promise<void> {
+    const p = this.resolve(key);
     await fs.promises.mkdir(path.dirname(p), { recursive: true });
     await fs.promises.writeFile(p, data);
-  },
-  async get(key) {
-    return fs.promises.readFile(localPath(key));
-  },
-  async delete(key) {
-    await fs.promises.rm(localPath(key), { force: true });
-  },
-};
+  }
+  async get(key: string): Promise<Buffer> {
+    return fs.promises.readFile(this.resolve(key));
+  }
+  async delete(key: string): Promise<void> {
+    await fs.promises.unlink(this.resolve(key)).catch((e) => {
+      if (e.code !== "ENOENT") throw e; // deleting a missing blob is fine
+    });
+  }
+}
 
-/* ------------------------------ s3 -------------------------------- */
-
+// ---------------------------------------------------------------------------
+// S3 driver — AWS Signature V4 with plain fetch, no SDK.
+// ---------------------------------------------------------------------------
 function hmac(key: Buffer | string, data: string): Buffer {
-  return crypto.createHmac("sha256", key).update(data).digest();
+  return crypto.createHmac("sha256", key).update(data, "utf8").digest();
 }
 function sha256Hex(data: Buffer | string): string {
   return crypto.createHash("sha256").update(data).digest("hex");
 }
 
-interface S3Config {
-  endpoint: string;
-  bucket: string;
-  accessKey: string;
-  secret: string;
-  region: string;
-}
+class S3Driver implements FileDriver {
+  private endpoint: string;
+  private bucket: string;
+  private key: string;
+  private secret: string;
+  private region: string;
 
-function s3Config(): S3Config {
-  const endpoint = process.env.S3_ENDPOINT;
-  const bucket = process.env.S3_BUCKET;
-  const accessKey = process.env.S3_KEY;
-  const secret = process.env.S3_SECRET;
-  if (!endpoint || !bucket || !accessKey || !secret) {
-    throw new Error("FILE_STORAGE=s3 requires S3_ENDPOINT, S3_BUCKET, S3_KEY, S3_SECRET");
+  constructor() {
+    const { S3_ENDPOINT, S3_BUCKET, S3_KEY, S3_SECRET } = process.env;
+    if (!S3_ENDPOINT || !S3_BUCKET || !S3_KEY || !S3_SECRET) {
+      throw new Error("FILE_STORAGE=s3 requires S3_ENDPOINT, S3_BUCKET, S3_KEY, S3_SECRET");
+    }
+    this.endpoint = S3_ENDPOINT.replace(/\/$/, "");
+    this.bucket = S3_BUCKET;
+    this.key = S3_KEY;
+    this.secret = S3_SECRET;
+    this.region = process.env.S3_REGION || "us-east-1";
   }
-  return { endpoint: endpoint.replace(/\/$/, ""), bucket, accessKey, secret, region: process.env.S3_REGION ?? "us-east-1" };
-}
 
-/** Minimal AWS SigV4 signer for path-style S3 requests. */
-async function s3Request(method: "PUT" | "GET" | "DELETE", key: string, body?: Buffer, mime?: string): Promise<globalThis.Response> {
-  const cfg = s3Config();
-  const url = new URL(`${cfg.endpoint}/${cfg.bucket}/${key}`);
-  const now = new Date();
-  const amzDate = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, ""); // YYYYMMDDTHHMMSSZ
-  const dateStamp = amzDate.slice(0, 8);
-  const payloadHash = sha256Hex(body ?? Buffer.alloc(0));
+  // Signs and sends one request (SigV4, path-style addressing for maximum
+  // compatibility with MinIO/R2/localstack).
+  private async request(method: "PUT" | "GET" | "DELETE", objectKey: string, body?: Buffer, contentType?: string): Promise<Response> {
+    const url = new URL(`${this.endpoint}/${this.bucket}/${objectKey}`);
+    const host = url.host;
+    const now = new Date();
+    const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ""); // YYYYMMDDTHHMMSSZ
+    const dateStamp = amzDate.slice(0, 8);
+    const payloadHash = sha256Hex(body ?? Buffer.alloc(0));
 
-  const headers: Record<string, string> = {
-    host: url.host,
-    "x-amz-content-sha256": payloadHash,
-    "x-amz-date": amzDate,
-  };
-  if (mime) headers["content-type"] = mime;
+    const headers: Record<string, string> = {
+      host,
+      "x-amz-content-sha256": payloadHash,
+      "x-amz-date": amzDate,
+    };
+    if (contentType) headers["content-type"] = contentType;
 
-  const signedHeaderNames = Object.keys(headers).sort();
-  const canonicalHeaders = signedHeaderNames.map((h) => `${h}:${headers[h].trim()}\n`).join("");
-  const signedHeaders = signedHeaderNames.join(";");
-  const canonicalRequest = [
-    method,
-    url.pathname.split("/").map(encodeURIComponent).join("/"),
-    "",
-    canonicalHeaders,
-    signedHeaders,
-    payloadHash,
-  ].join("\n");
+    const signedHeaderNames = Object.keys(headers).sort();
+    const canonicalHeaders = signedHeaderNames.map((h) => `${h}:${headers[h].trim()}\n`).join("");
+    const signedHeaders = signedHeaderNames.join(";");
+    const canonicalUri = url.pathname.split("/").map(encodeURIComponent).join("/");
+    const canonicalRequest = [method, canonicalUri, "", canonicalHeaders, signedHeaders, payloadHash].join("\n");
 
-  const scope = `${dateStamp}/${cfg.region}/s3/aws4_request`;
-  const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha256Hex(canonicalRequest)].join("\n");
-  const kDate = hmac("AWS4" + cfg.secret, dateStamp);
-  const kRegion = hmac(kDate, cfg.region);
-  const kService = hmac(kRegion, "s3");
-  const kSigning = hmac(kService, "aws4_request");
-  const signature = hmac(kSigning, stringToSign).toString("hex");
+    const scope = `${dateStamp}/${this.region}/s3/aws4_request`;
+    const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha256Hex(canonicalRequest)].join("\n");
+    const kSigning = hmac(hmac(hmac(hmac("AWS4" + this.secret, dateStamp), this.region), "s3"), "aws4_request");
+    const signature = crypto.createHmac("sha256", kSigning).update(stringToSign, "utf8").digest("hex");
 
-  const authorization = `AWS4-HMAC-SHA256 Credential=${cfg.accessKey}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
-  const { host: _host, ...fetchHeaders } = headers; // fetch sets Host itself
-  return fetch(url, {
-    method,
-    headers: { ...fetchHeaders, authorization },
-    body: body ? new Uint8Array(body) : undefined,
-  });
-}
+    const auth = `AWS4-HMAC-SHA256 Credential=${this.key}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+    const res = await fetch(url.toString(), {
+      method,
+      headers: { ...headers, Authorization: auth },
+      body: body as any,
+    });
+    if (!res.ok && !(method === "DELETE" && res.status === 404)) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`S3 ${method} ${objectKey} failed: ${res.status} ${text.slice(0, 200)}`);
+    }
+    return res;
+  }
 
-const s3Driver: FileDriver = {
-  async put(key, data, mime) {
-    const res = await s3Request("PUT", key, data, mime);
-    if (!res.ok) throw new Error(`S3 PUT failed: ${res.status} ${await res.text()}`);
-  },
-  async get(key) {
-    const res = await s3Request("GET", key);
-    if (!res.ok) throw new Error(`S3 GET failed: ${res.status}`);
+  async put(key: string, data: Buffer, contentType: string): Promise<void> {
+    await this.request("PUT", key, data, contentType);
+  }
+  async get(key: string): Promise<Buffer> {
+    const res = await this.request("GET", key);
     return Buffer.from(await res.arrayBuffer());
-  },
-  async delete(key) {
-    const res = await s3Request("DELETE", key);
-    if (!res.ok && res.status !== 404) throw new Error(`S3 DELETE failed: ${res.status}`);
-  },
-};
+  }
+  async delete(key: string): Promise<void> {
+    await this.request("DELETE", key);
+  }
+}
 
-/* ---------------------------- facade ------------------------------ */
+export type StorageBackend = "local" | "s3";
 
+// The PRIMARY backend — where new uploads land. Reads, by contrast, resolve the
+// driver per attachment row (see getDriver), so a table half-migrated between
+// backends still serves every download from the store that actually holds it.
+export function primaryBackend(): StorageBackend {
+  return process.env.FILE_STORAGE === "s3" ? "s3" : "local";
+}
+
+// One cached driver instance per backend. Both drivers are byte-stores over the
+// SAME key space ("<orgId>/<uuid>"), so a blob can be copied between them under
+// an unchanged key — that is exactly what the migrator relies on.
+const drivers: Partial<Record<StorageBackend, FileDriver>> = {};
+export function getDriver(backend: StorageBackend): FileDriver {
+  if (!drivers[backend]) {
+    drivers[backend] = backend === "s3" ? new S3Driver() : new LocalDriver();
+  }
+  return drivers[backend]!;
+}
+
+// The primary driver — new uploads go here.
 export function fileDriver(): FileDriver {
-  return (process.env.FILE_STORAGE ?? "local") === "s3" ? s3Driver : localDriver;
+  return getDriver(primaryBackend());
 }
 
-export function newStorageKey(orgId: number): string {
-  return `${orgId}/${crypto.randomUUID()}`;
+// SHA-256 (hex) of stored bytes — the integrity anchor the migrator verifies a
+// cross-backend copy against before it flips the row and deletes the source.
+export function checksumBytes(data: Buffer): string {
+  return crypto.createHash("sha256").update(data).digest("hex");
 }
+
+// Attachment policy: whitelist + 10MB, enforced at the route.
+export const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+export const ATTACHMENT_MIME_WHITELIST: Record<string, string> = {
+  "application/pdf": ".pdf",
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/webp": ".webp",
+  "text/csv": ".csv",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+};

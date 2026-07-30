@@ -1,0 +1,89 @@
+# =============================================================================
+# Prometheus alert rules for LedgerLite
+# =============================================================================
+# Load with `rule_files: [ /etc/prometheus/alerts.yml ]`. Every expression here
+# is sourced from a series LedgerLite exposes at GET /api/metrics (see
+# server/metrics.ts; the metrics_format test guards their presence). Tune the
+# thresholds to your traffic; the defaults suit a small production instance.
+groups:
+  - name: ledgerlite.availability
+    rules:
+      - alert: TargetDown
+        expr: up{job="ledgerlite"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "LedgerLite target is down"
+          description: "Prometheus cannot scrape {{ $labels.instance }} for 2m. Check the process and /api/health/ready."
+
+      - alert: High5xxRate
+        # >5% of requests 5xx over 5m (and a non-trivial request volume).
+        expr: |
+          sum(rate(ledgerlite_http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(ledgerlite_http_requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "5xx error rate above 5%"
+          description: "{{ $value | humanizePercentage }} of requests are 5xx over the last 5m."
+
+      - alert: HighP95Latency
+        # p95 request latency > 1s for 10m.
+        expr: |
+          histogram_quantile(0.95, sum(rate(ledgerlite_http_request_duration_seconds_bucket[5m])) by (le)) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "p95 latency above 1s"
+          description: "p95 request latency is {{ $value }}s over 5m."
+
+  - name: ledgerlite.saturation
+    rules:
+      - alert: DbPoolSaturated
+        # Requests are queuing for a Postgres connection.
+        expr: ledgerlite_pg_pool_waiting > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Postgres pool saturated"
+          description: "{{ $value }} request(s) waiting for a DB connection for 5m — raise PG_POOL_MAX or investigate slow queries."
+
+  - name: ledgerlite.jobs
+    rules:
+      - alert: SchedulerJobFailing
+        expr: increase(ledgerlite_scheduler_runs_total{result="failed"}[1h]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Scheduled job {{ $labels.job }} is failing"
+          description: "{{ $labels.job }} recorded {{ $value }} failure(s) in the last hour."
+
+      - alert: WebhookDeliveryFailureRate
+        # >20% of outbound webhook attempts failing over 15m.
+        expr: |
+          sum(rate(ledgerlite_webhook_deliveries_total{result="failed"}[15m]))
+            / clamp_min(sum(rate(ledgerlite_webhook_deliveries_total[15m])), 0.001) > 0.2
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Outbound webhook failure rate high"
+          description: "{{ $value | humanizePercentage }} of webhook deliveries are failing over 15m."
+
+  - name: ledgerlite.security
+    rules:
+      - alert: StripeWebhookSignatureFailures
+        # ANY signature failure is worth knowing — either a misconfig or an attack.
+        expr: increase(ledgerlite_stripe_webhook_signature_failures_total[15m]) > 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Stripe webhook signature failures ({{ $labels.source }})"
+          description: "{{ $value }} signature verification failure(s) in 15m — check the webhook secret or investigate spoofing."
+
+      - alert: FailedLoginSpike
+        expr: sum(rate(ledgerlite_auth_logins_total{result="failed"}[5m])) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Elevated failed-login rate"
+          description: "{{ $value }} failed logins/s over 5m — possible credential-stuffing."

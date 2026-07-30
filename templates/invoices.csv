@@ -1,4 +1,0 @@
-number,customer_name,date,due_date,line_description,quantity,rate,income_account_code,tax_rate
-INV-1001,Acme Inc,2026-01-05,2026-02-04,Design work,10,150.00,4000,0
-INV-1001,Acme Inc,2026-01-05,2026-02-04,"Hosting, annual",1,299.00,4000,0
-INV-1002,Globex Corp,2026-01-08,2026-02-07,Consulting,4,200.00,4000,8.5

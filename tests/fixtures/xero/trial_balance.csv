@@ -1,0 +1,8 @@
+Account Code,Account Name,Debit,Credit
+1000,Checking Account,30000.00,
+1100,Accounts Receivable,6000.00,
+1200,Inventory,9000.00,
+2000,Accounts Payable,,3500.00
+2200,Credit Card,,2500.00
+3000,Owner's Equity,,15000.00
+3100,Retained Earnings,,24000.00

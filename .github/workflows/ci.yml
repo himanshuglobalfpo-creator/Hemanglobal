@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast static gates — no database needed.
+  quality:
+    name: Lint · Typecheck · Client tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Dependency audit (production deps, gate at high+)
+        # Fails the build on a HIGH/CRITICAL advisory in a runtime dependency.
+        # Moderates are reported weekly (security-audit.yml), not blocked here.
+        run: npm audit --omit=dev --audit-level=high
+      - name: ESLint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run check
+      - name: API contract (client paths ↔ server routes)
+        run: npm run check:contract
+      - name: Version-literal consistency
+        run: npm run check:version
+      - name: Client unit tests (Vitest)
+        run: npm run test:client
+
+  # Server integration tests + production build + Playwright E2E, all against a
+  # real Postgres service. The test harness carves a private database per test
+  # file on this server (see tests/harness.ts), and the E2E launcher reuses it.
+  integration:
+    name: Server tests · Build · E2E
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      APP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      SESSION_SECRET: ci-session-secret-0123456789
+      # S3-compatible object store for the file-driver contract test. MinIO is
+      # started as a step below (the minio image needs a `server` arg, which the
+      # `services:` block can't pass), and the test's S3 section runs only when
+      # S3_ENDPOINT is present — so local `npm test` without MinIO still passes.
+      S3_ENDPOINT: http://localhost:9000
+      S3_BUCKET: ledgerlite-attachments
+      S3_KEY: minioadmin
+      S3_SECRET: minioadmin
+      S3_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Start MinIO (S3-compatible) + create bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/ready >/dev/null; then echo "MinIO ready"; break; fi
+            echo "waiting for MinIO ($i)"; sleep 2
+          done
+          aws --endpoint-url http://localhost:9000 s3 mb "s3://ledgerlite-attachments"
+      - name: Server integration tests
+        run: npm test
+      - name: Production build
+        run: npm run build
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+      - name: E2E tests (Playwright)
+        run: npm run test:e2e
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+  # Prod-smoke: build the SHIPPING artifact and boot it exactly as production
+  # would (NODE_ENV=production node dist/index.mjs) against a disposable
+  # Postgres, then require /api/health/ready = 200. This is the gate that
+  # catches ESM/bundle boot regressions (BUG-1/BUG-3) before merge — the unit
+  # suite can pass while the packaged server fails to start.
+  prod-smoke:
+    name: Prod artifact boot smoke
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      APP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      SESSION_SECRET: ci-session-secret-0123456789
+      # The all-zero key is a well-known placeholder the boot guard rejects in
+      # production; this throwaway smoke DB is exactly the CI/test exception.
+      ALLOW_INSECURE_DEFAULTS: "1"
+      PORT: "5000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # Build with the FULL toolchain (vite/esbuild are devDependencies), so
+      # NODE_ENV must NOT be "production" here or `npm ci` would omit them.
+      - name: Build the production artifact
+        run: |
+          npm ci
+          npm run build
+      # Now reinstall production-only deps — this catches a runtime dependency
+      # wrongly placed in devDependencies (dist/ is preserved by npm ci).
+      - name: Reinstall production-only deps
+        run: npm ci --omit=dev
+      - name: Boot dist/index.mjs and require health/ready = 200
+        env:
+          NODE_ENV: production
+        run: |
+          node dist/index.mjs &
+          SERVER_PID=$!
+          echo "Booted server pid=$SERVER_PID"
+          ok=0
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5000/api/health/ready" || echo 000)
+            echo "attempt $i → $code"
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 2
+          done
+          kill "$SERVER_PID" 2>/dev/null || true
+          if [ "$ok" != "1" ]; then echo "::error::production artifact did not reach health/ready=200"; exit 1; fi
+          echo "✅ dist/index.mjs booted and /api/health/ready returned 200"

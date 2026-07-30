@@ -1,31 +1,35 @@
-/**
- * server/csv.ts — TASK 4e: shared CSV serializer, RFC 4180 quoting.
- * Fields containing commas, quotes, CR or LF are wrapped in double quotes
- * with embedded quotes doubled. Line ending is CRLF per the RFC so files
- * open cleanly in Excel.
- */
-import type { Response } from "express";
+// ============================================================================
+// CSV — RFC 4180 serialization shared by every report's ?format=csv path
+// ============================================================================
+// Quoting rules (RFC 4180): a field is quoted when it contains a comma, a
+// double quote, or a line break; embedded quotes are doubled. Excel opens the
+// result cleanly, including descriptions like: He said "hi", twice.
 
-export interface CsvColumn<T> {
+export type CsvColumn<T> = {
+  key: keyof T | ((row: T) => unknown);
   header: string;
-  value: (row: T) => unknown;
-}
+};
 
-function escapeField(v: unknown): string {
-  if (v === null || v === undefined) return "";
-  const s = String(v);
-  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+function csvEscape(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  const s = String(value);
+  if (/[",\r\n]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
   return s;
 }
 
 export function toCsv<T>(rows: T[], columns: CsvColumn<T>[]): string {
-  const head = columns.map((c) => escapeField(c.header)).join(",");
-  const body = rows.map((r) => columns.map((c) => escapeField(c.value(r))).join(","));
-  return [head, ...body].join("\r\n") + "\r\n";
+  const header = columns.map((c) => csvEscape(c.header)).join(",");
+  const body = rows.map((row) =>
+    columns
+      .map((c) => csvEscape(typeof c.key === "function" ? c.key(row) : (row as any)[c.key]))
+      .join(",")
+  );
+  return [header, ...body].join("\r\n") + "\r\n"; // CRLF per RFC 4180
 }
 
-export function sendCsv<T>(res: Response, filename: string, rows: T[], columns: CsvColumn<T>[]): void {
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="${filename.replace(/"/g, "")}"`);
-  res.send(toCsv(rows, columns));
+// Cents → "1234.56" for CSV (spreadsheets want plain decimals, not "$1,234.56").
+export function csvMoney(cents: number): string {
+  return (Math.round(cents) / 100).toFixed(2);
 }

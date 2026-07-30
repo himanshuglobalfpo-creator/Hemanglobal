@@ -1,197 +1,207 @@
-/**
- * server/webhooks.ts — TASK 6: outbound webhooks.
- * - emitEvent() is called by routes AFTER storage transactions commit
- *   (never inside them) and enqueues one delivery row per subscribed hook.
- * - A 30s unref'd interval worker picks due pending/failed deliveries
- *   (attempts < 6), POSTs signed JSON, and backs off 1m/5m/30m/2h/12h.
- * - SSRF guard rejects URLs resolving to loopback/private/link-local ranges
- *   at create time AND again at delivery time (DNS rebinding defense).
- */
+// ============================================================================
+// OUTBOUND WEBHOOKS
+// ============================================================================
+// Events: invoice.created/paid/voided, bill.created/paid, credit_note.issued,
+// period.closed. Emission happens AFTER the business transaction commits —
+// storage methods call emitWebhookEvent() outside their db.transaction, so a
+// rolled-back operation can never notify the outside world.
+//
+// Delivery: 30s worker (unref'd interval) picks due pending/failed rows with
+// attempts < 6, POSTs the EXACT stored payload with
+//   x-ledgerlite-event:     <event name>
+//   x-ledgerlite-signature: hex HMAC-SHA256(secret, rawBody)
+// 10s fetch timeout; backoff 1m/5m/30m/2h/12h; 2xx marks success.
+//
+// SSRF guard: the target hostname is resolved via dns.lookup and every
+// address is checked against loopback/RFC1918/link-local/ULA ranges — at
+// CREATE time and again at DELIVERY time (DNS can change between the two).
+
 import crypto from "node:crypto";
 import dns from "node:dns/promises";
-import net from "node:net";
-import { db } from "./db.js";
-import type { WebhookEvent } from "../shared/schema.js";
+import { pool } from "./storage";
+import { currentOrgId } from "./org-scope";
+import { logger } from "./logger";
+import { recordWebhookDelivery, recordSchedulerRun } from "./metrics";
 
-/* --------------------------- SSRF guard --------------------------- */
+export const WEBHOOK_EVENTS = [
+  "invoice.created", "invoice.paid", "invoice.voided",
+  "bill.created", "bill.paid",
+  "credit_note.issued", "period.closed", "ping",
+] as const;
+export type WebhookEvent = (typeof WEBHOOK_EVENTS)[number];
 
+// Backoff schedule per the spec (minutes): 1, 5, 30, 120, 720.
+const BACKOFF_MINUTES = [1, 5, 30, 120, 720];
+const MAX_ATTEMPTS = 6;
+const FETCH_TIMEOUT_MS = 10_000;
+
+// ---------------------------------------------------------------------------
+// SSRF guard
+// ---------------------------------------------------------------------------
 function ipIsPrivate(ip: string): boolean {
-  if (net.isIPv4(ip)) {
-    const [a, b] = ip.split(".").map(Number);
-    if (a === 0 || a === 10 || a === 127) return true; // 0.0.0.0/8, 10/8, loopback
-    if (a === 169 && b === 254) return true; // link-local (cloud metadata!)
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
-    if (a === 192 && b === 168) return true; // 192.168/16
-    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
+  if (ip.includes(":")) {
+    // IPv6: loopback, link-local fe80::/10, unique-local fc00::/7, v4-mapped
+    const low = ip.toLowerCase();
+    if (low === "::1" || low === "::") return true;
+    if (low.startsWith("fe8") || low.startsWith("fe9") || low.startsWith("fea") || low.startsWith("feb")) return true;
+    if (low.startsWith("fc") || low.startsWith("fd")) return true;
+    if (low.startsWith("::ffff:")) return ipIsPrivate(low.slice(7));
     return false;
   }
-  const lower = ip.toLowerCase();
-  if (lower === "::" || lower === "::1") return true;
-  if (lower.startsWith("fe80:") || lower.startsWith("fc") || lower.startsWith("fd")) return true;
-  if (lower.startsWith("::ffff:")) return ipIsPrivate(lower.slice(7)); // v4-mapped
+  const parts = ip.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((p) => Number.isNaN(p))) return true; // unparseable → treat as unsafe
+  const [a, b] = parts;
+  if (a === 127 || a === 0) return true;               // loopback / this-net
+  if (a === 10) return true;                            // RFC1918
+  if (a === 172 && b >= 16 && b <= 31) return true;     // RFC1918
+  if (a === 192 && b === 168) return true;              // RFC1918
+  if (a === 169 && b === 254) return true;              // link-local (cloud metadata!)
+  if (a === 100 && b >= 64 && b <= 127) return true;    // CGNAT
   return false;
 }
 
-/** Throws with a human-readable reason when the URL must not be fetched. */
-export async function assertUrlIsPublic(rawUrl: string): Promise<void> {
-  let url: URL;
+export async function assertSafeWebhookUrl(url: string): Promise<void> {
+  let parsed: URL;
   try {
-    url = new URL(rawUrl);
+    parsed = new URL(url);
   } catch {
-    throw new Error("invalid URL");
+    throw new Error("Webhook URL is not a valid URL");
   }
-  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("only http(s) URLs allowed");
-  const host = url.hostname.replace(/^\[|\]$/g, "");
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".internal")) {
-    throw new Error("URL resolves to a private address");
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error("Webhook URL must be http(s)");
   }
-  const ips = net.isIP(host) ? [host] : (await dns.lookup(host, { all: true })).map((a) => a.address);
-  if (ips.length === 0) throw new Error("hostname does not resolve");
-  for (const ip of ips) {
-    if (ipIsPrivate(ip)) throw new Error(`URL resolves to a private address (${ip})`);
-  }
-}
-
-/* ---------------------------- signing ----------------------------- */
-
-export function signPayload(secret: string, rawBody: string): string {
-  return crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-}
-
-/* ---------------------------- emitting ---------------------------- */
-
-interface WebhookRow {
-  id: number;
-  org_id: number;
-  url: string;
-  secret: string;
-  events: string;
-  is_active: number;
-}
-
-/**
- * Enqueue deliveries for every active hook in the org subscribed to `event`.
- * MUST be called after the business transaction has committed — the payload
- * describes state that is already durable.
- */
-export function emitEvent(orgId: number, event: WebhookEvent, data: Record<string, unknown>): void {
-  const hooks = db
-    .prepare("SELECT * FROM webhooks WHERE org_id = ? AND is_active = 1")
-    .all(orgId) as WebhookRow[];
-  const insert = db.prepare(
-    `INSERT INTO webhook_deliveries (org_id, webhook_id, event, payload, status, attempts, next_attempt_at)
-     VALUES (?, ?, ?, ?, 'pending', 0, datetime('now'))`,
-  );
-  const payload = JSON.stringify({ event, orgId, occurredAt: new Date().toISOString(), data });
-  for (const hook of hooks) {
-    let events: string[] = [];
+  // Literal IPs get checked directly; hostnames resolve through DNS.
+  const host = parsed.hostname;
+  let addresses: string[];
+  if (/^[\d.]+$/.test(host) || host.includes(":")) {
+    addresses = [host.replace(/^\[|\]$/g, "")];
+  } else {
     try {
-      events = JSON.parse(hook.events);
+      addresses = (await dns.lookup(host, { all: true })).map((a) => a.address);
     } catch {
-      /* malformed events column: treat as no subscriptions */
+      throw new Error(`Webhook host "${host}" does not resolve`);
     }
-    if (events.includes(event)) insert.run(orgId, hook.id, event, payload);
+  }
+  for (const addr of addresses) {
+    if (ipIsPrivate(addr)) {
+      throw new Error(`Webhook URL resolves to a private/loopback address (${addr}) — refused.`);
+    }
   }
 }
 
-/* ------------------------ delivery worker ------------------------- */
-
-/** Backoff schedule per spec: 1m, 5m, 30m, 2h, 12h (then attempts hits 6 = give up). */
-const BACKOFF_MINUTES = [1, 5, 30, 120, 720];
-const MAX_ATTEMPTS = 6;
-
-interface DeliveryRow {
-  id: number;
-  org_id: number;
-  webhook_id: number;
-  event: string;
-  payload: string;
-  attempts: number;
+// ---------------------------------------------------------------------------
+// Emission (enqueue) — call AFTER the business transaction commits.
+// ---------------------------------------------------------------------------
+export async function emitWebhookEvent(event: WebhookEvent, data: Record<string, unknown>): Promise<void> {
+  try {
+    const orgId = currentOrgId();
+    const hooks = (await pool.query(
+      `SELECT id, events FROM webhooks WHERE org_id = $1 AND is_active = true`,
+      [orgId]
+    )).rows as Array<{ id: number; events: string }>;
+    if (hooks.length === 0) return;
+    const payload = JSON.stringify({ event, orgId, at: new Date().toISOString(), data });
+    for (const h of hooks) {
+      let subscribed: string[] = [];
+      try { subscribed = JSON.parse(h.events); } catch { /* malformed → no match */ }
+      if (!subscribed.includes(event)) continue;
+      await pool.query(
+        `INSERT INTO webhook_deliveries (org_id, webhook_id, event, payload) VALUES ($1, $2, $3, $4)`,
+        [orgId, h.id, event, payload]
+      );
+    }
+  } catch (e: any) {
+    // Webhook plumbing must NEVER break the business operation.
+    logger.warn("webhook emit failed", { event, error: e.message });
+  }
 }
 
-export async function deliverOne(row: DeliveryRow): Promise<void> {
-  const hook = db.prepare("SELECT * FROM webhooks WHERE id = ?").get(row.webhook_id) as WebhookRow | undefined;
-  const markFailed = (code: number | null) => {
-    const attempts = row.attempts + 1;
-    if (attempts >= MAX_ATTEMPTS || !hook || !hook.is_active) {
-      db.prepare("UPDATE webhook_deliveries SET status='failed', attempts=?, response_code=?, next_attempt_at=datetime('now','+100 years') WHERE id=?")
-        .run(attempts, code, row.id);
-    } else {
-      const mins = BACKOFF_MINUTES[Math.min(attempts - 1, BACKOFF_MINUTES.length - 1)];
-      db.prepare("UPDATE webhook_deliveries SET status='failed', attempts=?, response_code=?, next_attempt_at=datetime('now', ?) WHERE id=?")
-        .run(attempts, code, `+${mins} minutes`, row.id);
+export function signWebhookPayload(secret: string, rawBody: string): string {
+  return crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
+}
+
+// ---------------------------------------------------------------------------
+// Delivery worker
+// ---------------------------------------------------------------------------
+async function deliverOne(d: {
+  id: number; org_id: number; webhook_id: number; event: string; payload: string; attempts: number;
+  url: string; secret: string;
+}): Promise<void> {
+  const attemptNo = d.attempts + 1;
+  let responseCode: number | null = null;
+  let ok = false;
+  try {
+    await assertSafeWebhookUrl(d.url); // re-check at delivery time — DNS may have changed
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(d.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-ledgerlite-event": d.event,
+          "x-ledgerlite-signature": signWebhookPayload(d.secret, d.payload),
+        },
+        body: d.payload,
+        signal: ac.signal,
+      });
+      responseCode = res.status;
+      ok = res.status >= 200 && res.status < 300;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (e: any) {
+    logger.warn("webhook delivery error", { deliveryId: d.id, attempt: attemptNo, error: e.message });
+  }
+
+  recordWebhookDelivery(ok ? "success" : "failed");
+  if (ok) {
+    await pool.query(
+      `UPDATE webhook_deliveries SET status = 'success', attempts = $2, response_code = $3 WHERE id = $1`,
+      [d.id, attemptNo, responseCode]
+    );
+    return;
+  }
+  if (attemptNo >= MAX_ATTEMPTS) {
+    await pool.query(
+      `UPDATE webhook_deliveries SET status = 'failed', attempts = $2, response_code = $3, next_attempt_at = now() + interval '100 years' WHERE id = $1`,
+      [d.id, attemptNo, responseCode]
+    );
+    return;
+  }
+  const backoffMin = BACKOFF_MINUTES[Math.min(attemptNo - 1, BACKOFF_MINUTES.length - 1)];
+  await pool.query(
+    `UPDATE webhook_deliveries SET status = 'failed', attempts = $2, response_code = $3,
+            next_attempt_at = now() + ($4 || ' minutes')::interval
+      WHERE id = $1`,
+    [d.id, attemptNo, responseCode, String(backoffMin)]
+  );
+}
+
+let workerStarted = false;
+export function startWebhookWorker(): void {
+  if (workerStarted) return;
+  workerStarted = true;
+  const tick = async () => {
+    try {
+      const due = (await pool.query(
+        `SELECT d.id, d.org_id, d.webhook_id, d.event, d.payload, d.attempts, w.url, w.secret
+           FROM webhook_deliveries d
+           JOIN webhooks w ON w.id = d.webhook_id AND w.is_active = true
+          WHERE d.status IN ('pending', 'failed')
+            AND d.attempts < $1
+            AND d.next_attempt_at <= now()
+          ORDER BY d.id
+          LIMIT 20`,
+        [MAX_ATTEMPTS]
+      )).rows as any[];
+      for (const d of due) await deliverOne(d);
+      recordSchedulerRun("webhook_worker", "success");
+    } catch (e: any) {
+      recordSchedulerRun("webhook_worker", "failed");
+      logger.warn("webhook worker tick failed", { error: e.message });
     }
   };
-
-  if (!hook || !hook.is_active) {
-    markFailed(null);
-    return;
-  }
-  try {
-    await assertUrlIsPublic(hook.url); // re-check at delivery time (DNS rebinding)
-  } catch {
-    markFailed(null);
-    return;
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
-  try {
-    const res = await fetch(hook.url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-ledgerlite-event": row.event,
-        "x-ledgerlite-signature": signPayload(hook.secret, row.payload),
-      },
-      body: row.payload,
-      signal: controller.signal,
-      redirect: "error", // a redirect could bounce us into a private range
-    });
-    if (res.ok) {
-      db.prepare("UPDATE webhook_deliveries SET status='success', attempts=?, response_code=? WHERE id=?")
-        .run(row.attempts + 1, res.status, row.id);
-    } else {
-      markFailed(res.status);
-    }
-  } catch {
-    markFailed(null);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-let workerRunning = false;
-
-export async function runDeliveryPass(): Promise<number> {
-  // Intentionally NOT org-scoped: the delivery worker is a background
-  // process that drains due deliveries across ALL orgs; each row carries
-  // its own org_id and is only ever addressed by primary key below.
-  const due = db
-    .prepare(
-      `SELECT id, org_id, webhook_id, event, payload, attempts
-       FROM webhook_deliveries
-       WHERE status IN ('pending','failed') AND attempts < ? AND next_attempt_at <= datetime('now')
-       ORDER BY next_attempt_at LIMIT 25`,
-    )
-    .all(MAX_ATTEMPTS) as DeliveryRow[];
-  for (const row of due) {
-    await deliverOne(row);
-  }
-  return due.length;
-}
-
-export function startWebhookWorker(): NodeJS.Timeout {
-  const interval = setInterval(async () => {
-    if (workerRunning) return; // never overlap passes
-    workerRunning = true;
-    try {
-      await runDeliveryPass();
-    } catch (err) {
-      console.error("webhook worker pass failed:", err);
-    } finally {
-      workerRunning = false;
-    }
-  }, 30_000);
-  interval.unref(); // never keep the process alive just for the worker
-  return interval;
+  const interval = setInterval(tick, 30_000);
+  if (typeof interval.unref === "function") interval.unref();
 }
